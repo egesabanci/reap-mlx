@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# reap specfic
+artifacts/
+scratch/
+*.log
+.env
+.uv_cache/
+wandb/
+api-key.txt
+prod_env/credentials.conf
+merging_env_6/
+merging_env_7/
+pruning_env_4/
+pruning_env_5/
+*.sqllite
+credentials.json
+config/wildbench_prod_env_*
+cmd.sh
