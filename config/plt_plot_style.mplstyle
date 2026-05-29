@@ -1,0 +1,47 @@
+# --- Figure Properties ---
+figure.figsize: 10, 6
+
+# --- Font Properties ---
+font.family: sans-serif
+font.sans-serif: "DejaVu Sans"
+
+# --- Axes Properties ---
+axes.linewidth: 2.0
+axes.labelpad: 6.0
+axes.prop_cycle: cycler(color=["#4477aa","#ee6677","#228833","#ccbb44","#66ccee","#aa3377","#bbbbbb"])
+axes.titlepad: 20.0
+
+# Titles and Labels
+axes.titlesize: 30
+axes.labelsize: 22
+axes.titleweight: 500
+axes.labelweight: 500
+
+# Colors 
+axes.edgecolor: "#262626"
+axes.labelcolor: "#262626"
+axes.titlecolor: "#262626"
+
+
+# --- Tick Properties ---
+xtick.direction: out
+xtick.major.size: 5
+xtick.major.width: 1.5
+xtick.minor.size: 2.5
+xtick.major.pad: 5
+xtick.labelsize: 20
+
+ytick.direction: out
+ytick.major.size: 5
+ytick.major.width: 1.5
+ytick.minor.size: 2.5
+ytick.major.pad: 5
+ytick.labelsize: 20
+
+# --- Line Properties ---
+lines.linewidth: 3.0
+
+# --- Legend Properties ---
+legend.frameon: False 
+legend.fontsize: 14
+legend.borderpad: 0.5

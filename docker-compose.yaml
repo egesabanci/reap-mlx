@@ -1,0 +1,32 @@
+volumes:
+  venv_data:
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+      network: host
+    volumes:
+      - .:/app:rw
+      - ~/.cache/huggingface:/home/dev/.cache/huggingface
+      - venv_data:/app/.venv
+    working_dir: /app
+    tty: true
+    stdin_open: true
+    shm_size: "16g"
+    mem_limit: "1t"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    env_file:
+      - .env
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    network_mode: host

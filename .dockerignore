@@ -1,0 +1,20 @@
+# Git
+.git/
+.gitignore
+.gitmodules
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE / Tools
+.vscode/
+.pytest_cache/
+uv.lock
+
+# Logs
+*.log
+
+# Large data directories
+artifacts/
