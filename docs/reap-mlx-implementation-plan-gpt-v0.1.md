@@ -14,6 +14,17 @@ The goal is not to make every REAP feature backend-agnostic immediately. The
 first goal is to get pruning-only REAP working well on MLX-LM models, with a
 small and defensible implementation surface.
 
+## Alignment Notice - 2026-05-31
+
+The production and official experimentation workflow remains the original
+PyTorch/CUDA REAP implementation. The MLX backend is a parallel Apple Silicon
+experimentation path.
+
+The MLX goal is adapter-driven support for compatible MoE weights, not a
+one-model port. Qwen3-MoE is the bootstrap/reference adapter only; model-specific
+routing, expert layout, shared-expert behavior, and config updates must live
+behind explicit MLX adapter contracts.
+
 ## Core Conclusion
 
 Do not begin with a broad `AbstractBackend` that wraps tensor primitives.

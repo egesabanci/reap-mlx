@@ -4,6 +4,17 @@ This document captures the main engineering points for making the current REAP
 (Router-weighted Expert Activation Pruning) implementation work well on MLX
 backends, especially MLX-LM on Apple Silicon.
 
+## Alignment Notice - 2026-05-31
+
+The production and official experimentation workflow remains the original
+PyTorch/CUDA REAP implementation. The MLX backend is a parallel Apple Silicon
+experimentation path.
+
+The MLX goal is adapter-driven support for compatible MoE weights, not a
+one-model port. Qwen3-MoE is the bootstrap/reference adapter only; model-specific
+routing, expert layout, shared-expert behavior, and config updates must live
+behind explicit MLX adapter contracts.
+
 ## 1. Split CUDA-only Dependencies
 
 The current codebase imports PyTorch, vLLM, DeepSpeed, and CUDA-oriented
