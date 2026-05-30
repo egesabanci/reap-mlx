@@ -590,3 +590,20 @@ Total: ~780 lines of new code (excluding shell scripts and tests).
 | Quantized model observation produces different REAP scores | Medium | Medium | Acceptable for v0.1 (scores are relative, ranking is what matters); document the precision tradeoff |
 | MLX lazy evaluation causes OOM across batches | Low | Medium | `mx.eval()` after each layer; NumPy accumulators prevent cross-batch graph retention |
 | `mlx-lm` API changes between versions | Low | Low | Pin `mlx-lm>=0.24,<1.0`; wrap in adapter functions |
+
+---
+
+## Alignment Notice — 2026-05-31
+
+This is a historical brainstorming document. If any statement here conflicts
+with `implementation-plan-draft.md`, the active draft wins.
+
+The current objective is not to replace the original CUDA REAP workflow. The
+CUDA/PyTorch implementation remains the production and official experimentation
+path on CUDA-compatible systems. The MLX work is a parallel Apple Silicon
+experimentation backend.
+
+The MLX backend must be adapter-driven: Qwen3 is a bootstrap/reference adapter,
+not the model-support boundary. The target is to support any MoE weights whose
+routing and expert layout can be represented by an MLX model/weight adapter,
+while preserving REAP pruning semantics and schema compatibility.

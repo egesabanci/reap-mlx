@@ -655,3 +655,20 @@ The MLX version of REAP should be MLX-native:
 The first useful milestone is not "the repo has a backend abstraction." The
 first useful milestone is "a tiny MLX Qwen3-MoE model can be observed, pruned,
 saved, reloaded, and forwarded without importing CUDA tooling."
+
+---
+
+## Alignment Notice — 2026-05-31
+
+This is a historical planning document. If any statement here conflicts with
+`implementation-plan-draft.md`, the active draft wins.
+
+The current objective is not to replace the original CUDA REAP workflow. The
+CUDA/PyTorch implementation remains the production and official experimentation
+path on CUDA-compatible systems. The MLX work is a parallel Apple Silicon
+experimentation backend.
+
+The MLX backend must be adapter-driven: Qwen3 is a bootstrap/reference adapter,
+not the model-support boundary. The target is to support any MoE weights whose
+routing and expert layout can be represented by an MLX model/weight adapter,
+while preserving REAP pruning semantics and schema compatibility.

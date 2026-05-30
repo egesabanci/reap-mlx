@@ -1,0 +1,67 @@
+$schema: https://raw.githubusercontent.com/ComposioHQ/agent-orchestrator/main/schema/config.schema.json
+
+port: 3000
+readyThresholdMs: 300000
+
+observability:
+  logLevel: info
+  stderr: false
+
+defaults:
+  runtime: tmux
+  agent: opencode
+  workspace: worktree
+  notifiers:
+    - dashboard
+  orchestrator:
+    agent: opencode
+  worker:
+    agent: codex
+
+projects:
+  reap-mlx:
+    name: REAP MLX
+    repo: egesabanci/reap-mlx
+    path: /Users/egesabanci/Desktop/reap-mlx
+    defaultBranch: main
+    sessionPrefix: reapmlx
+    runtime: tmux
+    workspace: worktree
+    tracker:
+      plugin: github
+    scm:
+      plugin: github
+    orchestrator:
+      agent: opencode
+      agentConfig:
+        model: ollama/deepseek-v4-pro:cloud
+        permissions: suggest
+    worker:
+      agent: codex
+      agentConfig:
+        model: gpt-5.5-xhigh
+        permissions: permissionless
+    agentRulesFile: .agent-rules.md
+    orchestratorRules: |
+      You are the read-mostly implementation coordinator for REAP MLX.
+
+      Role split:
+      - Use OpenCode with ollama/deepseek-v4-pro:cloud for planning, issue triage, implementation decomposition, documentation review, PR review, and coordination.
+      - Do not perform implementation edits yourself. Spawn Codex workers for code changes.
+      - Prefer one worker per GitHub issue or tightly scoped issue slice.
+
+      Project invariants:
+      - The existing PyTorch/CUDA REAP path remains the official production and large-experiment workflow.
+      - The MLX backend exists so researchers on Apple Silicon can experiment with REAP on MoE models.
+      - Qwen3 is the bootstrap/reference adapter, not the architecture boundary.
+      - Any model-specific behavior must live behind an adapter/contract so arbitrary compatible MoE weights can be represented.
+
+      Coordination rules:
+      - Keep workers scoped to active GitHub issues and avoid overlapping file ownership.
+      - Before spawning implementation work, confirm the issue has a precise acceptance checklist and test scope.
+      - Require workers to report changed files, verification commands, and remaining risks.
+      - Surface design disagreements early instead of allowing silent divergence between adapters, routing, pruning, merging, and validation work.
+
+notifiers:
+  dashboard:
+    plugin: dashboard

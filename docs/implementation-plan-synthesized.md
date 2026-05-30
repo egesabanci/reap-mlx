@@ -388,3 +388,20 @@ experiments/mlx-pruning.sh        # Shell script
 src/reap/args.py                  # + backend flag
 src/reap/entry.py                 # dispatch logic (new file)
 ```
+
+---
+
+## Alignment Notice — 2026-05-31
+
+This is a historical brainstorming document. If any statement here conflicts
+with `implementation-plan-draft.md`, the active draft wins.
+
+The current objective is not to replace the original CUDA REAP workflow. The
+CUDA/PyTorch implementation remains the production and official experimentation
+path on CUDA-compatible systems. The MLX work is a parallel Apple Silicon
+experimentation backend.
+
+The MLX backend must be adapter-driven: Qwen3 is a bootstrap/reference adapter,
+not the model-support boundary. The target is to support any MoE weights whose
+routing and expert layout can be represented by an MLX model/weight adapter,
+while preserving REAP pruning semantics and schema compatibility.

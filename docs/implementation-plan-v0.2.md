@@ -557,3 +557,20 @@ This document supersedes:
 - `reap-mlx-implementation-plan-gpt-v0.1.md` — GPT-5.5's v0.1 with API checks
 
 v0.2 incorporates the MLX API ground truth discovered by GPT-5.5 (no `mx.bincount`, no `mx.topk` indices, `mx.argpartition` usage, mutable nn.Module, attention mask limitation), plus the data flow validation and selected-only correctness proof from DSv4. It corrects API inaccuracies in earlier docs and provides the simplest possible implementation surface.
+
+---
+
+## Alignment Notice — 2026-05-31
+
+This is a historical planning document. If any statement here conflicts with
+`implementation-plan-draft.md`, the active draft wins.
+
+The current objective is not to replace the original CUDA REAP workflow. The
+CUDA/PyTorch implementation remains the production and official experimentation
+path on CUDA-compatible systems. The MLX work is a parallel Apple Silicon
+experimentation backend.
+
+The MLX backend must be adapter-driven: Qwen3 is a bootstrap/reference adapter,
+not the model-support boundary. The target is to support any MoE weights whose
+routing and expert layout can be represented by an MLX model/weight adapter,
+while preserving REAP pruning semantics and schema compatibility.

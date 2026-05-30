@@ -1202,3 +1202,68 @@ separate manual smoke check, not a gate.
                       deferred to after the backend is built. Qwen3-MoE remains
                       the natural first router adapter due to best MLX-LM support.
 ```
+
+---
+
+## User Objective Alignment — 2026-05-31
+
+This section is the current product/engineering intent and should guide all
+implementation work. It supersedes any narrower wording in older brainstorming
+documents that sounds like the project is only about Qwen3, only about
+MLX-LM-hosted community checkpoints, or about replacing the CUDA production
+workflow.
+
+### Primary objectives
+
+1. **Make Cerebras REAP work correctly on MLX/Apple Silicon despite MLX
+   constraints.**
+
+   The MLX backend must preserve the REAP pruning semantics and observer-data
+   contract while adapting to MLX realities: lazy execution, no PyTorch hooks,
+   different model layouts, unified memory, limited scatter/count primitives,
+   and MLX-LM save/reload behavior.
+
+2. **Make MLX REAP usable with arbitrary MoE weights through an explicit adapter
+   and weight-layout contract.**
+
+   The implementation must not hardcode the project to one model family. Qwen3
+   remains the first reference adapter because it is a practical bootstrap
+   target, but the design target is: any MoE model whose weights and routing
+   semantics can be represented by an MLX model adapter should be observable,
+   prunable, saveable, and reloadable.
+
+### Relationship to the original CUDA REAP pipeline
+
+The existing PyTorch/CUDA REAP implementation remains the production and
+official experimentation path for CUDA-compatible systems. The MLX path is a
+parallel Apple Silicon experimentation backend for researchers who want to
+prototype REAP applications locally on Mac hardware.
+
+Therefore:
+
+- Do **not** destabilize or route production CUDA workflows through MLX.
+- Do **not** force the existing Torch entrypoints to become backend-generic
+  before the MLX path is proven.
+- Do keep schemas, pruning semantics, metric names, and saved metadata aligned
+  enough that results from the two paths are comparable.
+- Do keep model support adapter-driven, not model-name-driven.
+
+### Implications for active issues
+
+- Qwen3-specific issues are bootstrap/reference-adapter work, not the final
+  model-support boundary.
+- The model adapter issue must define the extension contract for additional or
+  user-provided MoE weight layouts.
+- The observer and pruner must work from adapter-provided routing and expert
+  execution semantics, not Qwen-only assumptions.
+- Real-model validation should use any available MoE model that fits Apple
+  Silicon hardware and should record limitations as follow-up adapter work.
+
+### Changelog
+
+```
+2026-05-31  Codex   Added explicit alignment with the two user objectives:
+                    MLX-compatible REAP for Apple Silicon experimentation, and
+                    adapter-driven support for arbitrary MoE weights while
+                    preserving the original CUDA REAP production path.
+```
