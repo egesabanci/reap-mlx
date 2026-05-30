@@ -6,6 +6,38 @@
 
 ---
 
+## User Objective Alignment - 2026-05-31
+
+This plan serves two user objectives:
+
+1. Make Cerebras' REAP implementation work on MLX, within MLX's real
+   constraints, without destabilizing the existing codebase.
+2. Make the MLX implementation work with any compatible MoE weights whose
+   routing and expert layout can be represented by the MLX adapter contract.
+
+The original PyTorch/CUDA REAP implementation remains the production and
+official experimentation workflow. The MLX backend is a parallel Apple Silicon
+experimentation path so researchers with Mac hardware can iterate on REAP
+applications without CUDA-compatible devices.
+
+Planning consequences:
+
+- Do not replace, weaken, or refactor the CUDA/PyTorch path unless a change is
+  explicitly required for import isolation.
+- Treat Qwen3-MoE as the bootstrap/reference adapter, not the final target or
+  architecture boundary.
+- Put model-specific routing, expert layout, shared-expert handling, tensor
+  names, and config-update behavior behind explicit MLX adapter contracts.
+- Prefer synthetic adapter/unit tests for normal CI and keep large real-model
+  checks as manual or marked slow tests.
+- Preserve REAP pruning semantics and observer-data compatibility while adapting
+  execution to MLX constraints such as lazy evaluation, no PyTorch hooks,
+  MLX-LM module layouts, and save/reload behavior.
+- Every active issue should stay aligned with the adapter-driven arbitrary-MoE
+  goal and the CUDA-as-production / MLX-as-Apple-Silicon-experimentation split.
+
+---
+
 ## Reference: Architecture Decisions (Read-Only)
 
 These decisions are settled. Do not reopen without explicit discussion.

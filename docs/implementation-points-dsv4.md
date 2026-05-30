@@ -6,6 +6,19 @@ Document detailing the key aspects and concrete steps required to port REAP (Rou
 
 ---
 
+## Alignment Notice - 2026-05-31
+
+The production and official experimentation workflow remains the original
+PyTorch/CUDA REAP implementation. The MLX backend is a parallel Apple Silicon
+experimentation path.
+
+The MLX goal is adapter-driven support for compatible MoE weights, not a
+one-model port. Qwen3-MoE is the bootstrap/reference adapter only; model-specific
+routing, expert layout, shared-expert behavior, and config updates must live
+behind explicit MLX adapter contracts.
+
+---
+
 ## 1. Architectural Strategy: Abstract Backend Layer
 
 Create a thin abstraction layer for framework-specific operations, allowing the core REAP algorithms to remain framework-agnostic while PyTorch and MLX backends coexist.

@@ -5,6 +5,19 @@
 
 ---
 
+## Alignment Notice - 2026-05-31
+
+Read model-specific language in this historical draft through the current
+objective: the PyTorch/CUDA REAP path remains production/official, while MLX is
+a parallel Apple Silicon experimentation backend.
+
+Qwen3-MoE is the bootstrap/reference adapter, not the final target boundary. The
+MLX implementation must be adapter-driven so any compatible MoE weights can be
+represented through explicit routing, expert-layout, shared-expert, and config
+contracts.
+
+---
+
 ## 0. Executive Summary
 
 **Goal:** Implement REAP expert pruning on MLX/Apple Silicon for Qwen3-30B-A3B (primary target), with a design that extends to Mixtral, Llama-4, DeepSeek V2, GLM-4.5, and ERNIE 4.5 as MLX models become available.

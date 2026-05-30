@@ -15,6 +15,17 @@ This document is a polished synthesis of every current planning document in
 It keeps the useful ideas, resolves contradictions, and turns the plan into a
 smaller implementation contract. This is still a planning document only.
 
+## Alignment Notice - 2026-05-31
+
+The production and official experimentation workflow remains the original
+PyTorch/CUDA REAP implementation. The MLX backend is a parallel Apple Silicon
+experimentation path.
+
+The MLX goal is adapter-driven support for compatible MoE weights, not a
+one-model port. Qwen3-MoE is the bootstrap/reference adapter only; model-specific
+routing, expert layout, shared-expert behavior, and config updates must live
+behind explicit MLX adapter contracts.
+
 ## Executive Decision
 
 Build a separate MLX pruning path first. Do not begin by refactoring the whole
