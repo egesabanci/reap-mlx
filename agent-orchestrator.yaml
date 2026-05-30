@@ -11,8 +11,7 @@ defaults:
   runtime: tmux
   agent: opencode
   workspace: worktree
-  notifiers:
-    - dashboard
+  notifiers: []
   orchestrator:
     agent: opencode
   worker:
@@ -25,6 +24,7 @@ projects:
     path: /Users/egesabanci/Desktop/reap-mlx
     defaultBranch: main
     sessionPrefix: reapmlx
+    orchestratorSessionStrategy: delete
     runtime: tmux
     workspace: worktree
     tracker:
@@ -39,7 +39,7 @@ projects:
     worker:
       agent: codex
       agentConfig:
-        model: gpt-5.5-xhigh
+        model: gpt-5.5
         permissions: permissionless
     agentRulesFile: .agent-rules.md
     orchestratorRules: |
@@ -61,7 +61,3 @@ projects:
       - Before spawning implementation work, confirm the issue has a precise acceptance checklist and test scope.
       - Require workers to report changed files, verification commands, and remaining risks.
       - Surface design disagreements early instead of allowing silent divergence between adapters, routing, pruning, merging, and validation work.
-
-notifiers:
-  dashboard:
-    plugin: dashboard
