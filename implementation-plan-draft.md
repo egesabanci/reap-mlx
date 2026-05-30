@@ -1152,3 +1152,53 @@ implementation.
                     quantized slicing, pairwise frequency parity, and slow-test
                     boundary for real 4-bit Qwen model loading.
 ```
+
+---
+
+## DSv4 Turn — 2026-05-30: Target Clarification
+
+### Primary goal is MLX compatibility, NOT a specific model
+
+The plan currently anchors heavily on Qwen3-30B-A3B as the target model. This
+needs correction: **the goal is to make the REAP codebase MLX-compatible and
+runnable on Apple Silicon (Mac) hardware.** Model selection is deferred until
+after the MLX backend is built and working.
+
+### What this changes
+
+| Aspect | Before | After |
+|---|---|---|
+| Primary objective | Prune Qwen3-30B-A3B at 25% compression | Build MLX backend that works across supported MoE architectures |
+| First model | Qwen3-MoE, then Mixtral later | Any supported architecture; Qwen3-MoE is still the natural first router adapter (best MLX-LM community support) |
+| E2E validation | Specific 4-bit Qwen3 model | Run on whatever model is available, small enough for dev hardware |
+| Phase 4+ | "Mixtral, then other architectures" | Each architecture is a router adapter module — add incrementally as needed |
+
+### What stays the same
+
+- Architecture decisions D1-D10 are all still valid and correct
+- Phase 0-3 implementation order is unchanged
+- The observer data contract, pruning logic, and accumulator design are
+  architecture-agnostic — they were already designed that way
+- Router adapters are still per-architecture — Qwen3MoeRouter is just the first
+  one, not the only one
+- Synthetic tiny models for unit tests — architectural decisions don't require a
+  specific real model
+
+### Adjusted acceptance criteria
+
+Phase 3 E2E validation should work with **any available MLX-LM MoE model** that
+fits in the development machine's unified memory. The model used for validation
+is chosen at test time based on what's available, not hardcoded to Qwen3.
+
+P0-003 (environment verification) should verify that `mlx` and `mlx_lm` are
+importable and that memory APIs work. Loading a specific large model is a
+separate manual smoke check, not a gate.
+
+### Changelog
+
+```
+2026-05-30  DSv4     Target clarification: primary goal is MLX backend compatibility
+                      on Apple Silicon, not a specific model. Model selection
+                      deferred to after the backend is built. Qwen3-MoE remains
+                      the natural first router adapter due to best MLX-LM support.
+```
