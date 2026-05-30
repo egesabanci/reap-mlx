@@ -16,6 +16,7 @@ scratch/
 .env
 .uv_cache/
 .cache/
+.ao/
 wandb/
 api-key.txt
 prod_env/credentials.conf
