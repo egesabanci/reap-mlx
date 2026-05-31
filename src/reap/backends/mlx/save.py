@@ -6,6 +6,7 @@ default save, load, or generation helpers are executed.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ class SaveReloadResult:
     reloaded_config: Mapping[str, Any]
     expected_expert_count: int
     smoke_result: Any = None
+    metrics: Mapping[str, Any] | None = None
 
 
 def save_pruned_model(
@@ -48,8 +50,10 @@ def save_pruned_model(
     expected_count = _expected_expert_count(config, expected_expert_count)
     save_fn = _default_save_fn() if save_fn is None else save_fn
     load_fn = _default_load_fn() if load_fn is None else load_fn
+    timings: dict[str, float] = {}
 
     try:
+        save_started = time.perf_counter()
         save_fn(
             dst_path=str(output_path),
             src_path_or_repo=str(original_model_name),
@@ -57,17 +61,23 @@ def save_pruned_model(
             tokenizer=tokenizer,
             config=config,
         )
+        timings["save_seconds"] = time.perf_counter() - save_started
     except Exception as exc:
         raise RuntimeError(
             f"Failed to save pruned MLX model to {output_path}."
         ) from exc
 
     _validate_saved_artifacts(output_path)
+    artifact_summary = _artifact_summary(output_path)
 
+    reload_started = time.perf_counter()
     reloaded_model, reloaded_tokenizer, reloaded_config = _load_reloaded_model(
         load_fn,
         output_path,
     )
+    timings["reload_seconds"] = time.perf_counter() - reload_started
+
+    validation_started = time.perf_counter()
     _validate_reloaded_config(reloaded_config, expected_count)
     _validate_reloaded_model_shapes(
         reloaded_model,
@@ -75,13 +85,37 @@ def save_pruned_model(
         adapter=adapter,
         expected_expert_count=expected_count,
     )
+    timings["reload_validation_seconds"] = time.perf_counter() - validation_started
 
     smoke_result = None
+    smoke_metrics = {
+        "enabled": smoke_fn is not None,
+        "completed": False,
+        "prompt": "What is your name?",
+        "max_tokens": 16,
+        "elapsed_seconds": None,
+        "generated_token_count": None,
+        "result_preview": None,
+    }
     if smoke_fn is not None:
+        smoke_started = time.perf_counter()
         smoke_result = smoke_fn(
             reloaded_model,
             reloaded_tokenizer,
             reloaded_config,
+        )
+        smoke_elapsed = time.perf_counter() - smoke_started
+        timings["smoke_seconds"] = smoke_elapsed
+        smoke_metrics.update(
+            {
+                "completed": True,
+                "elapsed_seconds": smoke_elapsed,
+                "generated_token_count": _count_generated_tokens(
+                    reloaded_tokenizer,
+                    smoke_result,
+                ),
+                "result_preview": _preview(smoke_result),
+            }
         )
 
     return SaveReloadResult(
@@ -91,6 +125,11 @@ def save_pruned_model(
         reloaded_config=reloaded_config,
         expected_expert_count=expected_count,
         smoke_result=smoke_result,
+        metrics={
+            "timings": timings,
+            "artifacts": artifact_summary,
+            "smoke": smoke_metrics,
+        },
     )
 
 
@@ -193,6 +232,28 @@ def _validate_saved_artifacts(output_dir: Path) -> None:
             "Saved MLX model is missing weight artifacts matching "
             f"{_WEIGHT_PATTERNS} in {output_dir}."
         )
+
+
+def _artifact_summary(output_dir: Path) -> dict[str, Any]:
+    files = []
+    seen: set[Path] = set()
+    for pattern in _WEIGHT_PATTERNS + ("*.json", "*.model", "*.txt"):
+        for path in output_dir.glob(pattern):
+            if path in seen or not path.is_file():
+                continue
+            seen.add(path)
+            files.append(
+                {
+                    "path": str(path.relative_to(output_dir)),
+                    "bytes": path.stat().st_size,
+                }
+            )
+    files.sort(key=lambda item: item["path"])
+    return {
+        "file_count": len(files),
+        "total_bytes": sum(int(item["bytes"]) for item in files),
+        "files": files,
+    }
 
 
 def _load_reloaded_model(load_fn: Callable[..., Any], output_dir: Path) -> tuple[
@@ -323,6 +384,39 @@ def _validate_first_dim(
             f"Reloaded {name} first dimension mismatch: expected "
             f"{expected_expert_count}, got shape {shape}."
         )
+
+
+def _count_generated_tokens(tokenizer: Any, text: Any) -> int | None:
+    if not isinstance(text, str):
+        return None
+
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        return None
+
+    try:
+        token_ids = encode(text, add_special_tokens=False)
+    except TypeError:
+        try:
+            token_ids = encode(text)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    try:
+        return len(token_ids)
+    except TypeError:
+        return None
+
+
+def _preview(value: Any, *, max_chars: int = 500) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
 
 
 __all__ = [
