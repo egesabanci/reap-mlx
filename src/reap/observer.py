@@ -1,8 +1,8 @@
 """Layerwise observer for MLX-backed MoE models.
 
-The MLX observer uses explicit layer replay instead of PyTorch hooks. It records
-only selected expert outputs for pruning metrics and avoids importing optional
-MLX runtime packages until observation is executed.
+The observer uses explicit MLX layer replay. It records only selected expert
+outputs for pruning metrics and avoids importing optional MLX runtime packages
+until observation is executed.
 """
 
 from __future__ import annotations

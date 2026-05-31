@@ -1,8 +1,8 @@
 """Expert pruning for adapter-described MLX MoE modules.
 
 This module mutates live MLX-LM-style modules by slicing expert-stacked arrays
-on their first dimension. It intentionally avoids importing MLX, MLX-LM, Torch,
-or vLLM at module import time.
+on their first dimension. It intentionally avoids importing MLX or MLX-LM at
+module import time.
 """
 
 from __future__ import annotations

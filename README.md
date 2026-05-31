@@ -3,10 +3,6 @@
 Apple Silicon / MLX implementation of Router-weighted Expert Activation
 Pruning (REAP) for MLX-LM MoE models.
 
-This repository is now focused on MLX-LM. The original CUDA/PyTorch
-experiment scripts, plotting assets, Docker setup, paper reproduction
-materials, and eager Torch source have been removed.
-
 ## Current Scope
 
 The working path is:
@@ -88,4 +84,5 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 
 - `artifacts/` is ignored and is the intended location for local pruned models,
   validation metrics, and scratch chat helpers.
-- The license file is retained until the replacement license/notice is decided.
+- This codebase is MLX-only. It intentionally does not include CUDA, PyTorch,
+  vLLM, plotting, or paper reproduction workflows.
