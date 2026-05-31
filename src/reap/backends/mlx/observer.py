@@ -13,11 +13,12 @@ from typing import Any, Callable
 
 from reap.backends.mlx.metrics import PruningState
 from reap.backends.mlx.model_adapters import (
-    Qwen3MoeModelAdapter,
     get_shared_expert,
+    infer_model_adapter,
     make_attention_mask,
+    make_ssm_mask,
 )
-from reap.backends.mlx.router import Qwen3MoeRouter
+from reap.backends.mlx.router import Lfm2MoeRouter, Qwen3MoeRouter
 
 
 logger = logging.getLogger(__name__)
@@ -35,10 +36,43 @@ def observe_model(
 ) -> dict[int, dict[str, Any]]:
     """Collect pruning-compatible observer data with explicit MLX layer replay."""
     mx = _require_mlx_core()
-    adapter = Qwen3MoeModelAdapter() if adapter is None else adapter
     config = {} if config is None else config
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
     eval_fn = mx.eval if eval_fn is None else eval_fn
 
+    if getattr(adapter, "adapter_name", None) == "lfm2_moe":
+        return _observe_lfm2_model(
+            model,
+            calibration_sequences,
+            config,
+            adapter=adapter,
+            debug_memory=debug_memory,
+            eval_fn=eval_fn,
+            mask_fn=mask_fn,
+        )
+
+    return _observe_qwen3_model(
+        model,
+        calibration_sequences,
+        config,
+        adapter=adapter,
+        debug_memory=debug_memory,
+        eval_fn=eval_fn,
+        mask_fn=mask_fn,
+    )
+
+
+def _observe_qwen3_model(
+    model: Any,
+    calibration_sequences: list[Any],
+    config: Mapping[str, Any],
+    *,
+    adapter: Any,
+    debug_memory: bool,
+    eval_fn: Callable[[Any], Any],
+    mask_fn: Callable[..., Any] | None,
+) -> dict[int, dict[str, Any]]:
+    mx = _require_mlx_core()
     layers = adapter.layers(model)
     moe_layer_indices = set(adapter.identify_moe_layers(model))
     embed_tokens = _get_embed_tokens(model)
@@ -74,6 +108,61 @@ def observe_model(
             else:
                 dense_mlp = adapter.get_dense_mlp(layer)
                 h = h + dense_mlp(moe_input)
+
+            eval_fn(h)
+            if debug_memory:
+                _log_memory(mx, layer_idx)
+
+    return {layer_idx: state.report() for layer_idx, state in accumulators.items()}
+
+
+def _observe_lfm2_model(
+    model: Any,
+    calibration_sequences: list[Any],
+    config: Mapping[str, Any],
+    *,
+    adapter: Any,
+    debug_memory: bool,
+    eval_fn: Callable[[Any], Any],
+    mask_fn: Callable[..., Any] | None,
+) -> dict[int, dict[str, Any]]:
+    mx = _require_mlx_core()
+    layers = adapter.layers(model)
+    moe_layer_indices = set(adapter.identify_moe_layers(model))
+    embed_tokens = _get_embed_tokens(model)
+
+    accumulators = _initialize_accumulators(
+        layers,
+        moe_layer_indices,
+        adapter=adapter,
+        config=config,
+    )
+
+    for sequence in calibration_sequences:
+        tokens = _batch_tokens(mx, sequence)
+        h = embed_tokens(tokens)
+        attn_mask, conv_mask = _lfm2_masks(
+            h,
+            sequence_length=tokens.shape[-1],
+            mask_fn=mask_fn,
+        )
+
+        for layer_idx, layer in enumerate(layers):
+            operator_mask = attn_mask if _is_lfm2_attention_layer(layer) else conv_mask
+            h_mid = _run_lfm2_operator(layer, h, operator_mask)
+            ffn_input = _call_required(layer, "ffn_norm", h_mid)
+
+            if layer_idx in moe_layer_indices:
+                h = h_mid + _observe_lfm2_moe_layer(
+                    layer,
+                    ffn_input,
+                    accumulators[layer_idx],
+                    adapter=adapter,
+                    config=config,
+                )
+            else:
+                dense_mlp = adapter.get_dense_mlp(layer)
+                h = h_mid + dense_mlp(ffn_input)
 
             eval_fn(h)
             if debug_memory:
@@ -161,6 +250,37 @@ def _attention_mask(
     return make_attention_mask(hidden_states, cache=None)
 
 
+def _lfm2_masks(
+    hidden_states: Any,
+    *,
+    sequence_length: int,
+    mask_fn: Callable[..., Any] | None,
+) -> tuple[Any | None, Any | None]:
+    if sequence_length == 1 and mask_fn is None:
+        return None, None
+    if mask_fn is not None:
+        return (
+            _call_mask_fn(mask_fn, hidden_states, kind="attention"),
+            _call_mask_fn(mask_fn, hidden_states, kind="ssm"),
+        )
+    return (
+        make_attention_mask(hidden_states, cache=None),
+        make_ssm_mask(hidden_states, cache=None),
+    )
+
+
+def _call_mask_fn(
+    mask_fn: Callable[..., Any],
+    hidden_states: Any,
+    *,
+    kind: str,
+) -> Any:
+    try:
+        return mask_fn(hidden_states, cache=None, kind=kind)
+    except TypeError:
+        return mask_fn(hidden_states, cache=None)
+
+
 def _run_attention(layer: Any, h: Any, mask: Any | None) -> Any:
     normalized = _call_required(layer, "input_layernorm", h)
     self_attn = getattr(layer, "self_attn", None)
@@ -173,6 +293,33 @@ def _run_attention(layer: Any, h: Any, mask: Any | None) -> Any:
     return h + attention_output
 
 
+def _is_lfm2_attention_layer(layer: Any) -> bool:
+    is_attention_layer = getattr(layer, "is_attention_layer", None)
+    if is_attention_layer is not None:
+        return bool(is_attention_layer)
+    return callable(getattr(layer, "self_attn", None))
+
+
+def _run_lfm2_operator(layer: Any, h: Any, mask: Any | None) -> Any:
+    normalized = _call_required(layer, "operator_norm", h)
+    if _is_lfm2_attention_layer(layer):
+        operator = getattr(layer, "self_attn", None)
+        if not callable(operator):
+            raise ValueError(
+                "LFM2 attention layer does not expose a callable self_attn module."
+            )
+        operator_output = operator(normalized, mask=mask, cache=None)
+    else:
+        operator = getattr(layer, "conv", None)
+        if not callable(operator):
+            raise ValueError("LFM2 conv layer does not expose a callable conv module.")
+        operator_output = operator(normalized, mask=mask, cache=None)
+
+    if isinstance(operator_output, tuple):
+        operator_output = operator_output[0]
+    return h + operator_output
+
+
 def _observe_moe_layer(
     layer: Any,
     moe_input: Any,
@@ -181,6 +328,7 @@ def _observe_moe_layer(
     adapter: Any,
     config: Mapping[str, Any],
 ) -> Any:
+    mx = _require_mlx_core()
     moe = adapter.get_moe(layer)
     routing = Qwen3MoeRouter(moe, config)(moe_input)
     switch_mlp = getattr(moe, "switch_mlp", None)
@@ -188,7 +336,40 @@ def _observe_moe_layer(
         raise ValueError("MoE layer does not expose a callable switch_mlp module.")
 
     selected_outputs = switch_mlp(moe_input, routing.indices)
-    state.accumulate(routing, selected_outputs=selected_outputs)
+    state.accumulate(
+        indices=routing.indices,
+        scores=routing.scores.astype(mx.float32),
+        selected_outputs=selected_outputs.astype(mx.float32),
+    )
+
+    moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
+    shared_expert = get_shared_expert(moe)
+    if shared_expert is not None:
+        moe_out = moe_out + shared_expert(moe_input)
+    return moe_out
+
+
+def _observe_lfm2_moe_layer(
+    layer: Any,
+    moe_input: Any,
+    state: PruningState,
+    *,
+    adapter: Any,
+    config: Mapping[str, Any],
+) -> Any:
+    mx = _require_mlx_core()
+    moe = adapter.get_moe(layer)
+    routing = Lfm2MoeRouter(moe, config)(moe_input)
+    switch_mlp = getattr(moe, "switch_mlp", None)
+    if not callable(switch_mlp):
+        raise ValueError("MoE layer does not expose a callable switch_mlp module.")
+
+    selected_outputs = switch_mlp(moe_input, routing.indices)
+    state.accumulate(
+        indices=routing.indices,
+        scores=routing.scores.astype(mx.float32),
+        selected_outputs=selected_outputs.astype(mx.float32),
+    )
 
     moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
     shared_expert = get_shared_expert(moe)
