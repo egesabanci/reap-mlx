@@ -4,7 +4,7 @@ set -euo pipefail
 # MLX REAP pruning experiment wrapper.
 # Usage: bash experiments/mlx-pruning.sh [MODEL_NAME] [DATASET] [PRUNE_METHOD] [COMPRESSION_RATIO] [SEED]
 
-MODEL=${1:-"mlx-community/Qwen3-30B-A3B-4bit-DWQ"}
+MODEL=${1:-"LiquidAI/LFM2.5-8B-A1B-MLX-4bit"}
 DATASET=${2:-"theblackcat102/evol-codealpaca-v1"}
 METHOD=${3:-"reap"}
 RATIO=${4:-"0.25"}
