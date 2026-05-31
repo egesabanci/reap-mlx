@@ -1,0 +1,384 @@
+"""Tests for MLX expert pruning mutation."""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from reap.backends.mlx.prune import (
+    compute_keep_indices,
+    prune_experts,
+    resolve_prune_method,
+    slice_first_dim,
+)
+
+
+MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
+
+requires_mlx = pytest.mark.skipif(
+    not MLX_AVAILABLE,
+    reason="MLX is not installed in this environment.",
+)
+
+
+def test_prune_module_import_does_not_import_heavy_runtime_packages():
+    repo_root = Path(__file__).resolve().parents[1]
+    src_dir = repo_root / "src"
+    code = textwrap.dedent(
+        """
+        import sys
+
+        BLOCKED_ROOTS = ("torch", "vllm", "mlx", "mlx_lm")
+
+        def is_blocked(fullname):
+            return any(
+                fullname == root or fullname.startswith(root + ".")
+                for root in BLOCKED_ROOTS
+            )
+
+        class ImportBlocker:
+            def find_spec(self, fullname, path=None, target=None):
+                if is_blocked(fullname):
+                    raise AssertionError(
+                        "forbidden import during MLX prune import: "
+                        f"{fullname}"
+                    )
+                return None
+
+        sys.meta_path.insert(0, ImportBlocker())
+
+        from reap.backends.mlx.prune import prune_experts
+
+        assert prune_experts is not None
+
+        forbidden_loaded = sorted(
+            name for name in sys.modules if is_blocked(name)
+        )
+        if forbidden_loaded:
+            raise AssertionError(
+                "forbidden modules loaded during MLX prune import: "
+                + ", ".join(forbidden_loaded)
+            )
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(src_dir)
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+class SliceModule:
+    def __init__(self, num_experts: int, offset: int):
+        base = np.arange(num_experts * 6, dtype=np.float32).reshape(
+            num_experts,
+            2,
+            3,
+        )
+        self.weight = base + offset
+        self.scales = (
+            np.arange(num_experts * 2, dtype=np.float32).reshape(num_experts, 2)
+            + offset
+            + 100
+        )
+        self.biases = (
+            np.arange(num_experts * 2, dtype=np.float32).reshape(num_experts, 2)
+            + offset
+            + 200
+        )
+        self.bias = (
+            np.arange(num_experts * 2, dtype=np.float32).reshape(num_experts, 2)
+            + offset
+            + 300
+        )
+
+    def get(self, name: str):
+        return getattr(self, name, None)
+
+
+class TinySwitchMlp:
+    def __init__(self, num_experts: int):
+        self.gate_proj = SliceModule(num_experts, 0)
+        self.up_proj = SliceModule(num_experts, 1000)
+        self.down_proj = SliceModule(num_experts, 2000)
+
+    def __call__(self, hidden_states, indices):
+        selected_values = self.gate_proj.weight[indices, 0, 0]
+        return np.stack([selected_values, selected_values + 1.0], axis=-1)
+
+
+class TinyGate:
+    def __init__(self, num_experts: int):
+        self.weight = (
+            np.arange(num_experts * 2, dtype=np.float32).reshape(num_experts, 2)
+            + 4000
+        )
+        self.bias = np.arange(num_experts, dtype=np.float32) + 5000
+        self.e_score_correction_bias = (
+            np.arange(num_experts, dtype=np.float32) + 6000
+        )
+        self.num_experts = num_experts
+        self.n_routed_experts = num_experts
+        self.top_k = 3
+
+
+class TinyMoe:
+    def __init__(self, num_experts: int = 4, top_k: int = 3):
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_experts_per_tok = top_k
+        self.norm_topk_prob = False
+        self.gate = TinyGate(num_experts)
+        self.switch_mlp = TinySwitchMlp(num_experts)
+
+    def __call__(self, hidden_states, indices):
+        selected_outputs = self.switch_mlp(hidden_states, indices)
+        scores = np.ones(indices.shape, dtype=np.float32) / indices.shape[-1]
+        return (selected_outputs * scores[..., None]).sum(axis=-2)
+
+
+def make_model(num_experts: int = 4, top_k: int = 3):
+    moe = TinyMoe(num_experts=num_experts, top_k=top_k)
+    return SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=moe)]),
+    )
+
+
+def qwen_config(num_experts: int = 4, top_k: int = 3):
+    return {
+        "num_experts": num_experts,
+        "num_experts_per_tok": top_k,
+        "top_k": top_k,
+        "norm_topk_prob": False,
+    }
+
+
+def test_resolve_prune_method_aliases_and_rejects_unknown_method():
+    assert resolve_prune_method("frequency") == "expert_frequency"
+    assert (
+        resolve_prune_method("weighted_frequency_sum")
+        == "weighted_expert_frequency_sum"
+    )
+    assert resolve_prune_method("reap") == "reap"
+
+    with pytest.raises(ValueError, match="Unsupported prune method"):
+        resolve_prune_method("ean_ca")
+
+
+def test_compute_keep_indices_keeps_highest_saliency_in_ascending_order():
+    keep = compute_keep_indices(np.array([0.1, 0.9, 0.2, 0.8]), 2)
+
+    np.testing.assert_array_equal(keep, np.array([1, 3]))
+
+
+def test_prune_experts_slices_qwen_switch_router_metadata_and_config():
+    model = make_model(num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    moe = model.model.layers[0].mlp
+    keep = np.array([1, 3])
+
+    originals = {
+        "gate_proj_weight": moe.switch_mlp.gate_proj.weight.copy(),
+        "gate_proj_scales": moe.switch_mlp.gate_proj.scales.copy(),
+        "gate_proj_biases": moe.switch_mlp.gate_proj.biases.copy(),
+        "gate_proj_bias": moe.switch_mlp.gate_proj.bias.copy(),
+        "up_proj_weight": moe.switch_mlp.up_proj.weight.copy(),
+        "down_proj_weight": moe.switch_mlp.down_proj.weight.copy(),
+        "gate_weight": moe.gate.weight.copy(),
+        "gate_bias": moe.gate.bias.copy(),
+        "gate_correction": moe.gate.e_score_correction_bias.copy(),
+    }
+
+    keep_by_layer = prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+        "reap",
+        0.5,
+    )
+
+    np.testing.assert_array_equal(keep_by_layer[0], keep)
+    np.testing.assert_array_equal(
+        moe.switch_mlp.gate_proj.weight,
+        originals["gate_proj_weight"][keep],
+    )
+    np.testing.assert_array_equal(
+        moe.switch_mlp.gate_proj.scales,
+        originals["gate_proj_scales"][keep],
+    )
+    np.testing.assert_array_equal(
+        moe.switch_mlp.gate_proj.biases,
+        originals["gate_proj_biases"][keep],
+    )
+    np.testing.assert_array_equal(
+        moe.switch_mlp.gate_proj.bias,
+        originals["gate_proj_bias"][keep],
+    )
+    np.testing.assert_array_equal(
+        moe.switch_mlp.up_proj.weight,
+        originals["up_proj_weight"][keep],
+    )
+    np.testing.assert_array_equal(
+        moe.switch_mlp.down_proj.weight,
+        originals["down_proj_weight"][keep],
+    )
+    np.testing.assert_array_equal(moe.gate.weight, originals["gate_weight"][keep])
+    np.testing.assert_array_equal(moe.gate.bias, originals["gate_bias"][keep])
+    np.testing.assert_array_equal(
+        moe.gate.e_score_correction_bias,
+        originals["gate_correction"][keep],
+    )
+
+    assert moe.num_experts == 2
+    assert moe.top_k == 2
+    assert moe.num_experts_per_tok == 2
+    assert moe.gate.num_experts == 2
+    assert moe.gate.n_routed_experts == 2
+    assert moe.gate.top_k == 2
+    assert config["num_experts"] == 2
+    assert config["num_experts_per_tok"] == 2
+    assert config["top_k"] == 2
+
+
+def test_prune_experts_accepts_weighted_frequency_alias():
+    model = make_model(num_experts=3, top_k=2)
+    config = qwen_config(num_experts=3, top_k=2)
+
+    keep_by_layer = prune_experts(
+        model,
+        config,
+        {0: {"weighted_expert_frequency_sum": np.array([0.1, 0.9, 0.8])}},
+        "weighted_frequency_sum",
+        1 / 3,
+    )
+
+    np.testing.assert_array_equal(keep_by_layer[0], np.array([1, 2]))
+    assert config["num_experts"] == 2
+    assert config["num_experts_per_tok"] == 2
+
+
+@requires_mlx
+def test_slice_first_dim_handles_mlx_arrays():
+    import mlx.core as mx
+
+    module = SimpleNamespace(
+        weight=mx.array([[0, 1], [2, 3], [4, 5]]),
+        scales=mx.array([[10], [11], [12]]),
+    )
+
+    slice_first_dim(
+        module,
+        np.array([0, 2]),
+        num_experts=3,
+        field_names=("weight", "scales"),
+    )
+    mx.eval(module.weight, module.scales)
+
+    assert module.weight.tolist() == [[0, 1], [4, 5]]
+    assert module.scales.tolist() == [[10], [12]]
+
+
+def test_pruned_tiny_moe_forward_keeps_output_shape():
+    model = make_model(num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    moe = model.model.layers[0].mlp
+
+    prune_experts(
+        model,
+        config,
+        {0: {"expert_frequency": np.array([1, 4, 2, 3])}},
+        "frequency",
+        0.5,
+    )
+
+    hidden_states = np.ones((1, 2, 2), dtype=np.float32)
+    indices = np.array([[[0, 1], [1, 0]]], dtype=np.int64)
+    output = moe(hidden_states, indices)
+
+    assert output.shape == hidden_states.shape
+
+
+@pytest.mark.parametrize("compression_ratio", [-0.1, 1.0])
+def test_prune_experts_rejects_invalid_compression_ratio(compression_ratio):
+    model = make_model()
+    config = qwen_config()
+
+    with pytest.raises(ValueError, match="compression_ratio"):
+        prune_experts(
+            model,
+            config,
+            {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+            "reap",
+            compression_ratio,
+        )
+
+
+def test_prune_experts_rejects_missing_observer_layer_data():
+    model = make_model()
+    config = qwen_config()
+
+    with pytest.raises(ValueError, match="Missing observer data for MoE layer 0"):
+        prune_experts(model, config, {}, "reap", 0.5)
+
+
+def test_prune_experts_rejects_wrong_saliency_length():
+    model = make_model(num_experts=4)
+    config = qwen_config(num_experts=4)
+
+    with pytest.raises(ValueError, match="expected 4"):
+        prune_experts(
+            model,
+            config,
+            {0: {"reap": np.array([0.1, 0.9, 0.2])}},
+            "reap",
+            0.5,
+        )
+
+
+def test_prune_experts_rejects_missing_switch_projection():
+    model = make_model()
+    config = qwen_config()
+    delattr(model.model.layers[0].mlp.switch_mlp, "up_proj")
+
+    with pytest.raises(ValueError, match="missing up_proj"):
+        prune_experts(
+            model,
+            config,
+            {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+            "reap",
+            0.5,
+        )
+
+
+def test_prune_experts_rejects_slice_field_with_wrong_first_dimension():
+    model = make_model(num_experts=4)
+    config = qwen_config(num_experts=4)
+    model.model.layers[0].mlp.switch_mlp.gate_proj.scales = np.zeros(
+        (3, 2),
+        dtype=np.float32,
+    )
+
+    with pytest.raises(ValueError, match="scales first dimension"):
+        prune_experts(
+            model,
+            config,
+            {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+            "reap",
+            0.5,
+        )
