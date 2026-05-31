@@ -1,8 +1,7 @@
 """NumPy pruning accumulators for MLX-backed MoE observation.
 
-This module is intentionally independent from the existing Torch pruning
-metrics. MLX observer code should pass compact selected-route arrays here after
-forcing any needed MLX evaluation boundaries.
+MLX observer code should pass compact selected-route arrays here after forcing
+any needed MLX evaluation boundaries.
 """
 
 from __future__ import annotations
