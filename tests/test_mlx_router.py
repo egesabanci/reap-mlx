@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from reap.backends.mlx.router import Qwen3MoeRouter, RouterResult
+from reap.backends.mlx.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
 
 
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
@@ -53,8 +53,9 @@ def test_router_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.router import Qwen3MoeRouter, RouterResult
+        from reap.backends.mlx.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
 
+        assert Lfm2MoeRouter is not None
         assert Qwen3MoeRouter is not None
         assert RouterResult(indices=1, scores=2).score_mode == "actual"
 
@@ -124,6 +125,22 @@ class TinyMlp:
             self.norm_topk_prob = norm_topk_prob
 
 
+class TinyLfm2Moe(TinyMlp):
+    def __init__(
+        self,
+        mx,
+        *,
+        top_k=None,
+        norm_topk_prob=None,
+        use_expert_bias=False,
+        expert_bias=None,
+    ):
+        super().__init__(mx, top_k=top_k, norm_topk_prob=norm_topk_prob)
+        self.use_expert_bias = use_expert_bias
+        if expert_bias is not None:
+            self.expert_bias = mx.array(expert_bias)
+
+
 def qwen_reference(mx, mlp, hidden_states, top_k, norm_topk_prob):
     leading_shape = hidden_states.shape[:-1]
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -138,6 +155,19 @@ def qwen_reference(mx, mlp, hidden_states, top_k, norm_topk_prob):
 
     output_shape = (*leading_shape, top_k)
     return indices.reshape(output_shape), scores.reshape(output_shape)
+
+
+def lfm2_reference(mx, moe, hidden_states, top_k, norm_topk_prob):
+    logits = moe.gate(hidden_states).astype(mx.float32)
+    gates = mx.softmax(logits, axis=-1)
+    if moe.use_expert_bias:
+        gates = gates + moe.expert_bias
+
+    indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
+    scores = mx.take_along_axis(gates, indices, axis=-1)
+    if norm_topk_prob:
+        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+    return indices, scores.astype(hidden_states.dtype)
 
 
 def assert_same_indices(actual, expected):
@@ -296,3 +326,77 @@ def test_qwen_router_prefers_live_top_k_over_config():
     result = Qwen3MoeRouter(mlp, {"num_experts_per_tok": 3})(hidden_states)
 
     assert result.indices.shape == (1, 1)
+
+
+@requires_mlx
+def test_lfm2_router_matches_reference_without_expert_bias():
+    import mlx.core as mx
+
+    moe = TinyLfm2Moe(mx, top_k=2, norm_topk_prob=False)
+    hidden_states = mx.array(
+        [
+            [[0.2, 0.4, 0.6], [1.0, -0.5, 0.25]],
+            [[-0.25, 0.5, 1.25], [0.0, 1.0, -1.0]],
+        ]
+    )
+
+    result = Lfm2MoeRouter(moe)(hidden_states)
+    expected_indices, expected_scores = lfm2_reference(
+        mx,
+        moe,
+        hidden_states,
+        top_k=2,
+        norm_topk_prob=False,
+    )
+
+    assert result.indices.shape == (2, 2, 2)
+    assert result.scores.shape == (2, 2, 2)
+    assert_same_indices(result.indices, expected_indices)
+    assert_allclose(mx, result.scores, expected_scores)
+
+
+@requires_mlx
+def test_lfm2_router_applies_expert_bias_before_top_k_selection():
+    import mlx.core as mx
+
+    moe = TinyLfm2Moe(
+        mx,
+        top_k=1,
+        norm_topk_prob=False,
+        use_expert_bias=True,
+        expert_bias=[0.0, 0.55, 0.0, 0.0],
+    )
+    hidden_states = mx.array([[[1.0, 0.0, 0.0]]])
+
+    result = Lfm2MoeRouter(moe)(hidden_states)
+    expected_indices, expected_scores = lfm2_reference(
+        mx,
+        moe,
+        hidden_states,
+        top_k=1,
+        norm_topk_prob=False,
+    )
+
+    assert result.indices.tolist() == [[[1]]]
+    assert_same_indices(result.indices, expected_indices)
+    assert_allclose(mx, result.scores, expected_scores)
+
+
+@requires_mlx
+def test_lfm2_router_renormalizes_biased_scores_with_epsilon():
+    import mlx.core as mx
+
+    moe = TinyLfm2Moe(
+        mx,
+        top_k=3,
+        norm_topk_prob=True,
+        use_expert_bias=True,
+        expert_bias=[0.0, 0.2, 0.1, 0.0],
+    )
+    hidden_states = mx.array([[[0.5, 0.25, -0.75], [1.0, 1.0, 1.0]]])
+
+    result = Lfm2MoeRouter(moe)(hidden_states)
+    selected_score_sums = result.scores.sum(axis=-1)
+
+    assert result.indices.shape == (1, 2, 3)
+    assert_allclose(mx, selected_score_sums, mx.ones(selected_score_sums.shape))
