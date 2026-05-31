@@ -1,0 +1,285 @@
+"""Tests for the MLX pruning CLI entrypoint."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from reap.backends.mlx.entrypoint import main
+
+
+def _subprocess_with_import_blocker(body: str) -> subprocess.CompletedProcess[str]:
+    repo_root = Path(__file__).resolve().parents[1]
+    src_dir = repo_root / "src"
+    code = textwrap.dedent(
+        f"""
+        import sys
+
+        BLOCKED_ROOTS = ("torch", "vllm", "mlx", "mlx_lm", "datasets")
+
+        def is_blocked(fullname):
+            return any(
+                fullname == root or fullname.startswith(root + ".")
+                for root in BLOCKED_ROOTS
+            )
+
+        class ImportBlocker:
+            def find_spec(self, fullname, path=None, target=None):
+                if is_blocked(fullname):
+                    raise AssertionError(
+                        "forbidden import during MLX CLI import/run: "
+                        f"{{fullname}}"
+                    )
+                return None
+
+        sys.meta_path.insert(0, ImportBlocker())
+
+        {body}
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(src_dir)
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_entrypoint_import_does_not_import_heavy_runtime_packages():
+    result = _subprocess_with_import_blocker(
+        """
+        from reap.backends.mlx.entrypoint import build_parser, main
+
+        assert build_parser is not None
+        assert main is not None
+
+        forbidden_loaded = sorted(
+            name for name in sys.modules if is_blocked(name)
+        )
+        if forbidden_loaded:
+            raise AssertionError(
+                "forbidden modules loaded during MLX CLI import: "
+                + ", ".join(forbidden_loaded)
+            )
+        """
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_help_works_without_heavy_runtime_imports():
+    result = _subprocess_with_import_blocker(
+        """
+        from reap.backends.mlx.entrypoint import main
+
+        raise SystemExit(main(["--help"]))
+        """
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "--model-name" in result.stdout
+    assert "--dataset-name" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (["--compression-ratio", "1.0"], "compression_ratio"),
+        (["--compression-ratio", "-0.1"], "compression_ratio"),
+        (["--compression-ratio", "nan"], "compression_ratio"),
+        (["--prune-method", "ean_ca"], "Unsupported prune method"),
+        (["--max-samples", "0"], "max_samples"),
+        (["--max-seq-length", "0"], "max_seq_length"),
+    ],
+)
+def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
+    def fail_load_model(model_name):
+        raise AssertionError("load_model_fn must not be called for invalid args")
+
+    args = [
+        "--model-name",
+        "model",
+        "--dataset-name",
+        "dataset",
+        "--output-dir",
+        "out",
+        *extra_args,
+    ]
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(args, load_model_fn=fail_load_model)
+
+    assert exc_info.value.code == 2
+
+
+def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_path):
+    events = []
+    output = []
+    model = object()
+    tokenizer = object()
+    config = {"num_experts": 4, "num_experts_per_tok": 2}
+    smoke = object()
+
+    def fake_load_model(model_name):
+        events.append(("load", model_name))
+        return model, tokenizer, config
+
+    def fake_load_calibration_sequences(tokenizer_arg, dataset_name, **kwargs):
+        events.append(("calibrate", tokenizer_arg, dataset_name, kwargs))
+        return [{"input_ids": [1, 2, 3]}]
+
+    def fake_observe_model(model_arg, sequences, config_arg):
+        events.append(("observe", model_arg, sequences, config_arg))
+        return {0: {"reap": [1.0, 0.5, 0.25, 0.0]}}
+
+    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio):
+        events.append(("prune", model_arg, config_arg, observer_data, method, ratio))
+        config_arg["num_experts"] = 3
+        return {0: [0, 1, 2]}
+
+    def fake_save_pruned_model(
+        model_arg,
+        tokenizer_arg,
+        config_arg,
+        output_dir,
+        original_model_name,
+        **kwargs,
+    ):
+        events.append(
+            (
+                "save",
+                model_arg,
+                tokenizer_arg,
+                config_arg,
+                output_dir,
+                original_model_name,
+                kwargs,
+            )
+        )
+        return SimpleNamespace(output_dir=Path(output_dir))
+
+    code = main(
+        [
+            "--model-name",
+            "mlx-model",
+            "--dataset-name",
+            "calibration-data",
+            "--split",
+            "validation",
+            "--dataset-config-name",
+            "code",
+            "--prune-method",
+            "frequency",
+            "--compression-ratio",
+            "0.25",
+            "--num-calibration-sequences",
+            "3",
+            "--max-seq-length",
+            "16",
+            "--seed",
+            "9",
+            "--output-dir",
+            str(tmp_path / "pruned"),
+        ],
+        load_model_fn=fake_load_model,
+        load_calibration_sequences_fn=fake_load_calibration_sequences,
+        observe_model_fn=fake_observe_model,
+        prune_experts_fn=fake_prune_experts,
+        save_pruned_model_fn=fake_save_pruned_model,
+        smoke_fn=smoke,
+        print_fn=output.append,
+    )
+
+    assert code == 0
+    assert [event[0] for event in events] == [
+        "load",
+        "calibrate",
+        "observe",
+        "prune",
+        "save",
+    ]
+    assert events[0] == ("load", "mlx-model")
+    assert events[1][1] is tokenizer
+    assert events[1][2] == "calibration-data"
+    assert events[1][3] == {
+        "split": "validation",
+        "dataset_config_name": "code",
+        "max_samples": 3,
+        "max_seq_length": 16,
+        "seed": 9,
+    }
+    assert events[3][4:] == ("frequency", 0.25)
+    assert events[4][6]["smoke_fn"] is smoke
+    assert any("load:" in line for line in output)
+    assert any("calibrate:" in line for line in output)
+    assert any("observe:" in line for line in output)
+    assert any("prune:" in line for line in output)
+    assert any("save:" in line for line in output)
+    assert any("reload/smoke:" in line for line in output)
+    assert any("done:" in line for line in output)
+
+
+def test_no_smoke_passes_no_smoke_function_to_save(tmp_path):
+    save_kwargs = {}
+
+    def fake_save_pruned_model(*args, **kwargs):
+        del args
+        save_kwargs.update(kwargs)
+        return SimpleNamespace(output_dir=tmp_path)
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--output-dir",
+            str(tmp_path),
+            "--no-smoke",
+        ],
+        load_model_fn=lambda model_name: (object(), object(), {"num_experts": 1}),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=fake_save_pruned_model,
+        smoke_fn=object(),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert save_kwargs["smoke_fn"] is None
+
+
+def test_keyboard_interrupt_returns_130_without_success_message():
+    output = []
+
+    def interrupt(model_name):
+        del model_name
+        raise KeyboardInterrupt
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--output-dir",
+            "out",
+        ],
+        load_model_fn=interrupt,
+        print_fn=output.append,
+    )
+
+    assert code == 130
+    assert any("interrupted:" in line for line in output)
+    assert not any("done:" in line for line in output)
