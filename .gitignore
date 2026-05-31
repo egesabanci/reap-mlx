@@ -5,24 +5,14 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
 # Virtual environments
 .venv/
 
-# reap specfic
+# Local MLX run artifacts
 artifacts/
 scratch/
 *.log
-.env
+.env*
 .uv_cache/
-wandb/
-api-key.txt
-prod_env/credentials.conf
-merging_env_6/
-merging_env_7/
-pruning_env_4/
-pruning_env_5/
-*.sqllite
-credentials.json
-config/wildbench_prod_env_*
-cmd.sh
