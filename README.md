@@ -3,9 +3,9 @@
 Apple Silicon / MLX implementation of Router-weighted Expert Activation
 Pruning (REAP) for MLX-LM MoE models.
 
-This repository is now focused on the MLX backend. The original CUDA/PyTorch
-experiment scripts, plotting assets, Docker setup, and paper reproduction
-materials have been removed or are being retired in follow-up cleanup work.
+This repository is now focused on MLX-LM. The original CUDA/PyTorch
+experiment scripts, plotting assets, Docker setup, paper reproduction
+materials, and eager Torch source have been removed.
 
 ## Current Scope
 
@@ -21,13 +21,13 @@ Implemented MLX architecture adapters:
 - `qwen3_moe`
 - `lfm2_moe`, validated with `LiquidAI/LFM2.5-8B-A1B-MLX-4bit`
 
-The MLX backend lives under:
+The implementation lives under:
 
 ```text
-src/reap/backends/mlx/
+src/reap/
 ```
 
-It is intentionally import-light: importing `reap.backends.mlx` must not import
+It is intentionally import-light: importing `reap` must not import
 Torch, vLLM, MLX, or MLX-LM unless an execution function explicitly needs them.
 
 ## Setup
@@ -35,14 +35,11 @@ Torch, vLLM, MLX, or MLX-LM unless an execution function explicitly needs them.
 Create a local virtual environment and install the MLX runtime dependencies:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install mlx mlx-lm datasets huggingface-hub safetensors transformers pytest
+uv sync --group dev
 ```
 
-Run commands with `PYTHONPATH=src` until packaging metadata is simplified for
-the MLX-only project.
+Run commands with `PYTHONPATH=src` while the command-line interface remains
+module-local.
 
 ## Run MLX Pruning
 
@@ -91,7 +88,4 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 
 - `artifacts/` is ignored and is the intended location for local pruned models,
   validation metrics, and scratch chat helpers.
-- The repository still contains some original Torch/CUDA source during the
-  cleanup transition. That code is no longer the target path and will be removed
-  in a follow-up MLX-only cleanup PR.
 - The license file is retained until the replacement license/notice is decided.

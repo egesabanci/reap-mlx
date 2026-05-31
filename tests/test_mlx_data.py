@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from reap.backends.mlx.data import (
+from reap.data import (
     extract_text,
     load_calibration_sequences,
     tokenize_text,
@@ -43,7 +43,7 @@ def test_data_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.data import load_calibration_sequences
+        from reap.data import load_calibration_sequences
 
         assert load_calibration_sequences is not None
 
