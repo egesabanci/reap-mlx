@@ -1,7 +1,7 @@
 """Router adapters for MLX-backed MoE models.
 
 This module is intentionally import-light: importing it must not require MLX,
-MLX-LM, Torch, vLLM, or the existing eager CUDA/PyTorch REAP modules.
+MLX-LM, Torch, vLLM, or other heavy runtime packages.
 """
 
 from __future__ import annotations

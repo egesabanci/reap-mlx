@@ -23,7 +23,7 @@ echo "Max samples:    $MAX_SAMPLES"
 echo "Max seq length: $MAX_SEQ_LENGTH"
 echo "Output:         $OUTPUT_DIR"
 
-python -m reap.backends.mlx.entrypoint \
+python -m reap.entrypoint \
     --model-name "$MODEL" \
     --dataset-name "$DATASET" \
     --prune-method "$METHOD" \

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from reap.backends.mlx.model_adapters import (
+from reap.model_adapters import (
     Lfm2MoeModelAdapter,
     MoeLayerConfig,
     Qwen3MoeModelAdapter,
@@ -51,7 +51,7 @@ def test_model_adapters_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.model_adapters import Lfm2MoeModelAdapter, Qwen3MoeModelAdapter
+        from reap.model_adapters import Lfm2MoeModelAdapter, Qwen3MoeModelAdapter
 
         assert Lfm2MoeModelAdapter().adapter_name == "lfm2_moe"
         assert Qwen3MoeModelAdapter().adapter_name == "qwen3_moe"

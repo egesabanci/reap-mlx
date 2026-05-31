@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from reap.backends.mlx.validation_metrics import RunMetrics
+from reap.validation_metrics import RunMetrics
 
 
 def _subprocess_with_import_blocker(body: str) -> subprocess.CompletedProcess[str]:
@@ -77,7 +77,7 @@ class TinyMoe:
 def test_validation_metrics_import_does_not_import_heavy_runtime_packages():
     result = _subprocess_with_import_blocker(
         """
-        from reap.backends.mlx.validation_metrics import RunMetrics
+        from reap.validation_metrics import RunMetrics
 
         assert RunMetrics is not None
 

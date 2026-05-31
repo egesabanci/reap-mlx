@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from reap.backends.mlx.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
+from reap.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
 
 
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
@@ -53,7 +53,7 @@ def test_router_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
+        from reap.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
 
         assert Lfm2MoeRouter is not None
         assert Qwen3MoeRouter is not None
