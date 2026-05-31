@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -209,13 +210,48 @@ def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
             "MLX entrypoint requires the optional 'mlx_lm' package to load models."
         ) from exc
 
-    loaded = load(model_name, return_config=True)
-    if not isinstance(loaded, tuple) or len(loaded) != 3:
+    if _supports_keyword(load, "return_config"):
+        loaded = load(model_name, return_config=True)
+        if not isinstance(loaded, tuple) or len(loaded) != 3:
+            raise ValueError(
+                "Expected mlx_lm.load(..., return_config=True) to return "
+                "(model, tokenizer, config)."
+            )
+        return loaded
+
+    loaded = load(model_name)
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise ValueError(
-            "Expected mlx_lm.load(..., return_config=True) to return "
-            "(model, tokenizer, config)."
+            "Expected mlx_lm.load(...) to return (model, tokenizer)."
         )
-    return loaded
+    model, tokenizer = loaded
+    return model, tokenizer, _load_mlx_lm_config(model_name)
+
+
+def _load_mlx_lm_config(model_name: str) -> Mapping[str, Any]:
+    try:
+        from mlx_lm.utils import get_model_path, load_config
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "MLX entrypoint requires mlx_lm.utils to load model config."
+        ) from exc
+
+    model_path, _ = get_model_path(model_name)
+    config = load_config(model_path)
+    if not isinstance(config, Mapping):
+        raise ValueError("MLX-LM load_config must return a mapping config.")
+    return config
+
+
+def _supports_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _infer_adapter_safely(model: Any, config: Mapping[str, Any]) -> Any | None:

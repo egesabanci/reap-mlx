@@ -6,6 +6,8 @@ default save, load, or generation helpers are executed.
 
 from __future__ import annotations
 
+import inspect
+import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -261,13 +263,33 @@ def _load_reloaded_model(load_fn: Callable[..., Any], output_dir: Path) -> tuple
     Any,
     Mapping[str, Any],
 ]:
+    load_supports_return_config = _supports_keyword(load_fn, "return_config")
     try:
-        reload_result = load_fn(str(output_dir), return_config=True)
+        if load_supports_return_config:
+            reload_result = load_fn(str(output_dir), return_config=True)
+        else:
+            reload_result = load_fn(str(output_dir))
     except Exception as exc:
         raise RuntimeError(
             f"Failed to reload pruned MLX model from {output_dir}."
         ) from exc
 
+    if load_supports_return_config:
+        return _parse_reload_result_with_config(reload_result)
+
+    if not isinstance(reload_result, tuple) or len(reload_result) != 2:
+        raise ValueError(
+            "Expected mlx_lm.load(...) to return (model, tokenizer) when "
+            "return_config is unsupported."
+        )
+
+    reloaded_model, reloaded_tokenizer = reload_result
+    return reloaded_model, reloaded_tokenizer, _read_saved_config(output_dir)
+
+
+def _parse_reload_result_with_config(
+    reload_result: Any,
+) -> tuple[Any, Any, Mapping[str, Any]]:
     if not isinstance(reload_result, tuple) or len(reload_result) != 3:
         raise ValueError(
             "Expected mlx_lm.load(..., return_config=True) to return "
@@ -278,6 +300,26 @@ def _load_reloaded_model(load_fn: Callable[..., Any], output_dir: Path) -> tuple
     if not isinstance(reloaded_config, Mapping):
         raise ValueError("Reloaded config must be a mapping.")
     return reloaded_model, reloaded_tokenizer, reloaded_config
+
+
+def _read_saved_config(output_dir: Path) -> Mapping[str, Any]:
+    config_path = output_dir / "config.json"
+    with config_path.open(encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    if not isinstance(config, Mapping):
+        raise ValueError("Saved config.json must contain a mapping.")
+    return config
+
+
+def _supports_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _validate_reloaded_config(

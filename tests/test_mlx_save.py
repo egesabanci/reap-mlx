@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -155,18 +156,28 @@ def make_lfm2_reloaded_model(
     )
 
 
-def write_required_artifacts(output_dir: str | Path):
+def write_required_artifacts(
+    output_dir: str | Path,
+    *,
+    config: dict | None = None,
+):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    (output_path / "config.json").write_text("{}", encoding="utf-8")
+    (output_path / "config.json").write_text(
+        json.dumps({} if config is None else config),
+        encoding="utf-8",
+    )
     (output_path / "model.safetensors").write_bytes(b"weights")
 
 
-def fake_save_factory(calls, *, write_artifacts=True):
+def fake_save_factory(calls, *, write_artifacts=True, save_passed_config=False):
     def fake_save(**kwargs):
         calls.append(kwargs)
         if write_artifacts:
-            write_required_artifacts(kwargs["dst_path"])
+            write_required_artifacts(
+                kwargs["dst_path"],
+                config=kwargs["config"] if save_passed_config else None,
+            )
 
     return fake_save
 
@@ -177,6 +188,15 @@ def fake_load_factory(model, tokenizer, config, calls=None):
             calls.append({"path": path, "return_config": return_config})
         assert return_config is True
         return model, tokenizer, config
+
+    return fake_load
+
+
+def fake_load_without_return_config_factory(model, tokenizer, calls=None):
+    def fake_load(path):
+        if calls is not None:
+            calls.append({"path": path})
+        return model, tokenizer
 
     return fake_load
 
@@ -222,6 +242,32 @@ def test_save_pruned_model_uses_passed_config_and_validates_reload(tmp_path):
     assert load_calls == [
         {"path": str(tmp_path / "saved"), "return_config": True},
     ]
+
+
+def test_save_pruned_model_supports_load_without_return_config(tmp_path):
+    load_calls = []
+    reloaded_model = make_reloaded_model(2)
+    reloaded_tokenizer = object()
+    config = {"num_experts": 2, "num_experts_per_tok": 2}
+
+    result = save_pruned_model(
+        object(),
+        object(),
+        config,
+        tmp_path / "saved",
+        "source-model",
+        save_fn=fake_save_factory([], save_passed_config=True),
+        load_fn=fake_load_without_return_config_factory(
+            reloaded_model,
+            reloaded_tokenizer,
+            calls=load_calls,
+        ),
+    )
+
+    assert result.reloaded_model is reloaded_model
+    assert result.reloaded_tokenizer is reloaded_tokenizer
+    assert result.reloaded_config == config
+    assert load_calls == [{"path": str(tmp_path / "saved")}]
 
 
 def test_smoke_function_runs_on_reloaded_model_not_original(tmp_path):
