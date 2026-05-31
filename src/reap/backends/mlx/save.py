@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from reap.backends.mlx.model_adapters import Qwen3MoeModelAdapter
+from reap.backends.mlx.model_adapters import infer_model_adapter
 
 
 _WEIGHT_PATTERNS = ("*.safetensors", "*.npz")
@@ -43,7 +43,7 @@ def save_pruned_model(
     save_fn: Callable[..., Any] | None = None,
 ) -> SaveReloadResult:
     """Save a pruned model, reload it, and validate the reloaded artifact."""
-    adapter = Qwen3MoeModelAdapter() if adapter is None else adapter
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
     output_path = _prepare_output_dir(output_dir)
     expected_count = _expected_expert_count(config, expected_expert_count)
     save_fn = _default_save_fn() if save_fn is None else save_fn
@@ -254,18 +254,20 @@ def _validate_reloaded_model_shapes(
                 f"Reloaded layer {layer_idx} expert count mismatch: expected "
                 f"{expected_expert_count}, got {layer_config.num_experts}."
             )
-        _validate_qwen3_shapes(
+        _validate_switch_moe_shapes(
             adapter.get_moe(layer),
             expected_expert_count=expected_expert_count,
             layer_idx=layer_idx,
+            validate_expert_bias=adapter.adapter_name == "lfm2_moe",
         )
 
 
-def _validate_qwen3_shapes(
+def _validate_switch_moe_shapes(
     moe: Any,
     *,
     expected_expert_count: int,
     layer_idx: int,
+    validate_expert_bias: bool,
 ) -> None:
     switch_mlp = getattr(moe, "switch_mlp", None)
     if switch_mlp is None:
@@ -292,6 +294,15 @@ def _validate_qwen3_shapes(
         expected_expert_count=expected_expert_count,
         name=f"layer {layer_idx} gate.weight",
     )
+
+    if validate_expert_bias and (
+        getattr(moe, "use_expert_bias", False) or hasattr(moe, "expert_bias")
+    ):
+        _validate_first_dim(
+            getattr(moe, "expert_bias", None),
+            expected_expert_count=expected_expert_count,
+            name=f"layer {layer_idx} expert_bias",
+        )
 
 
 def _validate_first_dim(

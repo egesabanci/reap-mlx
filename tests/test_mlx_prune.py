@@ -138,6 +138,15 @@ class TinyGate:
         self.top_k = 3
 
 
+class TinyLfmGate(TinyGate):
+    def __init__(self, num_experts: int):
+        super().__init__(num_experts)
+        self.scales = np.arange(num_experts, dtype=np.float32).reshape(num_experts, 1)
+        self.biases = (
+            np.arange(num_experts, dtype=np.float32).reshape(num_experts, 1) + 100
+        )
+
+
 class TinyMoe:
     def __init__(self, num_experts: int = 4, top_k: int = 3):
         self.num_experts = num_experts
@@ -160,12 +169,46 @@ def make_model(num_experts: int = 4, top_k: int = 3):
     )
 
 
+class TinyLfmMoe:
+    def __init__(self, num_experts: int = 32, top_k: int = 4):
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_experts_per_tok = top_k
+        self.norm_topk_prob = True
+        self.use_expert_bias = True
+        self.gate = TinyLfmGate(num_experts)
+        self.switch_mlp = TinySwitchMlp(num_experts)
+        self.expert_bias = np.arange(num_experts, dtype=np.float32) + 7000
+
+
+def make_lfm2_model(num_experts: int = 32, top_k: int = 4):
+    moe = TinyLfmMoe(num_experts=num_experts, top_k=top_k)
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(feed_forward=object()),
+                SimpleNamespace(feed_forward=moe),
+            ],
+        ),
+    )
+
+
 def qwen_config(num_experts: int = 4, top_k: int = 3):
     return {
         "num_experts": num_experts,
         "num_experts_per_tok": top_k,
         "top_k": top_k,
         "norm_topk_prob": False,
+    }
+
+
+def lfm2_config(num_experts: int = 32, top_k: int = 4):
+    return {
+        "model_type": "lfm2_moe",
+        "num_experts": num_experts,
+        "num_experts_per_tok": top_k,
+        "norm_topk_prob": True,
+        "use_expert_bias": True,
     }
 
 
@@ -382,3 +425,73 @@ def test_prune_experts_rejects_slice_field_with_wrong_first_dimension():
             "reap",
             0.5,
         )
+
+
+def test_prune_experts_slices_lfm2_switch_gate_expert_bias_and_config():
+    model = make_lfm2_model(num_experts=32, top_k=4)
+    config = lfm2_config(num_experts=32, top_k=4)
+    moe = model.model.layers[1].feed_forward
+    keep = np.arange(16, 32)
+
+    originals = {
+        "gate_proj_weight": moe.switch_mlp.gate_proj.weight.copy(),
+        "gate_proj_scales": moe.switch_mlp.gate_proj.scales.copy(),
+        "gate_proj_biases": moe.switch_mlp.gate_proj.biases.copy(),
+        "gate_weight": moe.gate.weight.copy(),
+        "gate_scales": moe.gate.scales.copy(),
+        "gate_biases": moe.gate.biases.copy(),
+        "expert_bias": moe.expert_bias.copy(),
+    }
+
+    keep_by_layer = prune_experts(
+        model,
+        config,
+        {1: {"reap": np.arange(32, dtype=np.float32)}},
+        "reap",
+        0.5,
+    )
+
+    np.testing.assert_array_equal(keep_by_layer[1], keep)
+    np.testing.assert_array_equal(
+        moe.switch_mlp.gate_proj.weight,
+        originals["gate_proj_weight"][keep],
+    )
+    np.testing.assert_array_equal(
+        moe.switch_mlp.gate_proj.scales,
+        originals["gate_proj_scales"][keep],
+    )
+    np.testing.assert_array_equal(
+        moe.switch_mlp.gate_proj.biases,
+        originals["gate_proj_biases"][keep],
+    )
+    np.testing.assert_array_equal(moe.gate.weight, originals["gate_weight"][keep])
+    np.testing.assert_array_equal(moe.gate.scales, originals["gate_scales"][keep])
+    np.testing.assert_array_equal(moe.gate.biases, originals["gate_biases"][keep])
+    np.testing.assert_array_equal(moe.expert_bias, originals["expert_bias"][keep])
+
+    assert moe.num_experts == 16
+    assert moe.top_k == 4
+    assert moe.num_experts_per_tok == 4
+    assert config["num_experts"] == 16
+    assert config["num_experts_per_tok"] == 4
+    assert config["use_expert_bias"] is True
+
+
+def test_prune_experts_clamps_lfm2_top_k_below_retained_count():
+    model = make_lfm2_model(num_experts=4, top_k=3)
+    config = lfm2_config(num_experts=4, top_k=3)
+    moe = model.model.layers[1].feed_forward
+
+    prune_experts(
+        model,
+        config,
+        {1: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+        "reap",
+        0.75,
+    )
+
+    assert moe.num_experts == 1
+    assert moe.top_k == 1
+    assert moe.num_experts_per_tok == 1
+    assert config["num_experts"] == 1
+    assert config["num_experts_per_tok"] == 1

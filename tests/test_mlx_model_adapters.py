@@ -13,11 +13,14 @@ from types import SimpleNamespace
 import pytest
 
 from reap.backends.mlx.model_adapters import (
+    Lfm2MoeModelAdapter,
     MoeLayerConfig,
     Qwen3MoeModelAdapter,
     get_model_layers,
     get_shared_expert,
+    infer_model_adapter,
     make_attention_mask,
+    update_lfm2_moe_config,
     update_qwen3_moe_config,
 )
 
@@ -48,8 +51,9 @@ def test_model_adapters_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.model_adapters import Qwen3MoeModelAdapter
+        from reap.backends.mlx.model_adapters import Lfm2MoeModelAdapter, Qwen3MoeModelAdapter
 
+        assert Lfm2MoeModelAdapter().adapter_name == "lfm2_moe"
         assert Qwen3MoeModelAdapter().adapter_name == "qwen3_moe"
 
         forbidden_loaded = sorted(
@@ -107,8 +111,16 @@ class MoeMlp:
             self.shared_experts = shared_experts
 
 
+class Lfm2FeedForward(MoeMlp):
+    pass
+
+
 def layer_with_mlp(mlp):
     return SimpleNamespace(mlp=mlp)
+
+
+def layer_with_feed_forward(feed_forward):
+    return SimpleNamespace(feed_forward=feed_forward)
 
 
 def model_model_layers(layers):
@@ -241,6 +253,69 @@ def test_qwen3_adapter_layer_config_requires_expert_count_and_top_k():
         adapter.get_layer_config(layer_with_mlp(MoeMlp(num_experts=2)), {})
 
 
+def test_lfm2_adapter_identifies_feed_forward_moe_layers_after_dense_layers():
+    adapter = Lfm2MoeModelAdapter()
+    layers = [
+        layer_with_feed_forward(DenseMlp()),
+        layer_with_feed_forward(DenseMlp()),
+        layer_with_feed_forward(Lfm2FeedForward()),
+        layer_with_feed_forward(Lfm2FeedForward()),
+    ]
+
+    model = model_model_layers(layers)
+
+    assert adapter.layers(model) is layers
+    assert adapter.identify_moe_layers(model) == [2, 3]
+    assert adapter.get_dense_mlp(layers[0]) is layers[0].feed_forward
+    assert adapter.get_moe(layers[2]) is layers[2].feed_forward
+
+
+def test_lfm2_adapter_layer_config_includes_expert_bias_flag():
+    adapter = Lfm2MoeModelAdapter()
+    feed_forward = Lfm2FeedForward(
+        num_experts=32,
+        top_k=4,
+        norm_topk_prob=True,
+    )
+    feed_forward.use_expert_bias = True
+    layer = layer_with_feed_forward(feed_forward)
+
+    layer_config = adapter.get_layer_config(
+        layer,
+        {
+            "num_experts": 99,
+            "num_experts_per_tok": 8,
+            "norm_topk_prob": False,
+            "use_expert_bias": False,
+        },
+    )
+
+    assert layer_config == MoeLayerConfig(
+        num_experts=32,
+        top_k=4,
+        norm_topk_prob=True,
+        adapter_name="lfm2_moe",
+        use_expert_bias=True,
+    )
+
+
+def test_infer_model_adapter_selects_lfm2_from_config_and_layout():
+    assert infer_model_adapter(config={"model_type": "lfm2_moe"}).adapter_name == (
+        "lfm2_moe"
+    )
+    assert infer_model_adapter(
+        config={"architectures": ["Lfm2MoeForCausalLM"]}
+    ).adapter_name == "lfm2_moe"
+
+    lfm2_model = model_model_layers(
+        [layer_with_feed_forward(DenseMlp()), layer_with_feed_forward(Lfm2FeedForward())]
+    )
+    qwen_model = model_model_layers([layer_with_mlp(MoeMlp())])
+
+    assert infer_model_adapter(lfm2_model, {}).adapter_name == "lfm2_moe"
+    assert infer_model_adapter(qwen_model, {}).adapter_name == "qwen3_moe"
+
+
 def test_get_shared_expert_handles_plural_and_singular_names():
     plural_shared = object()
     singular_shared = object()
@@ -268,6 +343,24 @@ def test_update_qwen3_moe_config_updates_existing_top_k_key_only():
     update_qwen3_moe_config(config, num_experts=3, top_k=2)
 
     assert config == {"num_experts": 3, "num_experts_per_tok": 2, "top_k": 2}
+
+
+def test_update_lfm2_moe_config_preserves_expert_bias_flag_and_clamps_top_k():
+    config = {
+        "model_type": "lfm2_moe",
+        "num_experts": 32,
+        "num_experts_per_tok": 4,
+        "use_expert_bias": True,
+    }
+
+    update_lfm2_moe_config(config, num_experts=2, top_k=4)
+
+    assert config == {
+        "model_type": "lfm2_moe",
+        "num_experts": 2,
+        "num_experts_per_tok": 2,
+        "use_expert_bias": True,
+    }
 
 
 def test_make_attention_mask_requires_mlx_lm_when_missing():
