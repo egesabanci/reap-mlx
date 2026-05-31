@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -228,6 +229,14 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
     assert any("reload/smoke:" in line for line in output)
     assert any("done:" in line for line in output)
 
+    metrics_path = tmp_path / "pruned" / "validation-metrics.json"
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "success"
+    assert payload["run_config"]["model_name"] == "mlx-model"
+    assert payload["run_config"]["actual_sample_count"] == 1
+    assert payload["pruning"]["expert_count_before"] == 4
+    assert payload["pruning"]["expert_count_after"] == 3
+
 
 def test_no_smoke_passes_no_smoke_function_to_save(tmp_path):
     save_kwargs = {}
@@ -283,3 +292,41 @@ def test_keyboard_interrupt_returns_130_without_success_message():
     assert code == 130
     assert any("interrupted:" in line for line in output)
     assert not any("done:" in line for line in output)
+
+
+def test_main_writes_failed_metrics_when_pipeline_phase_raises(tmp_path):
+    output_dir = tmp_path / "failed-run"
+
+    def fail_observe(model, sequences, config):
+        del model, sequences, config
+        raise RuntimeError("observer failed")
+
+    with pytest.raises(RuntimeError, match="observer failed"):
+        main(
+            [
+                "--model-name",
+                "model",
+                "--dataset-name",
+                "dataset",
+                "--output-dir",
+                str(output_dir),
+            ],
+            load_model_fn=lambda model_name: (
+                object(),
+                object(),
+                {"num_experts": 1, "num_experts_per_tok": 1},
+            ),
+            load_calibration_sequences_fn=lambda *args, **kwargs: [
+                {"input_ids": [1, 2]},
+            ],
+            observe_model_fn=fail_observe,
+            print_fn=lambda message: None,
+        )
+
+    payload = json.loads(
+        (output_dir / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["status"] == "failed"
+    assert payload["failure"]["phase"] == "observe"
+    assert payload["failure"]["type"] == "RuntimeError"
+    assert payload["failure"]["message"] == "observer failed"

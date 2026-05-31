@@ -9,9 +9,11 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from reap.backends.mlx.data import load_calibration_sequences
+from reap.backends.mlx.model_adapters import infer_model_adapter
 from reap.backends.mlx.observer import observe_model
 from reap.backends.mlx.prune import prune_experts, resolve_prune_method
 from reap.backends.mlx.save import generation_smoke, save_pruned_model
+from reap.backends.mlx.validation_metrics import RunMetrics
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--metrics-file",
+        default="validation-metrics.json",
+        help="Metrics JSON filename or absolute path for validation telemetry.",
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--no-smoke",
@@ -83,56 +90,100 @@ def main(
     if args.no_smoke:
         smoke_fn = None
 
+    metrics = RunMetrics(args.output_dir, args.metrics_file)
+    metrics.record_runtime()
+    metrics.record_run_config(args)
+    metrics.sample_memory("start")
+    current_phase = "model_load"
+
     try:
         _emit(print_fn, "load: loading MLX-LM model")
-        model, tokenizer, config = load_model_fn(args.model_name)
+        with metrics.phase("model_load"):
+            model, tokenizer, config = load_model_fn(args.model_name)
         if not isinstance(config, Mapping):
             raise ValueError("MLX-LM load must return a mapping config.")
+        adapter = _infer_adapter_safely(model, config)
+        metrics.record_model_metadata(model, config, adapter=adapter)
+        metrics.sample_memory("after_model_load")
 
+        current_phase = "calibration"
         _emit(print_fn, "calibrate: loading calibration sequences")
-        calibration_sequences = load_calibration_sequences_fn(
-            tokenizer,
-            args.dataset_name,
-            split=args.split,
-            dataset_config_name=args.dataset_config_name,
-            max_samples=args.max_samples,
-            max_seq_length=args.max_seq_length,
-            seed=args.seed,
-        )
+        with metrics.phase("calibration"):
+            calibration_sequences = load_calibration_sequences_fn(
+                tokenizer,
+                args.dataset_name,
+                split=args.split,
+                dataset_config_name=args.dataset_config_name,
+                max_samples=args.max_samples,
+                max_seq_length=args.max_seq_length,
+                seed=args.seed,
+            )
         if not calibration_sequences:
             raise RuntimeError("No non-empty calibration sequences were loaded.")
+        metrics.record_calibration(calibration_sequences)
+        metrics.sample_memory("after_calibration")
 
+        current_phase = "observe"
         _emit(print_fn, "observe: collecting pruning metrics")
-        observer_data = observe_model_fn(
-            model,
-            calibration_sequences,
-            config,
-        )
+        with metrics.phase("observe"):
+            observer_data = observe_model_fn(
+                model,
+                calibration_sequences,
+                config,
+            )
+        metrics.record_observer(observer_data, args.prune_method)
+        metrics.sample_memory("after_observe")
 
+        current_phase = "prune"
         _emit(print_fn, "prune: mutating selected experts")
-        prune_experts_fn(
-            model,
-            config,
-            observer_data,
-            args.prune_method,
-            args.compression_ratio,
+        config_before_prune = dict(config)
+        with metrics.phase("prune"):
+            keep_by_layer = prune_experts_fn(
+                model,
+                config,
+                observer_data,
+                args.prune_method,
+                args.compression_ratio,
+            )
+        metrics.record_pruning(
+            keep_by_layer,
+            config_before=config_before_prune,
+            config_after=config,
+            observer_data=observer_data,
         )
+        metrics.sample_memory("after_prune")
 
+        current_phase = "save_reload_smoke"
         _emit(print_fn, "save: saving pruned model and validating reload")
-        result = save_pruned_model_fn(
-            model,
-            tokenizer,
-            config,
-            args.output_dir,
-            args.model_name,
-            smoke_fn=smoke_fn,
-        )
+        with metrics.phase("save_reload_smoke"):
+            result = save_pruned_model_fn(
+                model,
+                tokenizer,
+                config,
+                args.output_dir,
+                args.model_name,
+                adapter=adapter,
+                smoke_fn=smoke_fn,
+            )
+        metrics.record_save_reload(result, adapter=adapter)
+        metrics.sample_memory("after_save_reload_smoke")
+        metrics.write(status="success")
         _emit(print_fn, "reload/smoke: validation complete")
         _emit(print_fn, f"done: saved MLX pruned model to {result.output_dir}")
         return 0
     except KeyboardInterrupt:
         _emit(print_fn, "interrupted: MLX pruning stopped")
         return 130
+    except Exception as exc:
+        try:
+            metrics.sample_memory("failure")
+            metrics.write(
+                status="failed",
+                failure=metrics.failure_payload(current_phase, exc),
+            )
+        except Exception:
+            logger.exception("failed to write MLX validation metrics")
+        raise
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -165,6 +216,14 @@ def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
             "(model, tokenizer, config)."
         )
     return loaded
+
+
+def _infer_adapter_safely(model: Any, config: Mapping[str, Any]) -> Any | None:
+    try:
+        return infer_model_adapter(model, config)
+    except Exception:
+        logger.debug("could not infer MLX model adapter for metrics", exc_info=True)
+        return None
 
 
 def _emit(print_fn: Callable[[str], Any], message: str) -> None:
