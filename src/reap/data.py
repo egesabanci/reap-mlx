@@ -1,7 +1,6 @@
 """Minimal calibration loading for the MLX pruning pipeline.
 
-This module stays independent of the existing Torch/vLLM data pipeline. The
-dataset dependency is imported lazily only when calibration data is loaded.
+The dataset dependency is imported lazily only when calibration data is loaded.
 """
 
 from __future__ import annotations

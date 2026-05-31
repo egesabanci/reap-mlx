@@ -1,11 +1,12 @@
 [project]
-name = "reap"
+name = "reap-mlx"
 version = "0.1.0"
 description = "REAP pruning for MLX-LM MoE models."
 readme = "README.md"
 authors = [
-    { name = "Mike Lasby", email = "mklasby@gmail.com" }
+    { name = "Ege Sabanci", email = "egesabanci@outlook.com.tr" },
 ]
+license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "datasets>=3.6.0,<4.0.0",
@@ -21,10 +22,16 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/reap"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.4.1",
 ]
+
+[project.urls]
+Repository = "https://github.com/egesabanci/reap-mlx"
 
 [tool.ruff]
 line-length = 88

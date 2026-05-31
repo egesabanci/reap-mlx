@@ -747,7 +747,7 @@ wheels = [
 ]
 
 [[package]]
-name = "reap"
+name = "reap-mlx"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
