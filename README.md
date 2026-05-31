@@ -9,13 +9,14 @@
 [Supported Models](#supported-models) |
 [CLI Reference](#cli-reference) |
 [Metrics](#metrics) |
+[References](#references) |
 [Development](#development) |
 [License](#license)
 
 ![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-blue)
 ![Runtime](https://img.shields.io/badge/Runtime-MLX-black)
 ![Package](https://img.shields.io/badge/Package-reap--mlx-green)
-![License](https://img.shields.io/badge/License-All%20rights%20reserved-red)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 </div>
 
@@ -202,6 +203,15 @@ Every run writes structured validation telemetry. The JSON includes:
 Use this file to compare pruning settings, calibration size, runtime cost, and
 artifact size across runs.
 
+## References
+
+REAP MLX is an independent MLX-focused implementation. Some implementation
+decisions are inspired by the original
+[CerebrasResearch/reap](https://github.com/CerebrasResearch/reap) repository.
+
+The pruning method is based on the paper
+[REAP the Experts: Why Pruning Prevails for One-Shot MoE compression](https://arxiv.org/pdf/2510.13999).
+
 ## Repository Layout
 
 ```txt
@@ -257,4 +267,4 @@ git diff --check
 
 ## License
 
-REAP MLX is all rights reserved. See [LICENSE](LICENSE).
+REAP MLX is released under the MIT License. See [LICENSE](LICENSE).
