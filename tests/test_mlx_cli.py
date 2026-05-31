@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from reap.backends.mlx.entrypoint import main
+from reap.entrypoint import main
 
 
 def _subprocess_with_import_blocker(body: str) -> subprocess.CompletedProcess[str]:
@@ -59,7 +59,7 @@ def _subprocess_with_import_blocker(body: str) -> subprocess.CompletedProcess[st
 def test_entrypoint_import_does_not_import_heavy_runtime_packages():
     result = _subprocess_with_import_blocker(
         """
-        from reap.backends.mlx.entrypoint import build_parser, main
+        from reap.entrypoint import build_parser, main
 
         assert build_parser is not None
         assert main is not None
@@ -81,7 +81,7 @@ def test_entrypoint_import_does_not_import_heavy_runtime_packages():
 def test_help_works_without_heavy_runtime_imports():
     result = _subprocess_with_import_blocker(
         """
-        from reap.backends.mlx.entrypoint import main
+        from reap.entrypoint import main
 
         raise SystemExit(main(["--help"]))
         """

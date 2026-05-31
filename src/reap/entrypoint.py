@@ -8,12 +8,12 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from reap.backends.mlx.data import load_calibration_sequences
-from reap.backends.mlx.model_adapters import infer_model_adapter
-from reap.backends.mlx.observer import observe_model
-from reap.backends.mlx.prune import prune_experts, resolve_prune_method
-from reap.backends.mlx.save import generation_smoke, save_pruned_model
-from reap.backends.mlx.validation_metrics import RunMetrics
+from reap.data import load_calibration_sequences
+from reap.model_adapters import infer_model_adapter
+from reap.observer import observe_model
+from reap.prune import prune_experts, resolve_prune_method
+from reap.save import generation_smoke, save_pruned_model
+from reap.validation_metrics import RunMetrics
 
 
 logger = logging.getLogger(__name__)

@@ -1,337 +1,439 @@
+"""Expert pruning for adapter-described MLX MoE modules.
+
+This module mutates live MLX-LM-style modules by slicing expert-stacked arrays
+on their first dimension. It intentionally avoids importing MLX, MLX-LM, Torch,
+or vLLM at module import time.
+"""
+
 from __future__ import annotations
-import time
-import logging
-import dataclasses
-import pathlib
-import time
+
+from collections.abc import Mapping, MutableMapping
 from typing import Any
-import gc
-import yaml
 
-import torch
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+import numpy as np
 
-from accelerate.utils import set_seed
-from accelerate.hooks import remove_hook_from_module
-
-
-from reap.main import record_activations, smoke_test, create_results_directory, dump_args_to_yaml
-from reap.args import (
-    ReapArgs,
-    ModelArgs,
-    EvalArgs,
-    PruneArgs,
-    ObserverArgs,
-    DatasetArgs,
-    ClusterArgs,
+from reap.model_adapters import (
+    infer_model_adapter,
+    update_lfm2_moe_config,
+    update_qwen3_moe_config,
 )
-from reap.data import DATASET_REGISTRY
-from reap.cluster import (
-    get_penalty_vector,
-    hierarchical_clustering,
-    dynamic_frequency_penalized_clustering,
-)
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
-from reap.eval import run_evaluate
-import shutil
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 
-def prune(
-    observer_data,
-    model,
-    prune_args,
-    n_experts_to_prune,
-    pruned_model_dir,
-):
+_PRUNE_METHOD_ALIASES = {
+    "frequency": "expert_frequency",
+    "weighted_frequency_sum": "weighted_expert_frequency_sum",
+}
+
+_SUPPORTED_PRUNE_METHODS = {
+    "expert_frequency",
+    "ean_sum",
+    "ean_mean",
+    "weighted_ean_sum",
+    "weighted_expert_frequency_sum",
+    "reap",
+    "max_activations",
+}
+
+_SLICE_FIELD_NAMES = ("weight", "scales", "biases", "bias")
+_SWITCH_PROJECTION_NAMES = ("gate_proj", "up_proj", "down_proj")
+_TOP_K_ATTRS = ("top_k", "num_experts_per_tok", "k")
+
+
+def prune_experts(
+    model: Any,
+    config: MutableMapping[str, Any],
+    observer_data: Mapping[int, Mapping[str, Any]],
+    prune_method: str,
+    compression_ratio: float,
+    *,
+    adapter: Any | None = None,
+) -> dict[int, np.ndarray]:
+    """Prune adapter-discovered MLX MoE experts in place.
+
+    Returns a mapping from layer index to ascending retained expert indices.
     """
-    Prune the model based on the observer data and clustering.
-    """
-    model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    _validate_adapter(adapter)
+    _validate_compression_ratio(compression_ratio)
 
-    for layer in observer_data:
-        if "expert_proba" not in observer_data[layer]:
-            # Calculate expert probabilities if not already present
-            observer_data[layer]["expert_proba"] = (
-                observer_data[layer]["expert_frequency"]
-                / observer_data[layer]["total_tokens"]
-            )
+    layers = adapter.layers(model)
+    keep_by_layer: dict[int, np.ndarray] = {}
+    config_num_experts: int | None = None
+    config_top_k: int | None = None
 
-    if prune_args.perserve_super_experts or prune_args.perserve_outliers:
-        super_expert_idx = get_super_expert_indices(observer_data, include_last_layers=prune_args.perserve_outliers)
-        metrics = [
-            "expert_proba",
-            "ean_sum",
-            "ean_mean",
-            "weighted_expert_frequency_sum",
-            "weighted_ean_sum",
-            "reap",
-            "reap_l2",
-            "weighted_ean_sum_l2",
-        ]
-        for layer in observer_data:
-            super_experts_in_layer = super_expert_idx[super_expert_idx[:, 0] == layer][:, 1]
-            if len(super_experts_in_layer) > 0:
-                for metric in metrics:
-                    if metric in observer_data[layer]:
-                        observer_data[layer][metric][super_experts_in_layer] = float("inf")
-
-    for layer in tqdm(observer_data, "Pruning layers..."):
-        num_experts = observer_data[layer]["expert_frequency"].shape[0]
-        if prune_args.prune_method == "ean_ca":
-            ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
-            for i in range(num_experts):
-                ean[i] = torch.linalg.norm(
-                    observer_data[layer]["routed_characteristic_activation"][i], dim=-1
-                ).sum()
-            _, experts_to_prune = torch.topk(ean, n_experts_to_prune, largest=False)
-        else:
-            prune_method = prune_args.prune_method
-            if prune_method == "frequency":
-                prune_method = "expert_frequency"
-            saliency_data = observer_data[layer].get(prune_method)
-            if saliency_data is None:
-                raise ValueError(
-                    f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
-                    f"Available keys: {list(observer_data[layer].keys())}"
-                )
-            _, experts_to_prune = torch.topk(
-                saliency_data, n_experts_to_prune, largest=False
-            )
-
-        retained_expert_indicies = [
-            i for i in range(num_experts) if i not in experts_to_prune
-        ]
-        # prune experts
-        moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
-            all_experts = getattr(moe, model_attrs["experts"])
-            retained_experts = [all_experts[i] for i in retained_expert_indicies]
-            retained_experts = torch.nn.ModuleList(retained_experts)
-            setattr(moe, model_attrs["experts"], retained_experts)
-            if model.__class__.__name__.lower() == "Ernie4_5_MoEForCausalLM".lower():
-                # transformers version >=4.54
-                # prune expert score correction bias too
-                moe.moe_statics.e_score_correction_bias.data = (
-                    moe.moe_statics.e_score_correction_bias.data[
-                        :, retained_expert_indicies
-                    ]
-                )
-
-            # prune router
-            router = getattr(moe, model_attrs["router"])
-            router.weight.data = router.weight.data[retained_expert_indicies, :]
-            if getattr(router, "bias", None):
-                router.bias.data = router.bias.data[retained_expert_indicies]
-            router.out_features = len(retained_expert_indicies)
-            if hasattr(router, "e_score_correction_bias"):
-                router.e_score_correction_bias.data = (
-                    router.e_score_correction_bias.data[retained_expert_indicies]
-                )
-            setattr(moe, model_attrs["router"], router)
-        else:
-            # prune fused experts, only tested for llama-4
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
-
-    # patch config and dump
-    logger.info("Saving pruned model...")
-    retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
-    if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
-        model.config.moe_capacity = [
-            retained_experts,
-            retained_experts,
-            retained_experts,
-        ]
-
-    pruned_model_dir.mkdir(parents=True, exist_ok=True)
-    start = time.time()
-    model.save_pretrained(pruned_model_dir)
-    end = time.time()
-    logger.info(
-        f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
-    )
-    return pruned_model_dir
-
-
-def get_pruned_model_dir(
-    results_dir: pathlib.Path,
-    n_experts_to_prune: int,
-    total_experts: int,
-    prune_args: PruneArgs,
-    seed: int,
-    renorm: bool,
-    name_prefix: str = None,
-) -> pathlib.Path:
-    """Generate output directory path for pruned model."""
-    compression_ratio_str = f"{(n_experts_to_prune / total_experts):.2f}"
-    name_prefix = "" if name_prefix is None else name_prefix
-    pruned_model_name = f"{name_prefix}{prune_args.prune_method}"
-
-    if prune_args.perserve_super_experts:
-        pruned_model_name += "-perserve_super"
-    elif prune_args.perserve_outliers:
-        pruned_model_name += "-perserve_outlier"
-    if renorm:
-        pruned_model_name += f"-renorm_{str(renorm).lower()}"
-    pruned_model_name += f"-seed_{seed}"
-    pruned_model_name += f"-{compression_ratio_str}"
-
-    pruned_model_dir = results_dir / "pruned_models" / pruned_model_name
-    logger.info(f"Using seed {seed}, pruned model dir: {pruned_model_dir}")
-
-    return pruned_model_dir
-
-
-def main():
-    parser = HfArgumentParser(
-        (
-            ReapArgs,
-            DatasetArgs,
-            ObserverArgs,
-            ModelArgs,
-            EvalArgs,
-            PruneArgs,
-            ClusterArgs,
-        )
-    )
-    reap_args, ds_args, obs_args, model_args, eval_args, prune_args, cluster_args = (
-        parser.parse_args_into_dataclasses()
-    )
-    if prune_args.perserve_super_experts and prune_args.perserve_outliers:
-        raise ValueError("Only one of perserve_super_experts or perserve_outliers can be set to True.")
-    set_seed(reap_args.seed)
-    results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
-
-    # get local patched model if req'd
-    model_name = patched_model_map(model_args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    # record activations or load previously recorded activations
-    logger.info(
-        f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
-    )
-    observer_data = record_activations(
-        model,
-        tokenizer,
-        reap_args,
-        model_args,
-        ds_args,
-        obs_args,
-        results_dir,
-    )
-    if reap_args.run_observer_only:
-        logger.info(
-            "Observer run completed. Exiting after collecting activation data since "
-            "`run_observer_only` is set to True."
-        )
-        return
-
-    # pruning
-    logger.info("Start of pruning")
-    n_experts_to_prune = prune_args.n_experts_to_prune
-    if n_experts_to_prune is None:
-        if cluster_args.compression_ratio is None:
+    for layer_idx in adapter.identify_moe_layers(model):
+        if layer_idx not in observer_data:
             raise ValueError(
-                "Either n_experts_to_prune or compression_ratio must be set for pruning."
+                f"Missing observer data for MoE layer {layer_idx}. "
+                f"Available layers: {sorted(observer_data)}."
+            )
+
+        layer = layers[layer_idx]
+        layer_config = adapter.get_layer_config(layer, config)
+        retained_count = _retained_expert_count(
+            layer_config.num_experts,
+            compression_ratio,
+        )
+        saliency = _saliency_scores(
+            observer_data[layer_idx],
+            prune_method,
+            num_experts=layer_config.num_experts,
+            layer_idx=layer_idx,
+        )
+        keep_indices = compute_keep_indices(saliency, retained_count)
+
+        if adapter.adapter_name == "lfm2_moe":
+            _prune_lfm2_moe_layer(
+                adapter.get_moe(layer),
+                keep_indices,
+                num_experts=layer_config.num_experts,
+                old_top_k=layer_config.top_k,
+                layer_idx=layer_idx,
             )
         else:
-            # Calculate n_experts_to_prune from compression_ratio
-            total_experts = len(
-                observer_data[next(iter(observer_data))]["expert_frequency"]
+            _prune_qwen3_moe_layer(
+                adapter.get_moe(layer),
+                keep_indices,
+                num_experts=layer_config.num_experts,
+                old_top_k=layer_config.top_k,
+                layer_idx=layer_idx,
             )
-            n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
-            logger.info(
-                f"Calculated n_experts to prune: {n_experts_to_prune} from compression_ratio: {cluster_args.compression_ratio}"
-            )
+        keep_by_layer[layer_idx] = keep_indices
 
-    pruned_model_dir = get_pruned_model_dir(
-        results_dir, n_experts_to_prune, total_experts, prune_args, reap_args.seed, obs_args.renormalize_router_weights
+        new_top_k = min(layer_config.top_k, retained_count)
+        if config_num_experts is None:
+            config_num_experts = retained_count
+            config_top_k = new_top_k
+        elif config_num_experts != retained_count:
+            raise ValueError(
+                "MLX MoE config update requires all pruned layers to retain "
+                f"the same expert count. Layer {layer_idx} retained "
+                f"{retained_count}, expected {config_num_experts}."
+            )
+        else:
+            config_top_k = min(config_top_k or new_top_k, new_top_k)
+
+    if config_num_experts is not None:
+        update_config = (
+            update_lfm2_moe_config
+            if adapter.adapter_name == "lfm2_moe"
+            else update_qwen3_moe_config
+        )
+        update_config(
+            config,
+            num_experts=config_num_experts,
+            top_k=config_top_k or config_num_experts,
+        )
+
+    return keep_by_layer
+
+
+def resolve_prune_method(prune_method: str) -> str:
+    """Return the observer-data key for a supported prune method or alias."""
+    resolved = _PRUNE_METHOD_ALIASES.get(prune_method, prune_method)
+    if resolved not in _SUPPORTED_PRUNE_METHODS:
+        supported = sorted(_SUPPORTED_PRUNE_METHODS | set(_PRUNE_METHOD_ALIASES))
+        raise ValueError(
+            f"Unsupported prune method {prune_method!r}. "
+            f"Supported methods: {supported}."
+        )
+    return resolved
+
+
+def compute_keep_indices(saliency: Any, retained_count: int) -> np.ndarray:
+    """Keep the highest-saliency experts and return them in ascending order."""
+    saliency_array = np.asarray(saliency, dtype=np.float64)
+    if saliency_array.ndim != 1:
+        raise ValueError(
+            "saliency scores must be a one-dimensional array, got "
+            f"shape {saliency_array.shape}."
+        )
+    retained_count = int(retained_count)
+    if retained_count < 1 or retained_count > saliency_array.shape[0]:
+        raise ValueError(
+            "retained_count must be in [1, num_experts], got "
+            f"{retained_count} for {saliency_array.shape[0]} experts."
+        )
+    if np.isnan(saliency_array).any():
+        raise ValueError("saliency scores must not contain NaN values.")
+
+    expert_ids = np.arange(saliency_array.shape[0])
+    ranked = np.lexsort((expert_ids, -saliency_array))
+    return np.sort(ranked[:retained_count]).astype(np.int64, copy=False)
+
+
+def slice_first_dim(
+    module: Any,
+    keep_indices: np.ndarray,
+    *,
+    num_experts: int,
+    required: bool = False,
+    field_names: tuple[str, ...] = _SLICE_FIELD_NAMES,
+) -> bool:
+    """Slice present module fields on dimension 0.
+
+    Returns ``True`` if at least one field was sliced.
+    """
+    sliced_any = False
+    keep_list = _keep_list(keep_indices)
+
+    for field_name in field_names:
+        value = _get_module_value(module, field_name)
+        if value is None:
+            continue
+        _validate_first_dim(
+            value,
+            field_name=field_name,
+            num_experts=num_experts,
+        )
+        _set_module_value(module, field_name, value[keep_list])
+        sliced_any = True
+
+    if required and not sliced_any:
+        raise ValueError(
+            "Expected module to expose at least one sliceable field from "
+            f"{field_names}."
+        )
+    return sliced_any
+
+
+def _validate_adapter(adapter: Any) -> None:
+    adapter_name = getattr(adapter, "adapter_name", None)
+    if adapter_name not in {"qwen3_moe", "lfm2_moe"}:
+        raise ValueError(
+            "MLX expert pruning currently supports the qwen3_moe and "
+            "lfm2_moe adapters only; "
+            f"got {adapter_name!r}."
+        )
+
+
+def _validate_compression_ratio(compression_ratio: float) -> None:
+    try:
+        ratio = float(compression_ratio)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("compression_ratio must be a number in [0, 1).") from exc
+
+    if ratio < 0.0 or ratio >= 1.0:
+        raise ValueError(
+            f"compression_ratio must be in [0, 1), got {compression_ratio}."
+        )
+
+
+def _retained_expert_count(num_experts: int, compression_ratio: float) -> int:
+    num_experts = int(num_experts)
+    num_to_prune = int(num_experts * float(compression_ratio))
+    return max(num_experts - num_to_prune, 1)
+
+
+def _saliency_scores(
+    layer_observer_data: Mapping[str, Any],
+    prune_method: str,
+    *,
+    num_experts: int,
+    layer_idx: int,
+) -> np.ndarray:
+    resolved_method = resolve_prune_method(prune_method)
+    if resolved_method not in layer_observer_data:
+        raise ValueError(
+            f"Prune method {prune_method!r} resolved to {resolved_method!r}, "
+            f"but that key is missing from observer data for layer {layer_idx}. "
+            f"Available keys: {sorted(layer_observer_data)}."
+        )
+
+    scores = np.asarray(layer_observer_data[resolved_method], dtype=np.float64)
+    if scores.ndim != 1:
+        raise ValueError(
+            f"Observer metric {resolved_method!r} for layer {layer_idx} must be "
+            f"one-dimensional, got shape {scores.shape}."
+        )
+    if scores.shape[0] != num_experts:
+        raise ValueError(
+            f"Observer metric {resolved_method!r} for layer {layer_idx} has "
+            f"{scores.shape[0]} scores, expected {num_experts}."
+        )
+    return scores
+
+
+def _prune_qwen3_moe_layer(
+    moe: Any,
+    keep_indices: np.ndarray,
+    *,
+    num_experts: int,
+    old_top_k: int,
+    layer_idx: int,
+) -> None:
+    switch_mlp = getattr(moe, "switch_mlp", None)
+    if switch_mlp is None:
+        raise ValueError(f"MoE layer {layer_idx} does not expose switch_mlp.")
+
+    for projection_name in _SWITCH_PROJECTION_NAMES:
+        projection = getattr(switch_mlp, projection_name, None)
+        if projection is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} switch_mlp is missing "
+                f"{projection_name}."
+            )
+        if _get_module_value(projection, "weight") is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} switch_mlp.{projection_name} is "
+                "missing required weight."
+            )
+        slice_first_dim(
+            projection,
+            keep_indices,
+            num_experts=num_experts,
+            required=True,
+        )
+
+    gate = getattr(moe, "gate", None)
+    if gate is None:
+        raise ValueError(f"MoE layer {layer_idx} does not expose a gate.")
+    if _get_module_value(gate, "weight") is None:
+        raise ValueError(f"MoE layer {layer_idx} gate is missing required weight.")
+    slice_first_dim(
+        gate,
+        keep_indices,
+        num_experts=num_experts,
+        required=True,
+        field_names=("weight", "bias", "e_score_correction_bias"),
     )
-    if (
-        pruned_model_dir.exists()
-        and list(pruned_model_dir.glob("*.safetensors"))
-        and not prune_args.overwrite_pruned_model
-    ):
-        logger.info(
-            f"Pruned model directory {pruned_model_dir} already exists and contains pruned model files. "
-            "Skipping pruning step."
-        )
-    else:
-        logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
-        prune(
-            observer_data,
-            model,
-            prune_args,
-            n_experts_to_prune,
-            pruned_model_dir,
-        )
-        logger.info("pruning completed.")
 
-        # smoke test
-        if reap_args.smoke_test:
-            logger.info("Running smoke test on the merged model...")
-            try:
-                smoke_test(model, tokenizer)
-            except Exception as e:
-                logger.error(f"Smoke test failed: {e}")
-                pass
+    retained_count = len(keep_indices)
+    new_top_k = min(int(old_top_k), retained_count)
+    _update_runtime_attrs(moe, gate, retained_count=retained_count, top_k=new_top_k)
 
-        tokenizer.save_pretrained(pruned_model_dir)
-        if model_name == "artifacts/models/GLM-4.5-Air":
-            # move modelling file
-            source_file = pathlib.Path(model_name) / "modeling_glm4_moe.py"
-            target_file = pruned_model_dir / "modeling_glm4_moe.py"
-            if source_file.exists():
-                shutil.copy2(source_file, target_file)
-                logger.info(f"Copied modeling_glm4_moe.py to {pruned_model_dir}")
-            else:
-                raise RuntimeError(
-                    f"Source file {source_file} does not exist. Cannot copy to {target_file}."
-                )
 
-        logger.info("Pruning completed.")
+def _prune_lfm2_moe_layer(
+    moe: Any,
+    keep_indices: np.ndarray,
+    *,
+    num_experts: int,
+    old_top_k: int,
+    layer_idx: int,
+) -> None:
+    switch_mlp = getattr(moe, "switch_mlp", None)
+    if switch_mlp is None:
+        raise ValueError(f"MoE layer {layer_idx} does not expose switch_mlp.")
 
-        dump_args_to_yaml(
-            pruned_model_dir,
-            reap_args,
-            ds_args,
-            obs_args,
-            model_args,
-            eval_args,
-            prune_args,
-            cluster_args,
+    for projection_name in _SWITCH_PROJECTION_NAMES:
+        projection = getattr(switch_mlp, projection_name, None)
+        if projection is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} switch_mlp is missing "
+                f"{projection_name}."
+            )
+        if _get_module_value(projection, "weight") is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} switch_mlp.{projection_name} is "
+                "missing required weight."
+            )
+        slice_first_dim(
+            projection,
+            keep_indices,
+            num_experts=num_experts,
+            required=True,
         )
 
-    # eval
-    if reap_args.do_eval:
-        remove_hook_from_module(model, recurse=True)
-        model.to("cpu")
-        del model
-        del observer_data
-        torch.cuda.empty_cache()
-        gc.collect()
-        model_args.model_name = pruned_model_dir
-        run_evaluate(model_args, pruned_model_dir / "eval", eval_args, reap_args.seed)
+    gate = getattr(moe, "gate", None)
+    if gate is None:
+        raise ValueError(f"MoE layer {layer_idx} does not expose a gate.")
+    if _get_module_value(gate, "weight") is None:
+        raise ValueError(f"MoE layer {layer_idx} gate is missing required weight.")
+    slice_first_dim(
+        gate,
+        keep_indices,
+        num_experts=num_experts,
+        required=True,
+        field_names=("weight", "scales", "biases", "bias"),
+    )
+
+    if getattr(moe, "use_expert_bias", False) or hasattr(moe, "expert_bias"):
+        expert_bias = getattr(moe, "expert_bias", None)
+        if expert_bias is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} use_expert_bias is enabled but "
+                "expert_bias is missing."
+            )
+        setattr(
+            moe,
+            "expert_bias",
+            _slice_value_first_dim(
+                expert_bias,
+                keep_indices,
+                num_experts=num_experts,
+                field_name="expert_bias",
+            ),
+        )
+
+    retained_count = len(keep_indices)
+    new_top_k = min(int(old_top_k), retained_count)
+    _update_runtime_attrs(moe, gate, retained_count=retained_count, top_k=new_top_k)
 
 
-if __name__ == "__main__":
-    main()
+def _update_runtime_attrs(
+    moe: Any,
+    gate: Any,
+    *,
+    retained_count: int,
+    top_k: int,
+) -> None:
+    setattr(moe, "num_experts", retained_count)
+    for attr in _TOP_K_ATTRS:
+        if hasattr(moe, attr):
+            setattr(moe, attr, top_k)
+
+    for attr in ("num_experts", "n_routed_experts"):
+        if hasattr(gate, attr):
+            setattr(gate, attr, retained_count)
+    if hasattr(gate, "top_k"):
+        setattr(gate, "top_k", top_k)
+
+
+def _get_module_value(module: Any, field_name: str) -> Any | None:
+    getter = getattr(module, "get", None)
+    if callable(getter):
+        try:
+            value = getter(field_name)
+        except (KeyError, TypeError, AttributeError):
+            value = None
+        if value is not None:
+            return value
+    return getattr(module, field_name, None)
+
+
+def _set_module_value(module: Any, field_name: str, value: Any) -> None:
+    setattr(module, field_name, value)
+
+
+def _slice_value_first_dim(
+    value: Any,
+    keep_indices: np.ndarray,
+    *,
+    num_experts: int,
+    field_name: str,
+) -> Any:
+    _validate_first_dim(value, field_name=field_name, num_experts=num_experts)
+    return value[_keep_list(keep_indices)]
+
+
+def _validate_first_dim(value: Any, *, field_name: str, num_experts: int) -> None:
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) < 1:
+        raise ValueError(f"{field_name} must expose a non-empty shape.")
+    if int(shape[0]) != int(num_experts):
+        raise ValueError(
+            f"{field_name} first dimension must match num_experts={num_experts}, "
+            f"got shape {shape}."
+        )
+
+
+def _keep_list(keep_indices: np.ndarray) -> list[int]:
+    return [int(idx) for idx in np.asarray(keep_indices, dtype=np.int64).tolist()]
+
+
+__all__ = [
+    "compute_keep_indices",
+    "prune_experts",
+    "resolve_prune_method",
+    "slice_first_dim",
+]
