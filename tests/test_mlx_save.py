@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from reap.backends.mlx.save import (
+from reap.save import (
     SaveReloadResult,
     generation_smoke,
     save_pruned_model,
@@ -49,7 +49,7 @@ def test_save_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.save import SaveReloadResult, save_pruned_model
+        from reap.save import SaveReloadResult, save_pruned_model
 
         assert SaveReloadResult is not None
         assert save_pruned_model is not None

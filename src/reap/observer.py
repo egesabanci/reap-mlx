@@ -1,536 +1,398 @@
+"""Layerwise observer for MLX-backed MoE models.
+
+The MLX observer uses explicit layer replay instead of PyTorch hooks. It records
+only selected expert outputs for pruning metrics and avoids importing optional
+MLX runtime packages until observation is executed.
+"""
+
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from contextlib import contextmanager
-from typing import Any, Optional
-import gc
-from functools import reduce
 
-import torch
-import torch.nn as nn
-import re
-from dataclasses import dataclass
 import logging
-import pathlib
-from functools import reduce
+from collections.abc import Mapping
+from typing import Any, Callable
 
-from reap.metrics import (
-    ttm_online,
-    get_routed_characteristic_activation,
-    ca_dist_online,
-    OnlineStatsTracker,
-    get_distance_fn,
+from reap.metrics import PruningState
+from reap.model_adapters import (
+    get_shared_expert,
+    infer_model_adapter,
+    make_attention_mask,
+    make_ssm_mask,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.router import Lfm2MoeRouter, Qwen3MoeRouter
 
-logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 
-class BaseTransformerObserverHookConfig:
-    state_attr_name: str = "hook_state"
-    hook_attr_name: str = "hooks"
-    module_name_to_hook_regex: Optional[str] = None
-    module_class_name_to_hook_regex: Optional[nn.Module] = None
+def observe_model(
+    model: Any,
+    calibration_sequences: list[Any],
+    config: Mapping[str, Any] | None = None,
+    *,
+    adapter: Any | None = None,
+    debug_memory: bool = False,
+    eval_fn: Callable[[Any], Any] | None = None,
+    mask_fn: Callable[..., Any] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Collect pruning-compatible observer data with explicit MLX layer replay."""
+    mx = _require_mlx_core()
+    config = {} if config is None else config
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    eval_fn = mx.eval if eval_fn is None else eval_fn
 
+    if getattr(adapter, "adapter_name", None) == "lfm2_moe":
+        return _observe_lfm2_model(
+            model,
+            calibration_sequences,
+            config,
+            adapter=adapter,
+            debug_memory=debug_memory,
+            eval_fn=eval_fn,
+            mask_fn=mask_fn,
+        )
 
-class BaseTransformerObserver(ABC):
-    def __init__(
-        self,
+    return _observe_qwen3_model(
         model,
-        hook_config: Optional[BaseTransformerObserverHookConfig] = None,
-    ):
-        self.model = model
-        self.hook_config = hook_config
-        self.hooks = []
-        self.state: dict[Any, Any] = {}
-        self._hook_model()
-        logger.info(
-            "%s initialized for %s.",
-            self.__class__.__name__,
-            self.model.__class__.__name__,
-        )
+        calibration_sequences,
+        config,
+        adapter=adapter,
+        debug_memory=debug_memory,
+        eval_fn=eval_fn,
+        mask_fn=mask_fn,
+    )
 
-    @abstractmethod
-    def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
-        """
-        Factory method to create a hook function for the given module.
-        This method should be implemented by subclasses to define how the
-        hook function should behave.
-        """
-        raise NotImplementedError("Subclasses must implement _hook_factory method.")
 
-    def report_state(self) -> dict[str, Any]:
-        """
-        Method to report the current state of the observer. Can be overridden to inject
-        custom behaviours.
-        """
-        return self.state
+def _observe_qwen3_model(
+    model: Any,
+    calibration_sequences: list[Any],
+    config: Mapping[str, Any],
+    *,
+    adapter: Any,
+    debug_memory: bool,
+    eval_fn: Callable[[Any], Any],
+    mask_fn: Callable[..., Any] | None,
+) -> dict[int, dict[str, Any]]:
+    mx = _require_mlx_core()
+    layers = adapter.layers(model)
+    moe_layer_indices = set(adapter.identify_moe_layers(model))
+    embed_tokens = _get_embed_tokens(model)
 
-    def close_hooks(self):
-        """Close all hooks registered to the model."""
-        self.reset()  # Reset the state before closing hooks
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks = []
-        logger.debug("All hooks closed for %s.", self.model.__class__.__name__)
+    accumulators = _initialize_accumulators(
+        layers,
+        moe_layer_indices,
+        adapter=adapter,
+        config=config,
+    )
 
-    def reset(self):
-        """Reset the observer state."""
-        del self.state
-        gc.collect()
-        self.state = {}
-        logger.debug("Observer state reset for %s.", self.model.__class__.__name__)
+    for sequence in calibration_sequences:
+        tokens = _batch_tokens(mx, sequence)
+        h = embed_tokens(tokens)
 
-    def save_state(self, file_path: str | pathlib.Path):
-        self._move_state_tensors_to_cpu()
-        if isinstance(file_path, str):
-            file_path = pathlib.Path(file_path)
-        if not file_path.parent.exists():
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-        state_dict = self.report_state()
-        with open(file_path, "wb") as f:
-            torch.save(state_dict, f)
-        logger.info("State saved to %s", file_path)
-
-    def _move_state_tensors_to_cpu(self):
-        """
-        Move all tensors in the state dictionary to CPU.
-        This is useful before saving the state to avoid GPU memory issues.
-        """
-        for layer_number, layer_state in self.state.items():
-            for key, value in layer_state.items():
-                if isinstance(value, torch.Tensor):
-                    self.state[layer_number][key] = value.cpu()
-
-    def _validate_hook_config(self):
-        if self.hook_config is None:
-            return
-        if (
-            self.hook_config.module_name_to_hook_regex is None
-            and self.hook_config.module_class_name_to_hook_regex is None
-        ):
-            raise ValueError(
-                "At least one of 'module_n`ame_to_hook_regex' or "
-                "'module_type_to_hook_regex' must be provided in the hook config."
+        for layer_idx, layer in enumerate(layers):
+            mask = _attention_mask(
+                h,
+                sequence_length=tokens.shape[-1],
+                mask_fn=mask_fn,
             )
-        if (
-            self.hook_config.module_name_to_hook_regex is not None
-            and self.hook_config.module_class_name_to_hook_regex is not None
-        ):
-            logger.warning(
-                "Both 'module_name_to_hook_regex' and 'module_type_to_hook_regex' are "
-                "provided. Both conditions must be satisfied to hook the module."
-            )
+            h = _run_attention(layer, h, mask)
+            moe_input = _call_required(layer, "post_attention_layernorm", h)
 
-    def _hook_model(self):
-        for name, module in self.model.named_modules():
-            hook_module = False
-            if (
-                self.hook_config.module_name_to_hook_regex
-                and re.search(self.hook_config.module_name_to_hook_regex, name)
-            ) or (
-                self.hook_config.module_class_name_to_hook_regex
-                and module.__class__.__name__
-                == self.hook_config.module_class_name_to_hook_regex
-            ):
-                hook_module = True
-            if hook_module:
-                layer_number = int(re.search(r"\d+", name).group(0))
-                hook_fn = self._hook_factory(module, layer_number)
-                hook = module.register_forward_hook(hook_fn)
-                self.hooks.append(hook)
-                logger.info("Hooked module: %s at layer %d", name, layer_number)
-        if len(self.hooks) == 0:
-            raise ValueError(
-                "No modules matched the provided hook configuration. "
-                "Check your hook configuration settings."
-            )
-
-    @classmethod
-    def _get_registry_for_cls(cls) -> dict[str, type[BaseTransformerObserver]]:
-        """Helper to get the registry from the specific class 'cls'."""
-        if not hasattr(cls, "_architecture_registry") or not isinstance(
-            cls._architecture_registry, dict
-        ):
-            raise AttributeError(
-                f"Class {cls.__name__} must define its own "
-                "`_architecture_registry: dict[str, type] = {{}}` "
-                f"to use the common registration/creation methods."
-            )
-        return cls._architecture_registry
-
-    @classmethod
-    def register_implementation(cls, *arch_names: str):
-        """
-        Class method decorator to register a concrete observer implementation.
-        'cls' is the class on which this decorator's factory is called (e.g.,
-        MoEExpertObserver) 'sub_cls' is the class being decorated
-        (e.g., Llama4MoEExpertObserver).
-        """
-
-        def decorator(sub_cls: type[BaseTransformerObserver]):
-            registry = cls._get_registry_for_cls()
-
-            for name in arch_names:
-                if name in registry:
-                    raise RuntimeError(
-                        f"Architecture {name} already registered with "
-                        f"{registry[name].__name__} for {cls.__name__}."
-                    )
-                registry[name] = sub_cls
-            return sub_cls
-
-        return decorator
-
-    @classmethod
-    def create_from_registry(
-        cls,
-        model: nn.Module,
-        hook_config: Optional[BaseTransformerObserverHookConfig] = None,
-        return_rank_0_only: bool = True,
-        **kwargs: Any,
-    ) -> BaseTransformerObserver:
-        registry = cls._get_registry_for_cls()
-        model_cls_name = model.__class__.__name__
-
-        specific_observer_cls = registry.get(model_cls_name)
-
-        if specific_observer_cls:
-            return specific_observer_cls(
-                model,
-                hook_config=hook_config,
-                return_rank_0_only=return_rank_0_only,
-                **kwargs,
-            )
-        else:
-            raise ValueError(
-                "Unsupported architecture for "
-                f"{cls.__name__}: {model_cls_name}. "
-                "Registered architectures in "
-                f"{cls.__name__}._architecture_registry: "
-                f"{list(registry.keys())}"
-            )
-
-
-# --- MoE Transformer Observer ---------------------------------------------------------
-
-
-@dataclass
-class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
-    num_experts_attr_name: str = "num_experts"
-    top_k_attr_name: str = "top_k"
-    fused_experts: bool = False
-    distance_measure: str = "angular"
-    renormalize_router_weights: bool = False
-    record_pruning_metrics_only: bool = False
-
-
-class MoETransformerObserver(BaseTransformerObserver):
-    """MoE Transformer Observer for all methods including both pruning and merging."""
-
-    def __init__(self, model, hook_config=None):
-        self._current_attention_mask: Optional[torch.Tensor] = None
-        super().__init__(model, hook_config)
-
-    @contextmanager
-    def set_attention_mask(self, attention_mask: Optional[torch.Tensor]):
-        """Temporarily set the attention mask for the current forward pass.
-
-        Use this as a context manager around each forward pass when using
-        batched inputs with padding, to ensure padding tokens are excluded
-        from statistics.
-
-        Args:
-            attention_mask: Tensor of shape (batch_size, seq_len) with 1 for real
-                tokens and 0 for padding tokens. Can be None for unbatched inputs.
-        """
-        previous_attention_mask = self._current_attention_mask
-        self._current_attention_mask = attention_mask
-        try:
-            yield
-        finally:
-            self._current_attention_mask = previous_attention_mask
-
-    def clear_attention_mask(self):
-        """Clear the attention mask after forward pass."""
-        self._current_attention_mask = None
-
-    def report_state(self) -> dict[str, Any]:
-        """
-        Method to report the current state of the observer. Can be overridden to inject
-        custom behaviours.
-        """
-        return {
-            layer_num: {
-                k: v.mean if isinstance(v, OnlineStatsTracker) else v
-                for k, v in layer_state.items()
-            }
-            for layer_num, layer_state in self.state.items()
-        }
-
-    def _initialize_state(self, output: torch.Tensor, num_experts: int):
-        # get device and shape info
-        output_hidden_states = output[0]
-        device = "cpu"
-        hidden_dim = output_hidden_states.shape[-1]
-        layer_state = initialize_pruning_state(num_experts, device=device)
-
-        if not self.hook_config.record_pruning_metrics_only:
-            # per routed token normalized states
-            layer_state["ttm_similarity_matrix"] = OnlineStatsTracker(
-                shape=(num_experts, num_experts),
-                count_shape=(num_experts, num_experts),
-                device=device,
-                dtype=torch.float32,
-            )
-            layer_state["routed_characteristic_activation"] = OnlineStatsTracker(
-                shape=(num_experts, hidden_dim),
-                count_shape=(num_experts, hidden_dim),
-                device=device,
-                dtype=torch.float32,
-            )
-            # HC-SMoE
-            layer_state["characteristic_activation"] = OnlineStatsTracker(
-                shape=(num_experts, hidden_dim),
-                count_shape=1,
-                device=device,
-                dtype=torch.float32,
-            )
-            # SubMoE
-            layer_state["online_characteristic_activation_dist"] = OnlineStatsTracker(
-                shape=(num_experts, num_experts),
-                count_shape=1,
-                device=device,
-                dtype=torch.float32,
-            )
-            # per total token normalized states -> MC-SMoE
-            layer_state["router_logit_similiarity"] = OnlineStatsTracker(
-                shape=(num_experts, num_experts),
-                count_shape=1,
-                device=device,
-                dtype=torch.float32,
-            )
-
-        return layer_state
-
-    def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
-        distance_fn = get_distance_fn("cosine") # always use cosine for online dist. metrics
-        num_experts = reduce(
-            getattr, self.hook_config.num_experts_attr_name.split("."), module
-        )
-        top_k = reduce(getattr, self.hook_config.top_k_attr_name.split("."), module)
-        if num_experts is None or top_k is None:
-            raise ValueError(
-                f"Module {module.__class__.__name__} at layer {layer_number} "
-                "does not have expected 'num_experts' or 'top_k' attributes. Check "
-                "HookConfig settings."
-            )
-
-        @torch.no_grad()
-        def _hook_fn(module, args, output):
-            if not len(output) >= 2:
-                raise ValueError(
-                    f"Expected output of module {module.__class__.__name__} at layer "
-                    f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
+            if layer_idx in moe_layer_indices:
+                h = h + _observe_moe_layer(
+                    layer,
+                    moe_input,
+                    accumulators[layer_idx],
+                    adapter=adapter,
+                    config=config,
                 )
-            input = args[0]  # (batch_size, seq_len, hidden_dim)
-            device = input.device
-            if layer_number not in self.state:
-                self.state[layer_number] = self._initialize_state(output, num_experts)
-            batch_size, sequence_length, hidden_dim = input.shape
-            flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
-
-            attention_mask = self._current_attention_mask
-            if attention_mask is not None:
-                # Flatten mask to match flat_input: (batch_size * seq_len,)
-                flat_mask = attention_mask.view(-1).bool().to(device)
             else:
-                # No mask provided - treat all tokens as valid
-                flat_mask = None
+                dense_mlp = adapter.get_dense_mlp(layer)
+                h = h + dense_mlp(moe_input)
 
-            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
+            eval_fn(h)
+            if debug_memory:
+                _log_memory(mx, layer_idx)
 
-            if self.hook_config.fused_experts:
-                _, router_scores = output  # (num_experts, total_tokens)
-                router_logits = module.router(flat_input)  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                selected_experts = selected_experts.to(device)
-                router_indices = (
-                    torch.arange(batch_size * sequence_length, device=device)
-                    .view(1, -1)
-                    .expand(router_scores.size(0), -1)
+    return {layer_idx: state.report() for layer_idx, state in accumulators.items()}
+
+
+def _observe_lfm2_model(
+    model: Any,
+    calibration_sequences: list[Any],
+    config: Mapping[str, Any],
+    *,
+    adapter: Any,
+    debug_memory: bool,
+    eval_fn: Callable[[Any], Any],
+    mask_fn: Callable[..., Any] | None,
+) -> dict[int, dict[str, Any]]:
+    mx = _require_mlx_core()
+    layers = adapter.layers(model)
+    moe_layer_indices = set(adapter.identify_moe_layers(model))
+    embed_tokens = _get_embed_tokens(model)
+
+    accumulators = _initialize_accumulators(
+        layers,
+        moe_layer_indices,
+        adapter=adapter,
+        config=config,
+    )
+
+    for sequence in calibration_sequences:
+        tokens = _batch_tokens(mx, sequence)
+        h = embed_tokens(tokens)
+        attn_mask, conv_mask = _lfm2_masks(
+            h,
+            sequence_length=tokens.shape[-1],
+            mask_fn=mask_fn,
+        )
+
+        for layer_idx, layer in enumerate(layers):
+            operator_mask = attn_mask if _is_lfm2_attention_layer(layer) else conv_mask
+            h_mid = _run_lfm2_operator(layer, h, operator_mask)
+            ffn_input = _call_required(layer, "ffn_norm", h_mid)
+
+            if layer_idx in moe_layer_indices:
+                h = h_mid + _observe_lfm2_moe_layer(
+                    layer,
+                    ffn_input,
+                    accumulators[layer_idx],
+                    adapter=adapter,
+                    config=config,
                 )
-                router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
-                routed_in = torch.gather(
-                    input=flat_input,
-                    dim=0,
-                    index=router_indices,
-                ).to(device)
-                # we do not apply router_scores
-                # record unweighted activations for all experts
-                routed_out = module.experts(routed_in)
-                activations = routed_out.view(num_experts, *flat_input.shape)
+            else:
+                dense_mlp = adapter.get_dense_mlp(layer)
+                h = h_mid + dense_mlp(ffn_input)
 
-            else:  # loop based MoE execution
-                # ernie returns combined_output, combine_weights, router_loss, gate_logits
-                *_, router_logits = output  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                # selected_experts = selected_experts.to(device)
-                for idx, expert in enumerate(module.experts):
-                    activations[idx] = expert(flat_input).to(
-                        device
-                    )  # (num_experts, total_seq_len, hidden_dim)
+            eval_fn(h)
+            if debug_memory:
+                _log_memory(mx, layer_idx)
 
-            del flat_input
-            
-            pruning_batch = update_pruning_state(
-                self.state[layer_number],
-                activations=activations,
-                selected_experts=selected_experts,
-                router_logits=router_logits,
-                num_experts=num_experts,
-                valid_token_mask=flat_mask,
-                renormalize_router_weights=self.hook_config.renormalize_router_weights,
+    return {layer_idx: state.report() for layer_idx, state in accumulators.items()}
+
+
+def _require_mlx_core():
+    try:
+        import mlx.core as mx
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "observe_model requires the optional 'mlx' package to execute. "
+            "Install MLX in the active environment before observing."
+        ) from exc
+    return mx
+
+
+def _get_embed_tokens(model: Any) -> Callable[[Any], Any]:
+    model_body = getattr(model, "model", None)
+    embed_tokens = getattr(model_body, "embed_tokens", None)
+    if callable(embed_tokens):
+        return embed_tokens
+
+    embed_tokens = getattr(model, "embed_tokens", None)
+    if callable(embed_tokens):
+        return embed_tokens
+
+    raise ValueError(
+        "Model does not expose an embed_tokens callable at "
+        "model.model.embed_tokens or model.embed_tokens."
+    )
+
+
+def _batch_tokens(mx: Any, sequence: Any) -> Any:
+    input_ids = sequence.get("input_ids") if isinstance(sequence, Mapping) else sequence
+    tokens = mx.array(input_ids)
+
+    if tokens.ndim == 0:
+        raise ValueError("Calibration sequences must contain at least one token.")
+    if tokens.ndim == 1:
+        if tokens.shape[0] == 0:
+            raise ValueError("Calibration sequences must contain at least one token.")
+        return tokens[None, :]
+    if tokens.ndim == 2:
+        if tokens.shape[0] != 1:
+            raise ValueError(
+                "MLX observer only supports unpadded batch-size-1 sequences."
             )
+        if tokens.shape[1] == 0:
+            raise ValueError("Calibration sequences must contain at least one token.")
+        return tokens
 
-            # Merging critera
-            if not self.hook_config.record_pruning_metrics_only:
-                ttm_similarity_matrix = ttm_online(
-                    pruning_batch.activations,
-                    pruning_batch.selected_experts,
-                    distance_callable=distance_fn,
-                    num_experts=num_experts,
-                    pairwise_expert_frequency=pruning_batch.pairwise_expert_frequency,
-                )
+    raise ValueError(
+        "Calibration sequences must have shape [seq] or [1, seq], "
+        f"got {tokens.shape}."
+    )
 
-                # ttm_similarity_matrix with pairwise frequency counts
-                self.state[layer_number]["ttm_similarity_matrix"].update(
-                    ttm_similarity_matrix, pruning_batch.pairwise_expert_frequency
-                )
-                del ttm_similarity_matrix
 
-                routed_characteristic_activation = get_routed_characteristic_activation(
-                    pruning_batch.activations,
-                    pruning_batch.selected_experts,
-                    pruning_batch.expert_frequency,
-                    device,
-                    hidden_dim,
-                    num_experts,
-                )
+def _initialize_accumulators(
+    layers: Any,
+    moe_layer_indices: set[int],
+    *,
+    adapter: Any,
+    config: Mapping[str, Any],
+) -> dict[int, PruningState]:
+    accumulators: dict[int, PruningState] = {}
+    for layer_idx in sorted(moe_layer_indices):
+        layer_config = adapter.get_layer_config(layers[layer_idx], config)
+        accumulators[layer_idx] = PruningState.initialize(layer_config.num_experts)
+    return accumulators
 
-                # routed_characteristic_activation with expert frequency counts
-                expert_freq_expanded = pruning_batch.expert_frequency.unsqueeze(-1).expand(
-                    (-1, hidden_dim)
-                )
-                self.state[layer_number]["routed_characteristic_activation"].update(
-                    routed_characteristic_activation, expert_freq_expanded
-                )
-                del expert_freq_expanded, routed_characteristic_activation
 
-                online_characteristic_activation_dist = ca_dist_online(
-                    pruning_batch.activations,
-                    distance_callable=distance_fn,
-                ).to(device="cpu")
+def _attention_mask(
+    hidden_states: Any,
+    *,
+    sequence_length: int,
+    mask_fn: Callable[..., Any] | None,
+) -> Any | None:
+    if mask_fn is not None:
+        return mask_fn(hidden_states, cache=None)
+    if sequence_length == 1:
+        return None
+    return make_attention_mask(hidden_states, cache=None)
 
-                # online_characteristic_activation_dist with expert frequency counts
-                self.state[layer_number]["online_characteristic_activation_dist"].update(
-                    online_characteristic_activation_dist, pruning_batch.num_tokens
-                )
-                del online_characteristic_activation_dist
 
-                # router logit similarity -> must align with distance_fn shape expectations
-                # dim 0 "batch" dim, dims 1,2 expert pairwise, dim 3 token logits
-                router_logit_sim = (
-                    distance_fn(
-                        pruning_batch.router_logits.permute(1, 0).view(
-                            1, num_experts, 1, -1
-                        ),  # 1, num_experts, 1, logits
-                        pruning_batch.router_logits.permute(1, 0).view(
-                            1, 1, num_experts, -1
-                        ),  # 1, 1, num_experts, logits
-                    )
-                    .squeeze()
-                    .to(device="cpu")
-                )  # yields (num_experts, num_experts)
+def _lfm2_masks(
+    hidden_states: Any,
+    *,
+    sequence_length: int,
+    mask_fn: Callable[..., Any] | None,
+) -> tuple[Any | None, Any | None]:
+    if sequence_length == 1 and mask_fn is None:
+        return None, None
+    if mask_fn is not None:
+        return (
+            _call_mask_fn(mask_fn, hidden_states, kind="attention"),
+            _call_mask_fn(mask_fn, hidden_states, kind="ssm"),
+        )
+    return (
+        make_attention_mask(hidden_states, cache=None),
+        make_ssm_mask(hidden_states, cache=None),
+    )
 
-                # router_logit_similarity with total tokens count
-                self.state[layer_number]["router_logit_similiarity"].update(
-                    router_logit_sim, pruning_batch.num_tokens
-                )
-                del router_logit_sim
 
-                # characteristic_activation with total tokens count
-                self.state[layer_number]["characteristic_activation"].update(
-                    pruning_batch.activations.mean(dim=1), pruning_batch.num_tokens
-                )
+def _call_mask_fn(
+    mask_fn: Callable[..., Any],
+    hidden_states: Any,
+    *,
+    kind: str,
+) -> Any:
+    try:
+        return mask_fn(hidden_states, cache=None, kind=kind)
+    except TypeError:
+        return mask_fn(hidden_states, cache=None)
 
-            # --- CLEAN UP -------------------------------------------------------------
-            del (
-                activations,
-                selected_experts,
-                router_logits,
-                pruning_batch,
+
+def _run_attention(layer: Any, h: Any, mask: Any | None) -> Any:
+    normalized = _call_required(layer, "input_layernorm", h)
+    self_attn = getattr(layer, "self_attn", None)
+    if not callable(self_attn):
+        raise ValueError("Layer does not expose a callable self_attn module.")
+
+    attention_output = self_attn(normalized, mask, cache=None)
+    if isinstance(attention_output, tuple):
+        attention_output = attention_output[0]
+    return h + attention_output
+
+
+def _is_lfm2_attention_layer(layer: Any) -> bool:
+    is_attention_layer = getattr(layer, "is_attention_layer", None)
+    if is_attention_layer is not None:
+        return bool(is_attention_layer)
+    return callable(getattr(layer, "self_attn", None))
+
+
+def _run_lfm2_operator(layer: Any, h: Any, mask: Any | None) -> Any:
+    normalized = _call_required(layer, "operator_norm", h)
+    if _is_lfm2_attention_layer(layer):
+        operator = getattr(layer, "self_attn", None)
+        if not callable(operator):
+            raise ValueError(
+                "LFM2 attention layer does not expose a callable self_attn module."
             )
-            gc.collect()
+        operator_output = operator(normalized, mask=mask, cache=None)
+    else:
+        operator = getattr(layer, "conv", None)
+        if not callable(operator):
+            raise ValueError("LFM2 conv layer does not expose a callable conv module.")
+        operator_output = operator(normalized, mask=mask, cache=None)
 
-        return _hook_fn
-
-
-# --- Concrete Config Implementations ----
-
-
-@dataclass
-class Qwen3MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Qwen3MoeSparseMoeBlock"
-
-
-@dataclass
-class Llama4MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Llama4TextMoe"
-    fused_experts: bool = True  # Llama4 uses fused experts
+    if isinstance(operator_output, tuple):
+        operator_output = operator_output[0]
+    return h + operator_output
 
 
-@dataclass
-class MixtralMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "MixtralSparseMoeBlock"
+def _observe_moe_layer(
+    layer: Any,
+    moe_input: Any,
+    state: PruningState,
+    *,
+    adapter: Any,
+    config: Mapping[str, Any],
+) -> Any:
+    mx = _require_mlx_core()
+    moe = adapter.get_moe(layer)
+    routing = Qwen3MoeRouter(moe, config)(moe_input)
+    switch_mlp = getattr(moe, "switch_mlp", None)
+    if not callable(switch_mlp):
+        raise ValueError("MoE layer does not expose a callable switch_mlp module.")
+
+    selected_outputs = switch_mlp(moe_input, routing.indices)
+    state.accumulate(
+        indices=routing.indices,
+        scores=routing.scores.astype(mx.float32),
+        selected_outputs=selected_outputs.astype(mx.float32),
+    )
+
+    moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
+    shared_expert = get_shared_expert(moe)
+    if shared_expert is not None:
+        moe_out = moe_out + shared_expert(moe_input)
+    return moe_out
 
 
-@dataclass
-class DeepSeekMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "DeepseekV2MoE"
-    num_experts_attr_name: str = "experts_per_rank"  # only for ep=1!
-    top_k_attr_name: str = "num_experts_per_tok"
-    fused_experts: bool = False
+def _observe_lfm2_moe_layer(
+    layer: Any,
+    moe_input: Any,
+    state: PruningState,
+    *,
+    adapter: Any,
+    config: Mapping[str, Any],
+) -> Any:
+    mx = _require_mlx_core()
+    moe = adapter.get_moe(layer)
+    routing = Lfm2MoeRouter(moe, config)(moe_input)
+    switch_mlp = getattr(moe, "switch_mlp", None)
+    if not callable(switch_mlp):
+        raise ValueError("MoE layer does not expose a callable switch_mlp module.")
+
+    selected_outputs = switch_mlp(moe_input, routing.indices)
+    state.accumulate(
+        indices=routing.indices,
+        scores=routing.scores.astype(mx.float32),
+        selected_outputs=selected_outputs.astype(mx.float32),
+    )
+
+    moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
+    shared_expert = get_shared_expert(moe)
+    if shared_expert is not None:
+        moe_out = moe_out + shared_expert(moe_input)
+    return moe_out
 
 
-@dataclass
-class Ernie4_5MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Ernie4_5_MoeMLP"
-    num_experts_attr_name: str = "num_local_experts"
-    top_k_attr_name: str = "k"
-
-    # hf in tree implementation below:
-    # module_class_name_to_hook_regex: Optional[str] = "Ernie4_5_MoESparseMoeBlock"
-    # num_experts_attr_name: str = "num_experts"
-    # top_k_attr_name: str = "top_k"
-    fused_experts: bool = False
+def _call_required(layer: Any, attr: str, h: Any) -> Any:
+    module = getattr(layer, attr, None)
+    if not callable(module):
+        raise ValueError(f"Layer does not expose a callable {attr} module.")
+    return module(h)
 
 
-@dataclass
-class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Glm4MoeMoE"
-    num_experts_attr_name: str = "config.n_routed_experts"
-    top_k_attr_name: str = "config.num_experts_per_tok"
-    fused_experts: bool = False
+def _log_memory(mx: Any, layer_idx: int) -> None:
+    memory_parts = []
+    for name in ("get_active_memory", "get_peak_memory", "get_cache_memory"):
+        getter = getattr(mx, name, None)
+        if callable(getter):
+            memory_parts.append(f"{name}={getter()}")
+    if memory_parts:
+        logger.debug("MLX memory after layer %s: %s", layer_idx, ", ".join(memory_parts))
 
 
-OBSERVER_CONFIG_REGISTRY = {
-    "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
-    "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
-    "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
-    "MixtralForCausalLM": MixtralMoEObserverHookConfig,
-    "DeepseekV2ForCausalLM": DeepSeekMoEObserverHookConfig,
-    "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
-    "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
-    "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
-}
+__all__ = ["observe_model"]

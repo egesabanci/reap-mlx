@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from reap.backends.mlx.prune import (
+from reap.prune import (
     compute_keep_indices,
     prune_experts,
     resolve_prune_method,
@@ -55,7 +55,7 @@ def test_prune_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.prune import prune_experts
+        from reap.prune import prune_experts
 
         assert prune_experts is not None
 

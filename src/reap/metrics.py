@@ -1,286 +1,250 @@
+"""NumPy pruning accumulators for MLX-backed MoE observation.
+
+This module is intentionally independent from the existing Torch pruning
+metrics. MLX observer code should pass compact selected-route arrays here after
+forcing any needed MLX evaluation boundaries.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
-import torch
-import torch.nn.functional as F
-import math  # For pi constant in comments
-from typing import List, Dict, Callable
-import logging
 
 
-logger = logging.getLogger(__name__)
-
-# --- Standalone Distance Functions ---
-
-CHUNK_SIZE=16 # Chunk size for distance calculations to avoid OOM
-
-def angular_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Computes the normalized angular distance between two tensors of vectors.
-    The distance is the angle in radians / pi, calculated as acos(cosine_similarity).
-    Range: [0, 1]
-
-    Args:
-        x: Tensor of shape (..., N, D)
-        y: Tensor of shape (..., M, D)
-
-    Returns:
-        A tensor of normalized pairwise distances of shape (..., N, M).
-    """
-    # Since this is used for online metrics, we chunk to avoid OOM
-    chunks = max(1, int(x.shape[0] // CHUNK_SIZE))
-    similarities = []
-    for x_chunk, y_chunk in zip(x.chunk(chunks, dim=0), y.chunk(chunks, dim=0)):
-        similarities.append(F.cosine_similarity(x_chunk, y_chunk, dim=-1))
-    similarity = torch.cat(similarities, dim=0)
-
-    # Clamp similarity to the valid range [-1, 1] to avoid NaNs from acos
-    # due to floating-point inaccuracies.
-    clamped_similarity = torch.clamp(similarity, -1.0, 1.0)
-
-    # Calculate the angle. The result is in radians.
-    angle = torch.acos(clamped_similarity)
-    return angle / math.pi  # Normalize to [0, 1] range
+_FLOAT_EPS = np.finfo(np.float64).eps
 
 
-def cosine_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Computes 1 - Cosine Similarity between two tensors of vectors.
-    Range: [0, 2]
-    """
-    # Since this is used for online metrics, we chunk to avoid OOM
-    chunks = max(1, int(x.shape[0] // CHUNK_SIZE))
-    similarities = []
-    for x_chunk, y_chunk in zip(x.chunk(chunks, dim=0), y.chunk(chunks, dim=0)):
-        similarities.append(F.cosine_similarity(x_chunk, y_chunk, dim=-1))
-    similarity = torch.cat(similarities, dim=0)
-    return 1.0 - similarity
+@dataclass
+class PruningState:
+    """Pruning-only observer state for one MoE layer."""
 
+    num_experts: int
+    total_tokens: int
+    expert_frequency: np.ndarray
+    pairwise_expert_frequency: np.ndarray
+    ean_sum: np.ndarray
+    weighted_ean_sum: np.ndarray
+    weighted_expert_frequency_sum: np.ndarray
+    max_activations: np.ndarray
 
-def cka_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Computes 1 - Centered Kernel Alignment (CKA) using a linear kernel.
-    """
-    x_centered = x - x.mean(dim=-1, keepdim=True)
-    y_centered = y - y.mean(dim=-1, keepdim=True)
-    cka_similarity = F.cosine_similarity(x_centered, y_centered, dim=-1)
-    return 1.0 - cka_similarity
+    @classmethod
+    def initialize(cls, num_experts: int) -> "PruningState":
+        """Create zero-initialized pruning state for ``num_experts`` experts."""
+        num_experts = int(num_experts)
+        if num_experts < 1:
+            raise ValueError(f"num_experts must be positive, got {num_experts}.")
 
+        return cls(
+            num_experts=num_experts,
+            total_tokens=0,
+            expert_frequency=np.zeros(num_experts, dtype=np.int64),
+            pairwise_expert_frequency=np.zeros(
+                (num_experts, num_experts),
+                dtype=np.int64,
+            ),
+            ean_sum=np.zeros(num_experts, dtype=np.float64),
+            weighted_ean_sum=np.zeros(num_experts, dtype=np.float64),
+            weighted_expert_frequency_sum=np.zeros(num_experts, dtype=np.float64),
+            max_activations=np.zeros(num_experts, dtype=np.float32),
+        )
 
-def js_divergence(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Computes the Jensen-Shannon Divergence. Assumes inputs are logits
-    and applies softmax to create probability distributions.
-    """
-    # Add a small epsilon for numerical stability with log
-    epsilon = 1e-10
-    x_dist = F.softmax(x, dim=-1)
-    y_dist = F.softmax(y, dim=-1)
-
-    m_dist = 0.5 * (x_dist + y_dist)
-
-    kl_x_m = F.kl_div((m_dist + epsilon).log(), x_dist, reduction="none").sum(dim=-1)
-    kl_y_m = F.kl_div((m_dist + epsilon).log(), y_dist, reduction="none").sum(dim=-1)
-
-    jsd = 0.5 * (kl_x_m + kl_y_m)
-    return jsd
-
-
-def euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Computes the Euclidean distance between two vectors.
-    The distance is computed as the L2 norm of the difference between the vectors.
-    Range: [0, inf)
-
-    Args:
-        x: Tensor of shape (..., M, D)
-        y: Tensor of shape (..., M, D)
-
-    Returns:
-        A tensor of pairwise distances in shape (..., N, M)
-    """
-    return torch.norm(x - y, dim=-1)
-
-
-distance_metrics = {
-    "angular": angular_distance,
-    "euclidean": euclidean_distance,
-    "jsd": js_divergence,
-    "cka": cka_distance,
-    "cosine": cosine_distance,
-}
-get_distance_fn = lambda metric: distance_metrics.get(metric)
-
-
-def ttm_online(
-    activations: torch.Tensor,  # (num_experts, seq, hidden_dim)
-    selected: List[torch.Tensor],
-    distance_callable: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    num_experts: int,
-    pairwise_expert_frequency: torch.Tensor,
-) -> np.ndarray:
-    """
-    Calculates a pairwise N x N distance matrix using a vectorized approach.
-    """
-    device = activations.device
-    pairwise_distances = torch.zeros(
-        (num_experts, num_experts), device=device, dtype=activations[0].dtype
-    )
-
-    E, S, H = activations.shape
-    K = selected.shape[1]
-    act_tensor_permuted = activations.permute(1, 0, 2)  # S, E, H
-
-    selected_acts = torch.gather(
-        act_tensor_permuted, 1, selected.unsqueeze(-1).expand(-1, -1, H)
-    )
-
-    dist_matrix = distance_callable(
-        selected_acts.unsqueeze(2), act_tensor_permuted.unsqueeze(1)
-    )  # Shape: (S, K, E)
-
-    # Vectorized accumulation using scatter_add_
-    # Create an index for the 'selected expert' dimension
-    idx0 = selected.view(S * K)
-
-    # Flatten the distance matrix to match the indices
-    flat_dists = dist_matrix.view(S * K, E)
-
-    # For each of the S*K selections, we have E distances.
-    # We need to add these E distances to the correct row in the temp matrix.
-    # The row index is given by the selected expert index.
-    pairwise_distances.scatter_add_(0, idx0.unsqueeze(-1).expand(-1, E), flat_dists)
-
-    # Symmetrize the matrices, add i,j to j,i
-    pairwise_distances = pairwise_distances + pairwise_distances.T
-
-    # normalize by the sum of tokens router to either i or j
-    pairwise_distances = pairwise_distances / pairwise_expert_frequency
-    pairwise_distances = pairwise_distances.nan_to_num(0)  # Replace NaNs with 0
-
-    # Ensure the diagonal is zero
-    pairwise_distances.fill_diagonal_(0)
-
-    return pairwise_distances
-
-
-def ca_dist_online(
-    activations: torch.Tensor,  # (seq, num_experts, hidden_dim)
-    distance_callable: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-):
-    # (total_seq_len, num_experts, hidden_dim)
-    permuted_activations = activations.permute(1, 0, 2)  
-    # we will chunk along seq len dim. 
-    distance_matrix = distance_callable(
-        permuted_activations.unsqueeze(1), permuted_activations.unsqueeze(2)
-    ).mean(dim=0)
-    return distance_matrix  # (num_experts, num_experts)
-
-
-def get_routed_characteristic_activation(
-    activations: torch.Tensor,
-    selected_experts: torch.Tensor,
-    expert_frequency: torch.Tensor,
-    device: torch.device,
-    hidden_dim: int,
-    num_experts: int,
-) -> torch.Tensor:
-    # seq, n_expert, hidden
-    activations_permuted = activations.permute(1, 0, 2)
-
-    # Shape: (seq, K, 1) -> (seq, K, hidden)
-    index_for_gather = selected_experts.unsqueeze(-1).expand(-1, -1, hidden_dim)
-
-    # Shape: (seq, K, hidden)
-    gathered_activations = activations_permuted.gather(dim=1, index=index_for_gather)
-
-    # Flatten the gathered activations and the expert indices.
-    # src shape: (seq * K, hidden)
-    src = gathered_activations.reshape(-1, hidden_dim)
-    # index shape: (seq * K, 1) -> (seq * K, hidden)
-    index_for_scatter = selected_experts.reshape(-1, 1).expand(-1, hidden_dim)
-
-    # We are scattering along dim=0 (the n_experts dimension).
-    characteristic_activation = torch.zeros(
-        num_experts, hidden_dim, dtype=torch.float64, device=device
-    )
-    characteristic_activation = characteristic_activation.scatter_add_(
-        dim=0, index=index_for_scatter, src=src.to(torch.float64)
-    )
-    # Normalize by the expert frequency
-    characteristic_activation = characteristic_activation / expert_frequency.unsqueeze(
-        -1
-    )
-    characteristic_activation = characteristic_activation.nan_to_num(
-        0
-    )  # Replace NaNs with 0
-    return characteristic_activation
-
-
-class OnlineStatsTracker:
-    """
-    A numerically stable tracker for online mean and variance using Welford's algorithm
-    and Kahan summation for updating the mean.
-
-    This is designed to handle a large number of updates without significant precision loss.
-    """
-
-    def __init__(
+    def accumulate(
         self,
-        shape: tuple,
-        count_shape: tuple | int = 1,
-        device: torch.device = torch.device("cpu"),
-        dtype: torch.dtype = torch.float32,
-    ):
-        """
-        Initializes the tracker.
+        routing: Any | None = None,
+        *,
+        indices: Any | None = None,
+        scores: Any | None = None,
+        selected_outputs: Any | None = None,
+        selected_output_norms: Any | None = None,
+        selected_output_maxes: Any | None = None,
+    ) -> "PruningState":
+        """Accumulate one selected-route batch into this state.
 
-        Args:
-            shape (tuple): The shape of the tensor statistic being tracked (e.g., (num_experts, hidden_dim)).
-            device (torch.device): The device to store the state on.
+        ``indices`` and ``scores`` must share shape ``[..., top_k]``. Pass either
+        selected expert outputs shaped ``[..., top_k, hidden]`` or precomputed
+        norms and maxes shaped like ``indices``.
         """
-        self.shape = shape
-        self.count_shape = count_shape
-        self.device = device
-        self.dtype = dtype
+        if routing is not None:
+            if indices is not None or scores is not None:
+                raise ValueError(
+                    "Pass either routing or explicit indices/scores, not both."
+                )
+            indices = getattr(routing, "indices", None)
+            scores = getattr(routing, "scores", None)
 
-        # Welford's algorithm state
-        self.count = torch.zeros(
-            count_shape, dtype=torch.long, device=self.device, requires_grad=False
+        if indices is None or scores is None:
+            raise ValueError("accumulate requires selected expert indices and scores.")
+
+        indices_array = np.asarray(indices, dtype=np.int64)
+        scores_array = np.asarray(scores, dtype=np.float64)
+        self._validate_route_arrays(indices_array, scores_array)
+
+        if indices_array.shape[-1] == 0:
+            raise ValueError("indices must include at least one selected expert.")
+
+        token_count = int(np.prod(indices_array.shape[:-1]))
+        if token_count == 0:
+            return self
+
+        flat_indices = indices_array.reshape(-1)
+        min_index = int(flat_indices.min())
+        max_index = int(flat_indices.max())
+        if min_index < 0 or max_index >= self.num_experts:
+            raise ValueError(
+                "selected expert indices must be in [0, num_experts): "
+                f"got min={min_index}, max={max_index}, "
+                f"num_experts={self.num_experts}."
+            )
+
+        norms_array = self._selected_output_norms(
+            indices_array,
+            selected_outputs=selected_outputs,
+            selected_output_norms=selected_output_norms,
         )
-        self.mean = torch.zeros(
-            shape, dtype=dtype, device=self.device, requires_grad=False
+        maxes_array = self._selected_output_maxes(
+            indices_array,
+            selected_outputs=selected_outputs,
+            selected_output_maxes=selected_output_maxes,
         )
 
-        # Kahan summation compensation for the mean
-        self.mean_compensation = torch.zeros(
-            shape, dtype=dtype, device=self.device, requires_grad=False
+        batch_frequency = np.bincount(
+            flat_indices,
+            minlength=self.num_experts,
+        )[: self.num_experts].astype(np.int64, copy=False)
+
+        self.total_tokens += token_count
+        self.expert_frequency += batch_frequency
+        self.pairwise_expert_frequency += (
+            batch_frequency[:, None] + batch_frequency[None, :]
         )
 
-    def update(self, new_mean: torch.Tensor, new_count: int | torch.Tensor):
-        """
-        Update the statistics with a new batch of data.
+        flat_norms = norms_array.reshape(-1).astype(np.float64, copy=False)
+        flat_scores = scores_array.reshape(-1)
+        flat_maxes = maxes_array.reshape(-1).astype(np.float32, copy=False)
 
-        Args:
-            new_mean (torch.Tensor): A tensor of new data to update state.
-            new_count (int | torch.Tensor): The count of new data points in the batch to
-                normalize the mean entires with.
-        """
-        new_count = new_count.to(self.device, torch.long)
-        new_mean = new_mean.to(self.device, dtype=self.dtype)
+        np.add.at(self.ean_sum, flat_indices, flat_norms)
+        np.add.at(self.weighted_ean_sum, flat_indices, flat_norms * flat_scores)
+        np.add.at(self.weighted_expert_frequency_sum, flat_indices, flat_scores)
+        np.maximum.at(self.max_activations, flat_indices, flat_maxes)
 
-        # Welford's algorithm
-        updated_count = self.count + new_count
-        delta = new_mean - self.mean
+        return self
 
-        # Kahan Summation
-        # `y` is the new term to add to the mean, corrected by the old compensation.
-        y = delta * new_count / updated_count
-        y = y.nan_to_num(0)  # Replace NaNs with 0 in case of updated_count being zero
-        y = y - self.mean_compensation
-        # `t` is the new provisional mean.
-        t = self.mean + y
-        # `self.mean_compensation` is the new error (the part that was lost).
-        self.mean_compensation = (t - self.mean) - y
-        # `self.mean` is the new, more accurate mean.
-        self.mean = t
-        # End Kahan Summation
-        self.count = updated_count
+    def report(self) -> dict[str, Any]:
+        """Return pruning data compatible with the existing observer schema."""
+        token_denominator = max(self.total_tokens, 1)
+        count_denominator = np.maximum(
+            self.expert_frequency.astype(np.float64),
+            _FLOAT_EPS,
+        )
+
+        return {
+            "total_tokens": int(self.total_tokens),
+            "expert_frequency": self.expert_frequency.copy(),
+            "pairwise_expert_frequency": self.pairwise_expert_frequency.copy(),
+            "expert_proba": self.expert_frequency.astype(np.float64)
+            / token_denominator,
+            "ean_sum": self.ean_sum.copy(),
+            "ean_mean": (self.ean_sum / count_denominator).astype(np.float32),
+            "weighted_ean_sum": self.weighted_ean_sum.copy(),
+            "weighted_expert_frequency_sum": (
+                self.weighted_expert_frequency_sum.copy()
+            ),
+            "reap": (self.weighted_ean_sum / count_denominator).astype(np.float32),
+            "max_activations": self.max_activations.copy(),
+        }
+
+    def _validate_route_arrays(
+        self,
+        indices_array: np.ndarray,
+        scores_array: np.ndarray,
+    ) -> None:
+        if indices_array.ndim < 1:
+            raise ValueError(
+                "indices must have shape [..., top_k], got a scalar value."
+            )
+        if indices_array.shape != scores_array.shape:
+            raise ValueError(
+                "indices and scores must have the same shape: "
+                f"{indices_array.shape} != {scores_array.shape}."
+            )
+
+    def _selected_output_norms(
+        self,
+        indices_array: np.ndarray,
+        *,
+        selected_outputs: Any | None,
+        selected_output_norms: Any | None,
+    ) -> np.ndarray:
+        if selected_output_norms is not None:
+            norms_array = np.asarray(selected_output_norms, dtype=np.float64)
+            self._validate_selected_stat_shape(
+                "selected_output_norms",
+                norms_array,
+                indices_array.shape,
+            )
+            return norms_array
+
+        if selected_outputs is None:
+            raise ValueError(
+                "selected_outputs or selected_output_norms must be provided "
+                "for non-empty accumulation."
+            )
+
+        outputs_array = np.asarray(selected_outputs)
+        self._validate_selected_output_shape(outputs_array, indices_array.shape)
+        return np.linalg.norm(outputs_array, axis=-1).astype(np.float64, copy=False)
+
+    def _selected_output_maxes(
+        self,
+        indices_array: np.ndarray,
+        *,
+        selected_outputs: Any | None,
+        selected_output_maxes: Any | None,
+    ) -> np.ndarray:
+        if selected_output_maxes is not None:
+            maxes_array = np.asarray(selected_output_maxes, dtype=np.float32)
+            self._validate_selected_stat_shape(
+                "selected_output_maxes",
+                maxes_array,
+                indices_array.shape,
+            )
+            return maxes_array
+
+        if selected_outputs is None:
+            raise ValueError(
+                "selected_outputs or selected_output_maxes must be provided "
+                "for non-empty accumulation."
+            )
+
+        outputs_array = np.asarray(selected_outputs)
+        self._validate_selected_output_shape(outputs_array, indices_array.shape)
+        return np.max(outputs_array, axis=-1).astype(np.float32, copy=False)
+
+    def _validate_selected_stat_shape(
+        self,
+        name: str,
+        values: np.ndarray,
+        expected_shape: tuple[int, ...],
+    ) -> None:
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {values.shape}."
+            )
+
+    def _validate_selected_output_shape(
+        self,
+        values: np.ndarray,
+        route_shape: tuple[int, ...],
+    ) -> None:
+        if values.shape[:-1] != route_shape:
+            raise ValueError(
+                "selected_outputs must have shape [..., top_k, hidden] matching "
+                f"indices shape {route_shape}, got {values.shape}."
+            )
+        if values.shape[-1] == 0:
+            raise ValueError("selected_outputs hidden dimension must be non-empty.")
+
+
+__all__ = ["PruningState"]

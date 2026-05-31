@@ -1,7 +1,7 @@
 """Structured validation telemetry for MLX pruning runs.
 
 The helpers in this module are intentionally import-light. Optional runtime
-packages are imported only inside collection methods so the MLX backend keeps
+packages are imported only inside collection methods so the package keeps
 its no-heavy-import package boundary.
 """
 
@@ -21,8 +21,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from reap.backends.mlx.model_adapters import infer_model_adapter
-from reap.backends.mlx.prune import resolve_prune_method
+from reap.model_adapters import infer_model_adapter
+from reap.prune import resolve_prune_method
 
 
 _PACKAGE_VERSION_NAMES = (

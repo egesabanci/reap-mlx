@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from reap.backends.mlx.observer import observe_model
+from reap.observer import observe_model
 
 
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
@@ -62,7 +62,7 @@ def test_observer_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.observer import observe_model
+        from reap.observer import observe_model
 
         assert observe_model is not None
 

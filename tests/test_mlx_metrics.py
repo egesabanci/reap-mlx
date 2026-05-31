@@ -11,8 +11,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from reap.backends.mlx.metrics import PruningState
-from reap.backends.mlx.router import RouterResult
+from reap.metrics import PruningState
+from reap.router import RouterResult
 
 
 def test_pruning_state_initialize_shapes_and_dtypes():
@@ -67,7 +67,7 @@ def test_metrics_module_import_does_not_import_heavy_runtime_packages():
 
         sys.meta_path.insert(0, ImportBlocker())
 
-        from reap.backends.mlx.metrics import PruningState
+        from reap.metrics import PruningState
 
         assert PruningState.initialize(2).report()["total_tokens"] == 0
 

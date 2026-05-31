@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from reap.backends.mlx.model_adapters import infer_model_adapter
+from reap.model_adapters import infer_model_adapter
 
 
 _WEIGHT_PATTERNS = ("*.safetensors", "*.npz")
