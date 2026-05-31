@@ -187,6 +187,65 @@ class TinyModel:
         self.model.layers = layers
 
 
+class TinyLfmOperator:
+    def __init__(self, mx, value):
+        self.mx = mx
+        self.value = value
+        self.calls = []
+
+    def __call__(self, x, mask=None, cache=None):
+        self.calls.append((mask, cache))
+        return self.mx.ones_like(x) * self.value
+
+
+class TinyLfmGate:
+    def __init__(self, mx):
+        self.mx = mx
+
+    def __call__(self, hidden_states):
+        token_values = hidden_states[..., 0]
+        return self.mx.stack(
+            [
+                1.0 - token_values,
+                token_values,
+                self.mx.zeros_like(token_values) - 2.0,
+            ],
+            axis=-1,
+        )
+
+
+class TinyLfmMoeFeedForward:
+    def __init__(self, mx, *, top_k=1):
+        self.num_experts = 3
+        self.top_k = top_k
+        self.norm_topk_prob = False
+        self.use_expert_bias = False
+        self.gate = TinyLfmGate(mx)
+        self.switch_mlp = TinySwitchMlp(mx)
+
+
+class TinyLfmDenseFeedForward:
+    def __init__(self, mx):
+        self.mx = mx
+        self.inputs = []
+
+    def __call__(self, hidden_states):
+        self.inputs.append(np.asarray(hidden_states))
+        return self.mx.zeros_like(hidden_states)
+
+
+class TinyLfmLayer:
+    def __init__(self, mx, *, is_attention_layer, feed_forward, operator_value=0.0):
+        self.operator_norm = Identity()
+        self.ffn_norm = Identity()
+        self.is_attention_layer = is_attention_layer
+        self.feed_forward = feed_forward
+        if is_attention_layer:
+            self.self_attn = TinyLfmOperator(mx, operator_value)
+        else:
+            self.conv = TinyLfmOperator(mx, operator_value)
+
+
 def _softmax_top_score():
     values = np.exp(np.array([1.0, 0.0, -2.0]))
     return values[0] / values.sum()
@@ -379,3 +438,55 @@ def test_observe_model_rejects_empty_calibration_sequence():
             [[]],
             {"num_experts": 3, "num_experts_per_tok": 1},
         )
+
+
+@requires_mlx
+def test_observe_model_replays_lfm2_conv_attention_dense_and_moe_layers():
+    import mlx.core as mx
+
+    dense_feed_forward = TinyLfmDenseFeedForward(mx)
+    conv_layer = TinyLfmLayer(
+        mx,
+        is_attention_layer=False,
+        feed_forward=dense_feed_forward,
+        operator_value=0.0,
+    )
+    moe_layer = TinyLfmLayer(
+        mx,
+        is_attention_layer=True,
+        feed_forward=TinyLfmMoeFeedForward(mx, top_k=1),
+        operator_value=0.0,
+    )
+    model = TinyModel(mx, [conv_layer, moe_layer])
+    mask_calls = []
+    eval_calls = []
+
+    def mask_fn(hidden_states, cache=None, kind=None):
+        mask_calls.append((hidden_states.shape, cache, kind))
+        return kind
+
+    observer_data = observe_model(
+        model,
+        [[0, 1]],
+        {
+            "model_type": "lfm2_moe",
+            "num_experts": 3,
+            "num_experts_per_tok": 1,
+            "norm_topk_prob": False,
+            "use_expert_bias": False,
+        },
+        mask_fn=mask_fn,
+        eval_fn=lambda h: eval_calls.append(h.shape),
+    )
+
+    assert set(observer_data) == {1}
+    assert set(observer_data[1]) == EXPECTED_PRUNING_KEYS
+    assert mask_calls == [
+        ((1, 2, 2), None, "attention"),
+        ((1, 2, 2), None, "ssm"),
+    ]
+    assert conv_layer.conv.calls == [("ssm", None)]
+    assert moe_layer.self_attn.calls == [("attention", None)]
+    assert eval_calls == [(1, 2, 2), (1, 2, 2)]
+    assert len(dense_feed_forward.inputs) == 1
+    assert np.isfinite(observer_data[1]["reap"]).all()

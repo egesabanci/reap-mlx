@@ -19,6 +19,7 @@ class MoeLayerConfig:
     top_k: int
     norm_topk_prob: bool
     adapter_name: str = "qwen3_moe"
+    use_expert_bias: bool = False
 
 
 def _lookup_attr_path(root: Any, path: tuple[str, ...]) -> Any | None:
@@ -119,6 +120,16 @@ def update_qwen3_moe_config(
     return config
 
 
+def update_lfm2_moe_config(
+    config: MutableMapping[str, Any],
+    *,
+    num_experts: int,
+    top_k: int,
+) -> MutableMapping[str, Any]:
+    """Update an LFM2 MoE config dict after expert pruning."""
+    return update_qwen3_moe_config(config, num_experts=num_experts, top_k=top_k)
+
+
 def make_attention_mask(hidden_states: Any, cache: Any | None = None) -> Any:
     """Build an MLX-LM causal attention mask using the installed MLX-LM helper."""
     try:
@@ -130,6 +141,19 @@ def make_attention_mask(hidden_states: Any, cache: Any | None = None) -> Any:
         ) from exc
 
     return create_attention_mask(hidden_states, cache=cache)
+
+
+def make_ssm_mask(hidden_states: Any, cache: Any | None = None) -> Any:
+    """Build an MLX-LM SSM/conv mask using the installed MLX-LM helper."""
+    try:
+        from mlx_lm.models.base import create_ssm_mask
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "make_ssm_mask requires the optional 'mlx_lm' package. "
+            "Install MLX-LM before constructing MLX SSM masks."
+        ) from exc
+
+    return create_ssm_mask(hidden_states, cache=cache)
 
 
 class Qwen3MoeModelAdapter:
@@ -205,11 +229,130 @@ class Qwen3MoeModelAdapter:
         )
 
 
+class Lfm2MoeModelAdapter:
+    """Liquid LFM2.5 MoE adapter for MLX-LM-style model objects."""
+
+    adapter_name = "lfm2_moe"
+
+    def layers(self, model: Any) -> Sequence[Any]:
+        return get_model_layers(model)
+
+    def identify_moe_layers(self, model: Any) -> list[int]:
+        return [
+            layer_idx
+            for layer_idx, layer in enumerate(self.layers(model))
+            if self.is_moe_layer(layer)
+        ]
+
+    def is_moe_layer(self, layer: Any) -> bool:
+        feed_forward = getattr(layer, "feed_forward", None)
+        return (
+            feed_forward is not None
+            and getattr(feed_forward, "switch_mlp", None) is not None
+        )
+
+    def get_moe(self, layer: Any) -> Any:
+        if not self.is_moe_layer(layer):
+            raise ValueError(
+                "Layer does not expose an LFM2-style MoE feed_forward.switch_mlp."
+            )
+        return layer.feed_forward
+
+    def get_dense_mlp(self, layer: Any) -> Any:
+        feed_forward = getattr(layer, "feed_forward", None)
+        if feed_forward is None:
+            raise ValueError("Layer does not expose a feed_forward module.")
+        return feed_forward
+
+    def get_layer_config(
+        self,
+        layer: Any,
+        config: Mapping[str, Any] | None = None,
+    ) -> MoeLayerConfig:
+        moe = self.get_moe(layer)
+
+        num_experts = _positive_int(
+            _live_or_config_value(
+                moe,
+                ("num_experts",),
+                config,
+                ("num_experts",),
+            ),
+            "num_experts",
+        )
+        top_k = _positive_int(
+            _live_or_config_value(
+                moe,
+                ("top_k", "num_experts_per_tok"),
+                config,
+                ("num_experts_per_tok", "top_k"),
+            ),
+            "top_k",
+        )
+        norm_topk_prob = bool(
+            _live_or_config_value(
+                moe,
+                ("norm_topk_prob",),
+                config,
+                ("norm_topk_prob",),
+                default=False,
+            )
+        )
+        use_expert_bias = bool(
+            _live_or_config_value(
+                moe,
+                ("use_expert_bias",),
+                config,
+                ("use_expert_bias",),
+                default=False,
+            )
+        )
+
+        return MoeLayerConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            norm_topk_prob=norm_topk_prob,
+            adapter_name=self.adapter_name,
+            use_expert_bias=use_expert_bias,
+        )
+
+
+def infer_model_adapter(
+    model: Any | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> Any:
+    """Infer the MLX architecture adapter from config or model layout."""
+    model_type = _config_value(config, "model_type")
+    architectures = _config_value(config, "architectures", default=()) or ()
+    if model_type == "lfm2_moe" or any(
+        str(architecture).startswith("Lfm2") for architecture in architectures
+    ):
+        return Lfm2MoeModelAdapter()
+
+    if model is not None:
+        try:
+            layers = get_model_layers(model)
+        except ValueError:
+            layers = ()
+        if any(
+            getattr(getattr(layer, "feed_forward", None), "switch_mlp", None)
+            is not None
+            for layer in layers
+        ):
+            return Lfm2MoeModelAdapter()
+
+    return Qwen3MoeModelAdapter()
+
+
 __all__ = [
+    "Lfm2MoeModelAdapter",
     "MoeLayerConfig",
     "Qwen3MoeModelAdapter",
     "get_model_layers",
     "get_shared_expert",
+    "infer_model_adapter",
     "make_attention_mask",
+    "make_ssm_mask",
+    "update_lfm2_moe_config",
     "update_qwen3_moe_config",
 ]

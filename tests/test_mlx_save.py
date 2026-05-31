@@ -111,10 +111,47 @@ class TinyMoe:
         self.gate = TinyGate(weight_experts)
 
 
+class TinyLfmMoe(TinyMoe):
+    def __init__(
+        self,
+        num_experts: int,
+        *,
+        weight_experts: int | None = None,
+        expert_bias_experts: int | None = None,
+    ):
+        super().__init__(num_experts, weight_experts=weight_experts)
+        self.use_expert_bias = True
+        expert_bias_experts = (
+            num_experts if expert_bias_experts is None else expert_bias_experts
+        )
+        self.expert_bias = np.zeros((expert_bias_experts,), dtype=np.float32)
+
+
 def make_reloaded_model(num_experts: int, *, weight_experts: int | None = None):
     moe = TinyMoe(num_experts, weight_experts=weight_experts)
     return SimpleNamespace(
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=moe)]),
+    )
+
+
+def make_lfm2_reloaded_model(
+    num_experts: int,
+    *,
+    weight_experts: int | None = None,
+    expert_bias_experts: int | None = None,
+):
+    moe = TinyLfmMoe(
+        num_experts,
+        weight_experts=weight_experts,
+        expert_bias_experts=expert_bias_experts,
+    )
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(feed_forward=object()),
+                SimpleNamespace(feed_forward=moe),
+            ],
+        ),
     )
 
 
@@ -323,6 +360,61 @@ def test_save_pruned_model_rejects_reloaded_shape_mismatch(tmp_path):
                 make_reloaded_model(2, weight_experts=3),
                 object(),
                 {"num_experts": 2},
+            ),
+        )
+
+
+def test_save_pruned_model_validates_lfm2_expert_bias_shape(tmp_path):
+    result = save_pruned_model(
+        object(),
+        object(),
+        {
+            "model_type": "lfm2_moe",
+            "num_experts": 16,
+            "num_experts_per_tok": 4,
+            "use_expert_bias": True,
+        },
+        tmp_path / "saved",
+        "source-model",
+        save_fn=fake_save_factory([]),
+        load_fn=fake_load_factory(
+            make_lfm2_reloaded_model(16),
+            object(),
+            {
+                "model_type": "lfm2_moe",
+                "num_experts": 16,
+                "num_experts_per_tok": 4,
+                "use_expert_bias": True,
+            },
+        ),
+    )
+
+    assert result.expected_expert_count == 16
+
+
+def test_save_pruned_model_rejects_lfm2_expert_bias_shape_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="expert_bias first dimension mismatch"):
+        save_pruned_model(
+            object(),
+            object(),
+            {
+                "model_type": "lfm2_moe",
+                "num_experts": 16,
+                "num_experts_per_tok": 4,
+                "use_expert_bias": True,
+            },
+            tmp_path / "saved",
+            "source-model",
+            save_fn=fake_save_factory([]),
+            load_fn=fake_load_factory(
+                make_lfm2_reloaded_model(16, expert_bias_experts=32),
+                object(),
+                {
+                    "model_type": "lfm2_moe",
+                    "num_experts": 16,
+                    "num_experts_per_tok": 4,
+                    "use_expert_bias": True,
+                },
             ),
         )
 

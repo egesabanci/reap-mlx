@@ -13,7 +13,8 @@ from typing import Any
 import numpy as np
 
 from reap.backends.mlx.model_adapters import (
-    Qwen3MoeModelAdapter,
+    infer_model_adapter,
+    update_lfm2_moe_config,
     update_qwen3_moe_config,
 )
 
@@ -51,7 +52,7 @@ def prune_experts(
 
     Returns a mapping from layer index to ascending retained expert indices.
     """
-    adapter = Qwen3MoeModelAdapter() if adapter is None else adapter
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
     _validate_adapter(adapter)
     _validate_compression_ratio(compression_ratio)
 
@@ -81,13 +82,22 @@ def prune_experts(
         )
         keep_indices = compute_keep_indices(saliency, retained_count)
 
-        _prune_qwen3_moe_layer(
-            adapter.get_moe(layer),
-            keep_indices,
-            num_experts=layer_config.num_experts,
-            old_top_k=layer_config.top_k,
-            layer_idx=layer_idx,
-        )
+        if adapter.adapter_name == "lfm2_moe":
+            _prune_lfm2_moe_layer(
+                adapter.get_moe(layer),
+                keep_indices,
+                num_experts=layer_config.num_experts,
+                old_top_k=layer_config.top_k,
+                layer_idx=layer_idx,
+            )
+        else:
+            _prune_qwen3_moe_layer(
+                adapter.get_moe(layer),
+                keep_indices,
+                num_experts=layer_config.num_experts,
+                old_top_k=layer_config.top_k,
+                layer_idx=layer_idx,
+            )
         keep_by_layer[layer_idx] = keep_indices
 
         new_top_k = min(layer_config.top_k, retained_count)
@@ -96,7 +106,7 @@ def prune_experts(
             config_top_k = new_top_k
         elif config_num_experts != retained_count:
             raise ValueError(
-                "Qwen3-MoE config update requires all pruned layers to retain "
+                "MLX MoE config update requires all pruned layers to retain "
                 f"the same expert count. Layer {layer_idx} retained "
                 f"{retained_count}, expected {config_num_experts}."
             )
@@ -104,7 +114,12 @@ def prune_experts(
             config_top_k = min(config_top_k or new_top_k, new_top_k)
 
     if config_num_experts is not None:
-        update_qwen3_moe_config(
+        update_config = (
+            update_lfm2_moe_config
+            if adapter.adapter_name == "lfm2_moe"
+            else update_qwen3_moe_config
+        )
+        update_config(
             config,
             num_experts=config_num_experts,
             top_k=config_top_k or config_num_experts,
@@ -184,9 +199,10 @@ def slice_first_dim(
 
 def _validate_adapter(adapter: Any) -> None:
     adapter_name = getattr(adapter, "adapter_name", None)
-    if adapter_name != "qwen3_moe":
+    if adapter_name not in {"qwen3_moe", "lfm2_moe"}:
         raise ValueError(
-            "MLX expert pruning currently supports the qwen3_moe adapter only; "
+            "MLX expert pruning currently supports the qwen3_moe and "
+            "lfm2_moe adapters only; "
             f"got {adapter_name!r}."
         )
 
@@ -287,6 +303,73 @@ def _prune_qwen3_moe_layer(
     _update_runtime_attrs(moe, gate, retained_count=retained_count, top_k=new_top_k)
 
 
+def _prune_lfm2_moe_layer(
+    moe: Any,
+    keep_indices: np.ndarray,
+    *,
+    num_experts: int,
+    old_top_k: int,
+    layer_idx: int,
+) -> None:
+    switch_mlp = getattr(moe, "switch_mlp", None)
+    if switch_mlp is None:
+        raise ValueError(f"MoE layer {layer_idx} does not expose switch_mlp.")
+
+    for projection_name in _SWITCH_PROJECTION_NAMES:
+        projection = getattr(switch_mlp, projection_name, None)
+        if projection is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} switch_mlp is missing "
+                f"{projection_name}."
+            )
+        if _get_module_value(projection, "weight") is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} switch_mlp.{projection_name} is "
+                "missing required weight."
+            )
+        slice_first_dim(
+            projection,
+            keep_indices,
+            num_experts=num_experts,
+            required=True,
+        )
+
+    gate = getattr(moe, "gate", None)
+    if gate is None:
+        raise ValueError(f"MoE layer {layer_idx} does not expose a gate.")
+    if _get_module_value(gate, "weight") is None:
+        raise ValueError(f"MoE layer {layer_idx} gate is missing required weight.")
+    slice_first_dim(
+        gate,
+        keep_indices,
+        num_experts=num_experts,
+        required=True,
+        field_names=("weight", "scales", "biases", "bias"),
+    )
+
+    if getattr(moe, "use_expert_bias", False) or hasattr(moe, "expert_bias"):
+        expert_bias = getattr(moe, "expert_bias", None)
+        if expert_bias is None:
+            raise ValueError(
+                f"MoE layer {layer_idx} use_expert_bias is enabled but "
+                "expert_bias is missing."
+            )
+        setattr(
+            moe,
+            "expert_bias",
+            _slice_value_first_dim(
+                expert_bias,
+                keep_indices,
+                num_experts=num_experts,
+                field_name="expert_bias",
+            ),
+        )
+
+    retained_count = len(keep_indices)
+    new_top_k = min(int(old_top_k), retained_count)
+    _update_runtime_attrs(moe, gate, retained_count=retained_count, top_k=new_top_k)
+
+
 def _update_runtime_attrs(
     moe: Any,
     gate: Any,
@@ -320,6 +403,17 @@ def _get_module_value(module: Any, field_name: str) -> Any | None:
 
 def _set_module_value(module: Any, field_name: str, value: Any) -> None:
     setattr(module, field_name, value)
+
+
+def _slice_value_first_dim(
+    value: Any,
+    keep_indices: np.ndarray,
+    *,
+    num_experts: int,
+    field_name: str,
+) -> Any:
+    _validate_first_dim(value, field_name=field_name, num_experts=num_experts)
+    return value[_keep_list(keep_indices)]
 
 
 def _validate_first_dim(value: Any, *, field_name: str, num_experts: int) -> None:
