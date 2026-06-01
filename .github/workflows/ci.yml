@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Run tests
+        run: uv run python -m pytest -q tests/test_mlx_*.py
+
+      - name: Smoke CLI
+        run: uv run python -m reap.entrypoint --help

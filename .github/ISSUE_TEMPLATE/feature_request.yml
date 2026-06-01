@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a model adapter, pruning feature, metric, or workflow improvement.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What should REAP MLX support or improve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed scope
+      description: Describe the smallest useful implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: How should this be tested?
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to model cards, papers, traces, or prior experiments.
