@@ -9,6 +9,7 @@
 [Supported Models](#supported-models) |
 [CLI Reference](#cli-reference) |
 [Metrics](#metrics) |
+[Technical Docs](#technical-docs) |
 [References](#references) |
 [Development](#development) |
 [License](#license)
@@ -203,6 +204,13 @@ Every run writes structured validation telemetry. The JSON includes:
 Use this file to compare pruning settings, calibration size, runtime cost, and
 artifact size across runs.
 
+## Technical Docs
+
+Maintainer-focused reference documentation is available in
+[docs/index.md](docs/index.md). It covers the pipeline, architecture, model
+adapters, calibration, observation metrics, pruning semantics, save/reload
+validation, CLI behavior, telemetry, and development workflow.
+
 ## References
 
 REAP MLX is an independent MLX-focused implementation. Some implementation
@@ -222,6 +230,9 @@ reap-mlx/
   uv.lock
   experiments/
     mlx-pruning.sh
+  docs/
+    index.md
+    *.md
   src/
     reap/
       data.py
