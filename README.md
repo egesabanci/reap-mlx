@@ -139,6 +139,10 @@ Adding a model family should usually mean adding or extending an adapter in
 coverage in `tests/test_mlx_model_adapters.py`, `tests/test_mlx_router.py`, and
 `tests/test_mlx_prune.py`.
 
+All currently supported MoE layers must prune to the same retained expert count.
+The first pruned MoE layer sets the expected count for the run; per-layer expert
+counts and per-layer compression ratios are not yet supported.
+
 ## Pruning Methods
 
 `--prune-method` selects the per-expert saliency score used to rank experts.
@@ -155,6 +159,10 @@ Higher scores are kept.
 | `ean_mean` | Mean selected expert output norm. |
 | `weighted_ean_sum` | Router-score-weighted sum of selected expert output norms. |
 | `max_activations` | Maximum selected expert output activation. |
+
+For LFM2 models with `use_expert_bias=True`, router-score-weighted methods use
+bias-adjusted selected scores. This matches the model's routed computation, but
+can rank experts differently from a pure-softmax REAP formulation.
 
 `--compression-ratio` must be in `[0, 1)`. For each MoE layer, REAP MLX prunes
 `int(num_experts * compression_ratio)` experts and always keeps at least one

@@ -91,6 +91,9 @@ RouterResult(
 The leading dimensions match the input hidden states without the hidden
 dimension.
 
+`indices` and `scores` are in `argpartition` partition order. The top-k experts
+are present, but they are not guaranteed to be sorted by descending score.
+
 ## Qwen3 Router Semantics
 
 Qwen3 routing:
@@ -122,6 +125,11 @@ LFM2 routing:
 9. Casts scores back to the hidden-state dtype.
 
 When `use_expert_bias` is true, `moe.expert_bias` is required.
+
+The bias-adjusted selected scores flow into `PruningState.accumulate`, so
+`weighted_ean_sum` and `reap` include the LFM2 expert bias. This matches the
+actual routed model computation, but it can differ from the original REAP paper
+formulation that weights activations by pure softmax probabilities.
 
 ## Selected Expert Outputs
 

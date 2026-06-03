@@ -20,6 +20,12 @@ prune_experts(
 
 Returns ascending retained expert indices for each pruned MoE layer.
 
+## Mutation Contract
+
+`prune_experts` mutates the live model and the passed `config` mapping in place.
+Callers that need original config values after pruning should copy the config
+before calling.
+
 ## Supported Methods
 
 | Method | Description |
@@ -135,9 +141,11 @@ After all MoE layers are pruned, config is updated with:
 - `config["num_experts_per_tok"] = min(top_k, retained_count)`
 - `config["top_k"]` only if that key already exists
 
-All pruned MoE layers must retain the same expert count. If different layers
-would retain different counts, pruning raises a `ValueError` because the current
-config format records one global `num_experts` value.
+All pruned MoE layers must retain the same expert count. The first pruned MoE
+layer sets the retained-count expectation, and subsequent pruned MoE layers must
+match it. If different layers would retain different counts, pruning raises a
+`ValueError` because the current config format records one global `num_experts`
+value.
 
 ## Validation Failures
 
@@ -154,5 +162,4 @@ Pruning raises before mutation or during mutation for:
 - LFM2 expert bias enabled but missing.
 
 Because pruning mutates in place, callers should treat failures during pruning
-as invalidating the live model object for save purposes.
-
+as invalidating the live model object and config mapping for save purposes.
