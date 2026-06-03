@@ -111,12 +111,13 @@ def _observe_qwen3_model(
             moe_input = _call_required(layer, "post_attention_layernorm", h)
 
             if layer_idx in moe_layer_indices:
-                h = h + _observe_moe_layer(
+                h = h + _observe_selected_moe_layer(
                     layer,
                     moe_input,
                     accumulators[layer_idx],
                     adapter=adapter,
                     config=config,
+                    router_cls=Qwen3MoeRouter,
                 )
             else:
                 dense_mlp = adapter.get_dense_mlp(layer)
@@ -166,12 +167,13 @@ def _observe_lfm2_model(
             ffn_input = _call_required(layer, "ffn_norm", h_mid)
 
             if layer_idx in moe_layer_indices:
-                h = h_mid + _observe_lfm2_moe_layer(
+                h = h_mid + _observe_selected_moe_layer(
                     layer,
                     ffn_input,
                     accumulators[layer_idx],
                     adapter=adapter,
                     config=config,
+                    router_cls=Lfm2MoeRouter,
                 )
             else:
                 dense_mlp = adapter.get_dense_mlp(layer)
@@ -333,46 +335,18 @@ def _run_lfm2_operator(layer: Any, h: Any, mask: Any | None) -> Any:
     return h + operator_output
 
 
-def _observe_moe_layer(
+def _observe_selected_moe_layer(
     layer: Any,
     moe_input: Any,
     state: PruningState,
     *,
     adapter: Any,
     config: Mapping[str, Any],
+    router_cls: type,
 ) -> Any:
     mx = _require_mlx_core()
     moe = adapter.get_moe(layer)
-    routing = Qwen3MoeRouter(moe, config)(moe_input)
-    switch_mlp = getattr(moe, "switch_mlp", None)
-    if not callable(switch_mlp):
-        raise ValueError("MoE layer does not expose a callable switch_mlp module.")
-
-    selected_outputs = switch_mlp(moe_input, routing.indices)
-    state.accumulate(
-        indices=routing.indices,
-        scores=routing.scores.astype(mx.float32),
-        selected_outputs=selected_outputs.astype(mx.float32),
-    )
-
-    moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
-    shared_expert = get_shared_expert(moe)
-    if shared_expert is not None:
-        moe_out = moe_out + shared_expert(moe_input)
-    return moe_out
-
-
-def _observe_lfm2_moe_layer(
-    layer: Any,
-    moe_input: Any,
-    state: PruningState,
-    *,
-    adapter: Any,
-    config: Mapping[str, Any],
-) -> Any:
-    mx = _require_mlx_core()
-    moe = adapter.get_moe(layer)
-    routing = Lfm2MoeRouter(moe, config)(moe_input)
+    routing = router_cls(moe, config)(moe_input)
     switch_mlp = getattr(moe, "switch_mlp", None)
     if not callable(switch_mlp):
         raise ValueError("MoE layer does not expose a callable switch_mlp module.")
