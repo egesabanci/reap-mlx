@@ -87,12 +87,25 @@ def _observe_qwen3_model(
     for sequence in calibration_sequences:
         tokens = _batch_tokens(mx, sequence)
         h = embed_tokens(tokens)
-
-        for layer_idx, layer in enumerate(layers):
-            mask = _attention_mask(
+        default_mask = (
+            _attention_mask(
                 h,
                 sequence_length=tokens.shape[-1],
-                mask_fn=mask_fn,
+                mask_fn=None,
+            )
+            if mask_fn is None
+            else None
+        )
+
+        for layer_idx, layer in enumerate(layers):
+            mask = (
+                default_mask
+                if mask_fn is None
+                else _attention_mask(
+                    h,
+                    sequence_length=tokens.shape[-1],
+                    mask_fn=mask_fn,
+                )
             )
             h = _run_attention(layer, h, mask)
             moe_input = _call_required(layer, "post_attention_layernorm", h)

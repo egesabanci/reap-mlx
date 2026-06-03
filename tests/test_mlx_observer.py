@@ -352,6 +352,35 @@ def test_observe_model_reports_only_moe_layers_in_partial_model():
 
 
 @requires_mlx
+def test_observe_model_reuses_default_qwen_mask_once_per_sequence(monkeypatch):
+    import mlx.core as mx
+
+    layers = [
+        TinyLayer(mx, TinyDenseMlp(mx)),
+        TinyLayer(mx, TinyMoeMlp(mx, top_k=1)),
+        TinyLayer(mx, TinyDenseMlp(mx)),
+    ]
+    model = TinyModel(mx, layers)
+    mask = object()
+    mask_calls = []
+
+    def make_mask(hidden_states, cache=None):
+        mask_calls.append((hidden_states.shape, cache))
+        return mask
+
+    monkeypatch.setattr("reap.observer.make_attention_mask", make_mask)
+
+    observe_model(
+        model,
+        [[0, 1]],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+    )
+
+    assert mask_calls == [((1, 2, 2), None)]
+    assert [layer.self_attn.masks for layer in layers] == [[mask], [mask], [mask]]
+
+
+@requires_mlx
 def test_observe_model_calls_mask_fn_for_sequence_length_greater_than_one():
     import mlx.core as mx
 
