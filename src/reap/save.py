@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from reap.model_adapters import infer_model_adapter
 
 
 _WEIGHT_PATTERNS = ("*.safetensors", "*.npz")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -153,10 +155,15 @@ def generation_smoke(
         "apply_chat_template",
     ):
         messages = [{"role": "user", "content": prompt}]
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-        )
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            logger.warning(
+                "Chat template application failed, using raw prompt for smoke test",
+            )
 
     return generate_fn(
         model,
