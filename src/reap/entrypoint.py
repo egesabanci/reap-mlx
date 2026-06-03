@@ -52,6 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip generation smoke after save/reload validation.",
     )
+    parser.add_argument(
+        "--smoke-prompt",
+        default="What is your name?",
+        help="Prompt for the generation smoke test.",
+    )
+    parser.add_argument(
+        "--smoke-max-tokens",
+        type=int,
+        default=16,
+        help="Maximum tokens for the generation smoke test.",
+    )
     return parser
 
 
@@ -87,9 +98,20 @@ def main(
     save_pruned_model_fn = (
         save_pruned_model if save_pruned_model_fn is None else save_pruned_model_fn
     )
-    smoke_fn = generation_smoke if smoke_fn is None and not args.no_smoke else smoke_fn
     if args.no_smoke:
         smoke_fn = None
+    elif smoke_fn is None:
+        smoke_prompt = args.smoke_prompt
+        smoke_max_tokens = args.smoke_max_tokens
+
+        def smoke_fn(model: Any, tokenizer: Any, config: Mapping[str, Any]) -> Any:
+            return generation_smoke(
+                model,
+                tokenizer,
+                config,
+                prompt=smoke_prompt,
+                max_tokens=smoke_max_tokens,
+            )
 
     metrics = RunMetrics(args.output_dir, args.metrics_file)
     metrics.record_runtime()
@@ -165,6 +187,8 @@ def main(
                 args.model_name,
                 adapter=adapter,
                 smoke_fn=smoke_fn,
+                smoke_prompt=args.smoke_prompt,
+                smoke_max_tokens=args.smoke_max_tokens,
             )
         metrics.record_save_reload(result, adapter=adapter)
         metrics.sample_memory("after_save_reload_smoke")
@@ -191,6 +215,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     resolve_prune_method(args.prune_method)
     _validate_positive_int(args.max_samples, "max_samples")
     _validate_positive_int(args.max_seq_length, "max_seq_length")
+    _validate_positive_int(args.smoke_max_tokens, "smoke_max_tokens")
 
     ratio = float(args.compression_ratio)
     if not math.isfinite(ratio) or ratio < 0.0 or ratio >= 1.0:

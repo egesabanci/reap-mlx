@@ -16,6 +16,8 @@ save_pruned_model(
     adapter=None,
     expected_expert_count=None,
     smoke_fn=None,
+    smoke_prompt="What is your name?",
+    smoke_max_tokens=16,
     load_fn=None,
     save_fn=None,
 ) -> SaveReloadResult
@@ -149,12 +151,15 @@ attribute exists.
 
 ## Smoke Generation
 
-`generation_smoke` runs a short generation with:
+`generation_smoke` runs a short generation with these default CLI settings:
 
 ```txt
 prompt: "What is your name?"
 max_tokens: 16
 ```
+
+Use `--smoke-prompt` and `--smoke-max-tokens` to override those values for a
+run. The configured prompt and token limit are recorded in smoke metrics.
 
 If the tokenizer has a chat template and `apply_chat_template`, the prompt is
 wrapped as a user message with `add_generation_prompt=True`.
@@ -177,4 +182,3 @@ smoke by passing `smoke_fn=None`.
 | Reload config expert mismatch | Mutated config was not saved or wrong artifact reloaded. |
 | First-dimension mismatch | Expert-stacked weights were not sliced consistently. |
 | LFM2 expert bias mismatch | `expert_bias` was not pruned or reloaded with stale shape. |
-

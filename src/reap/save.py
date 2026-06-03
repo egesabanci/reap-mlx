@@ -45,6 +45,8 @@ def save_pruned_model(
     adapter: Any | None = None,
     expected_expert_count: int | None = None,
     smoke_fn: Callable[[Any, Any, Mapping[str, Any]], Any] | None = None,
+    smoke_prompt: str = "What is your name?",
+    smoke_max_tokens: int = 16,
     load_fn: Callable[..., Any] | None = None,
     save_fn: Callable[..., Any] | None = None,
 ) -> SaveReloadResult:
@@ -95,8 +97,8 @@ def save_pruned_model(
     smoke_metrics = {
         "enabled": smoke_fn is not None,
         "completed": False,
-        "prompt": "What is your name?",
-        "max_tokens": 16,
+        "prompt": smoke_prompt,
+        "max_tokens": smoke_max_tokens,
         "elapsed_seconds": None,
         "generated_token_count": None,
         "result_preview": None,

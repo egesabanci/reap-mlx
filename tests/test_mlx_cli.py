@@ -90,6 +90,8 @@ def test_help_works_without_heavy_runtime_imports():
     assert result.returncode == 0, result.stderr + result.stdout
     assert "--model-name" in result.stdout
     assert "--dataset-name" in result.stdout
+    assert "--smoke-prompt" in result.stdout
+    assert "--smoke-max-tokens" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -101,6 +103,7 @@ def test_help_works_without_heavy_runtime_imports():
         (["--prune-method", "ean_ca"], "Unsupported prune method"),
         (["--max-samples", "0"], "max_samples"),
         (["--max-seq-length", "0"], "max_seq_length"),
+        (["--smoke-max-tokens", "0"], "smoke_max_tokens"),
     ],
 )
 def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
@@ -221,6 +224,8 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
     }
     assert events[3][4:] == ("frequency", 0.25)
     assert events[4][6]["smoke_fn"] is smoke
+    assert events[4][6]["smoke_prompt"] == "What is your name?"
+    assert events[4][6]["smoke_max_tokens"] == 16
     assert any("load:" in line for line in output)
     assert any("calibrate:" in line for line in output)
     assert any("observe:" in line for line in output)
@@ -236,6 +241,64 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
     assert payload["run_config"]["actual_sample_count"] == 1
     assert payload["pruning"]["expert_count_before"] == 4
     assert payload["pruning"]["expert_count_after"] == 3
+
+
+def test_main_configures_default_generation_smoke_from_cli(tmp_path, monkeypatch):
+    save_kwargs = {}
+    generation_calls = []
+
+    def fake_generation_smoke(model, tokenizer, config, *, prompt, max_tokens):
+        generation_calls.append((model, tokenizer, config, prompt, max_tokens))
+        return "smoke-ok"
+
+    def fake_save_pruned_model(*args, **kwargs):
+        del args
+        save_kwargs.update(kwargs)
+        return SimpleNamespace(output_dir=tmp_path)
+
+    monkeypatch.setattr("reap.entrypoint.generation_smoke", fake_generation_smoke)
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--output-dir",
+            str(tmp_path),
+            "--smoke-prompt",
+            "Summarize this domain.",
+            "--smoke-max-tokens",
+            "7",
+        ],
+        load_model_fn=lambda model_name: (object(), object(), {"num_experts": 1}),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=fake_save_pruned_model,
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert save_kwargs["smoke_prompt"] == "Summarize this domain."
+    assert save_kwargs["smoke_max_tokens"] == 7
+
+    result = save_kwargs["smoke_fn"](
+        "reloaded-model",
+        "reloaded-tokenizer",
+        {"num_experts": 1},
+    )
+
+    assert result == "smoke-ok"
+    assert generation_calls == [
+        (
+            "reloaded-model",
+            "reloaded-tokenizer",
+            {"num_experts": 1},
+            "Summarize this domain.",
+            7,
+        )
+    ]
 
 
 def test_no_smoke_passes_no_smoke_function_to_save(tmp_path):
@@ -267,6 +330,8 @@ def test_no_smoke_passes_no_smoke_function_to_save(tmp_path):
 
     assert code == 0
     assert save_kwargs["smoke_fn"] is None
+    assert save_kwargs["smoke_prompt"] == "What is your name?"
+    assert save_kwargs["smoke_max_tokens"] == 16
 
 
 def test_keyboard_interrupt_returns_130_without_success_message():

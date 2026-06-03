@@ -300,6 +300,29 @@ def test_smoke_function_runs_on_reloaded_model_not_original(tmp_path):
     assert smoke_calls == [(reloaded_model, reloaded_tokenizer, {"num_experts": 1})]
 
 
+def test_save_pruned_model_records_configured_smoke_prompt_and_max_tokens(tmp_path):
+    result = save_pruned_model(
+        object(),
+        object(),
+        {"num_experts": 1},
+        tmp_path / "saved",
+        "source-model",
+        smoke_fn=lambda model, tokenizer, config: "smoke-ok",
+        smoke_prompt="Summarize this domain.",
+        smoke_max_tokens=7,
+        save_fn=fake_save_factory([]),
+        load_fn=fake_load_factory(
+            make_reloaded_model(1),
+            object(),
+            {"num_experts": 1},
+        ),
+    )
+
+    assert result.metrics["smoke"]["prompt"] == "Summarize this domain."
+    assert result.metrics["smoke"]["max_tokens"] == 7
+    assert result.metrics["smoke"]["completed"] is True
+
+
 def test_save_pruned_model_uses_explicit_expected_count_when_config_missing(tmp_path):
     result = save_pruned_model(
         object(),
