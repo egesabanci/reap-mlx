@@ -150,11 +150,15 @@ Tracked fields:
 | --- | --- | --- |
 | `total_tokens` | scalar | Number of routed token positions, not multiplied by top-k. |
 | `expert_frequency` | `[num_experts]` | Count of selected router assignments per expert. |
-| `pairwise_expert_frequency` | `[num_experts, num_experts]` | Batch-level pairwise frequency summary. |
 | `ean_sum` | `[num_experts]` | Sum of selected expert output L2 norms. |
 | `weighted_ean_sum` | `[num_experts]` | Sum of output norms multiplied by router score. |
 | `weighted_expert_frequency_sum` | `[num_experts]` | Sum of selected router scores. |
 | `max_activations` | `[num_experts]` | Maximum selected expert output activation. |
+
+Optional debug tracking can be enabled with
+`PruningState.initialize(num_experts, track_pairwise=True)`. This allocates and
+reports `pairwise_expert_frequency` with shape `[num_experts, num_experts]`.
+Default observation leaves it disabled to avoid O(num_experts²) hot-path work.
 
 `accumulate` can accept a `RouterResult` or explicit `indices` and `scores`.
 Callers must also provide either selected expert outputs or precomputed selected
@@ -168,7 +172,6 @@ output norms and maxes.
 | --- | --- |
 | `total_tokens` | Routed token positions. |
 | `expert_frequency` | Selected-route counts. |
-| `pairwise_expert_frequency` | Batch pairwise frequency matrix. |
 | `expert_proba` | `expert_frequency / max(total_tokens, 1)`. |
 | `ean_sum` | Sum of selected output norms. |
 | `ean_mean` | `ean_sum / max(expert_frequency, eps)`. |
@@ -184,6 +187,5 @@ Never-selected experts report finite zeros for mean-style metrics.
 `expert_frequency.sum()` can exceed `total_tokens` when `top_k > 1`, because
 frequency counts selected routes and each token can select multiple experts.
 
-`pairwise_expert_frequency` is collected for telemetry and future analysis. It
-is not currently a supported pruning method.
-
+`pairwise_expert_frequency` is not currently a supported pruning method and is
+disabled by default.

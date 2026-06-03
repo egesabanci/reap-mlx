@@ -25,7 +25,6 @@ requires_mlx = pytest.mark.skipif(
 EXPECTED_PRUNING_KEYS = {
     "total_tokens",
     "expert_frequency",
-    "pairwise_expert_frequency",
     "expert_proba",
     "ean_sum",
     "ean_mean",
@@ -286,10 +285,6 @@ def test_observe_model_reports_pruning_keys_and_manual_values():
 
     assert report["total_tokens"] == 2
     np.testing.assert_array_equal(report["expert_frequency"], [1, 1, 0])
-    np.testing.assert_array_equal(
-        report["pairwise_expert_frequency"],
-        [[2, 2, 1], [2, 2, 1], [1, 1, 0]],
-    )
     np.testing.assert_allclose(report["expert_proba"], [0.5, 0.5, 0.0])
     np.testing.assert_allclose(report["ean_sum"], [norm0, norm1, 0.0])
     np.testing.assert_allclose(report["ean_mean"], [norm0, norm1, 0.0])

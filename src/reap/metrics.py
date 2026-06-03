@@ -22,27 +22,34 @@ class PruningState:
     num_experts: int
     total_tokens: int
     expert_frequency: np.ndarray
-    pairwise_expert_frequency: np.ndarray
+    pairwise_expert_frequency: np.ndarray | None
     ean_sum: np.ndarray
     weighted_ean_sum: np.ndarray
     weighted_expert_frequency_sum: np.ndarray
     max_activations: np.ndarray
 
     @classmethod
-    def initialize(cls, num_experts: int) -> "PruningState":
+    def initialize(
+        cls,
+        num_experts: int,
+        *,
+        track_pairwise: bool = False,
+    ) -> "PruningState":
         """Create zero-initialized pruning state for ``num_experts`` experts."""
         num_experts = int(num_experts)
         if num_experts < 1:
             raise ValueError(f"num_experts must be positive, got {num_experts}.")
 
+        pairwise = (
+            np.zeros((num_experts, num_experts), dtype=np.int64)
+            if track_pairwise
+            else None
+        )
         return cls(
             num_experts=num_experts,
             total_tokens=0,
             expert_frequency=np.zeros(num_experts, dtype=np.int64),
-            pairwise_expert_frequency=np.zeros(
-                (num_experts, num_experts),
-                dtype=np.int64,
-            ),
+            pairwise_expert_frequency=pairwise,
             ean_sum=np.zeros(num_experts, dtype=np.float64),
             weighted_ean_sum=np.zeros(num_experts, dtype=np.float64),
             weighted_expert_frequency_sum=np.zeros(num_experts, dtype=np.float64),
@@ -115,9 +122,10 @@ class PruningState:
 
         self.total_tokens += token_count
         self.expert_frequency += batch_frequency
-        self.pairwise_expert_frequency += (
-            batch_frequency[:, None] + batch_frequency[None, :]
-        )
+        if self.pairwise_expert_frequency is not None:
+            self.pairwise_expert_frequency += (
+                batch_frequency[:, None] + batch_frequency[None, :]
+            )
 
         flat_norms = norms_array.reshape(-1).astype(np.float64, copy=False)
         flat_scores = scores_array.reshape(-1)
@@ -138,10 +146,9 @@ class PruningState:
             _FLOAT_EPS,
         )
 
-        return {
+        report = {
             "total_tokens": int(self.total_tokens),
             "expert_frequency": self.expert_frequency.copy(),
-            "pairwise_expert_frequency": self.pairwise_expert_frequency.copy(),
             "expert_proba": self.expert_frequency.astype(np.float64)
             / token_denominator,
             "ean_sum": self.ean_sum.copy(),
@@ -153,6 +160,11 @@ class PruningState:
             "reap": (self.weighted_ean_sum / count_denominator).astype(np.float32),
             "max_activations": self.max_activations.copy(),
         }
+        if self.pairwise_expert_frequency is not None:
+            report["pairwise_expert_frequency"] = (
+                self.pairwise_expert_frequency.copy()
+            )
+        return report
 
     def _validate_route_arrays(
         self,
