@@ -185,6 +185,8 @@ Core options:
 | `--metrics-file` | `validation-metrics.json` | Metrics filename or absolute path. |
 | `--verbose` | off | Print pipeline progress. |
 | `--no-smoke` | off | Skip generation smoke after save/reload validation. |
+| `--smoke-prompt` | `What is your name?` | Prompt for generation smoke validation. |
+| `--smoke-max-tokens` | `16` | Maximum tokens for generation smoke validation. |
 
 ## Metrics
 

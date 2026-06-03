@@ -32,6 +32,8 @@ validation, optional smoke generation, and telemetry writing.
 | `--metrics-file` | `validation-metrics.json` | Metrics filename or absolute path. |
 | `--verbose` | off | Print phase progress messages. |
 | `--no-smoke` | off | Skip generation smoke after reload validation. |
+| `--smoke-prompt` | `What is your name?` | Prompt for generation smoke validation. |
+| `--smoke-max-tokens` | `16` | Maximum tokens for generation smoke validation. |
 
 ## Validation
 
@@ -44,6 +46,7 @@ The CLI rejects:
 - unsupported prune methods;
 - `max_samples < 1`;
 - `max_seq_length < 1`.
+- `smoke_max_tokens < 1`.
 
 Invalid arguments exit through `argparse` with code 2.
 
@@ -133,4 +136,3 @@ re-raises the exception. The failure payload includes:
 - exception message;
 - elapsed seconds before failure;
 - memory sample at failure.
-
