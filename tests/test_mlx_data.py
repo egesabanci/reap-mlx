@@ -207,6 +207,76 @@ def test_conversation_records_fall_back_to_role_content_text():
     assert text == "human: Explain REAP.\nassistant: REAP prunes experts."
 
 
+def test_extract_text_skips_multimodal_content_blocks():
+    text = extract_text(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        },
+                        {
+                            "type": "audio",
+                            "audio": {"url": "https://example.com/a.wav"},
+                        },
+                        {
+                            "type": "video",
+                            "video": {"url": "https://example.com/v.mp4"},
+                        },
+                        {"type": "text", "text": "Use one sentence."},
+                    ],
+                }
+            ]
+        },
+        tokenizer=WhitespaceTokenizer(),
+    )
+
+    assert text == "user: Describe this.\nUse one sentence."
+
+
+def test_load_calibration_sequences_tokenizes_only_text_content_blocks():
+    tokenizer = WhitespaceTokenizer()
+
+    sequences = load_calibration_sequences(
+        tokenizer,
+        "multimodal/data",
+        max_samples=1,
+        max_seq_length=10,
+        load_dataset_fn=lambda dataset_name, **kwargs: [
+            {
+                "text": [
+                    {"type": "text", "text": "Hello world"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                    {"type": "text", "text": "Goodbye"},
+                ]
+            }
+        ],
+    )
+
+    assert tokenizer.texts == ["Hello world\nGoodbye"]
+    np.testing.assert_array_equal(sequences[0]["input_ids"], [5, 5, 7])
+
+
+def test_extract_text_preserves_untyped_mapping_content_fallback():
+    text = extract_text(
+        {
+            "text": [
+                "metadata",
+                {"source": "manual", "value": 3},
+            ]
+        }
+    )
+
+    assert text == 'metadata\n{"source": "manual", "value": 3}'
+
+
 class RecordingShuffleDataset(list):
     def __init__(self, records):
         super().__init__(records)
