@@ -50,6 +50,9 @@ def prune_experts(
 ) -> dict[int, np.ndarray]:
     """Prune adapter-discovered MLX MoE experts in place.
 
+    This mutates both the live model and the passed config mapping in place.
+    Copy config before calling if pre-pruning values are still needed.
+
     Returns a mapping from layer index to ascending retained expert indices.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter

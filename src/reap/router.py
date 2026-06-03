@@ -15,7 +15,10 @@ _NORM_EPSILON: float = 1e-20
 
 @dataclass(frozen=True)
 class RouterResult:
-    """Architecture-neutral selected-router output."""
+    """Architecture-neutral selected-router output.
+
+    Indices and scores are in argpartition order, not sorted by score.
+    """
 
     indices: Any
     scores: Any
