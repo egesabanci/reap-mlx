@@ -101,7 +101,8 @@ Qwen3 routing:
 4. Applies `mx.softmax(logits, axis=-1, precise=True)`.
 5. Selects top-k experts through `mx.argpartition`.
 6. Gathers selected softmax scores.
-7. Optionally renormalizes selected scores when `norm_topk_prob` is enabled.
+7. Optionally renormalizes selected scores with the shared epsilon denominator
+   when `norm_topk_prob` is enabled.
 8. Reshapes selected indices and scores back to leading dimensions.
 
 Live `top_k` on the module is preferred over config top-k.
@@ -117,7 +118,7 @@ LFM2 routing:
 5. Adds `expert_bias` before top-k selection when `use_expert_bias` is enabled.
 6. Selects top-k experts through `mx.argpartition`.
 7. Gathers selected scores.
-8. Optionally renormalizes selected scores with an epsilon denominator.
+8. Optionally renormalizes selected scores with the shared epsilon denominator.
 9. Casts scores back to the hidden-state dtype.
 
 When `use_expert_bias` is true, `moe.expert_bias` is required.

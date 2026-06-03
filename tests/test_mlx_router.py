@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import importlib.util
 import os
 import subprocess
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from reap import router as router_module
 from reap.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
 
 
@@ -151,7 +153,9 @@ def qwen_reference(mx, mlp, hidden_states, top_k, norm_topk_prob):
     scores = mx.take_along_axis(gates, indices, axis=-1)
 
     if norm_topk_prob:
-        scores = scores / scores.sum(axis=-1, keepdims=True)
+        scores = scores / (
+            scores.sum(axis=-1, keepdims=True) + router_module._NORM_EPSILON
+        )
 
     output_shape = (*leading_shape, top_k)
     return indices.reshape(output_shape), scores.reshape(output_shape)
@@ -166,7 +170,9 @@ def lfm2_reference(mx, moe, hidden_states, top_k, norm_topk_prob):
     indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
     scores = mx.take_along_axis(gates, indices, axis=-1)
     if norm_topk_prob:
-        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores = scores / (
+            mx.sum(scores, axis=-1, keepdims=True) + router_module._NORM_EPSILON
+        )
     return indices, scores.astype(hidden_states.dtype)
 
 
@@ -178,6 +184,15 @@ def assert_allclose(mx, actual, expected, *, atol=1e-6):
     diff = mx.max(mx.abs(actual - expected))
     mx.eval(diff)
     assert float(diff) <= atol
+
+
+def test_router_normalization_epsilon_is_shared():
+    assert router_module._NORM_EPSILON == 1e-20
+    assert "_NORM_EPSILON" in inspect.getsource(Qwen3MoeRouter.__call__)
+
+    lfm2_call_source = inspect.getsource(Lfm2MoeRouter.__call__)
+    assert "_NORM_EPSILON" in lfm2_call_source
+    assert "1e-20" not in lfm2_call_source
 
 
 @requires_mlx

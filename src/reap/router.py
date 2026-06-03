@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
+_NORM_EPSILON: float = 1e-20
+
+
 @dataclass(frozen=True)
 class RouterResult:
     """Architecture-neutral selected-router output."""
@@ -124,7 +127,9 @@ class Qwen3MoeRouter:
         flat_scores = mx.take_along_axis(gates, flat_indices, axis=-1)
 
         if self.norm_topk_prob:
-            flat_scores = flat_scores / flat_scores.sum(axis=-1, keepdims=True)
+            flat_scores = flat_scores / (
+                flat_scores.sum(axis=-1, keepdims=True) + _NORM_EPSILON
+            )
 
         output_shape = (*leading_shape, self.top_k)
         return RouterResult(
@@ -212,7 +217,9 @@ class Lfm2MoeRouter:
         indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
         scores = mx.take_along_axis(gates, indices, axis=-1)
         if self.norm_topk_prob:
-            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+            scores = scores / (
+                mx.sum(scores, axis=-1, keepdims=True) + _NORM_EPSILON
+            )
         scores = scores.astype(hidden_states.dtype)
 
         return RouterResult(
