@@ -28,6 +28,7 @@ validation, optional smoke generation, and telemetry writing.
 | `--max-samples` | `128` | Maximum non-empty calibration samples. |
 | `--num-calibration-sequences` | alias | Alias for `--max-samples`. |
 | `--max-seq-length` | `2048` | Maximum tokens per calibration sequence. |
+| `--eval-frequency` | `1` | Evaluate the MLX graph every N observation layers. |
 | `--seed` | `42` | Shuffle seed when the dataset supports shuffle. |
 | `--metrics-file` | `validation-metrics.json` | Metrics filename or absolute path. |
 | `--verbose` | off | Print phase progress messages. |
@@ -45,7 +46,8 @@ The CLI rejects:
 - non-finite compression ratios such as `nan`;
 - unsupported prune methods;
 - `max_samples < 1`;
-- `max_seq_length < 1`.
+- `max_seq_length < 1`;
+- `eval_frequency < 1`;
 - `smoke_max_tokens < 1`.
 
 Invalid arguments exit through `argparse` with code 2.

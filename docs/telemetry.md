@@ -60,6 +60,7 @@ Run config records user-facing CLI inputs:
 - `seed`
 - `max_samples`
 - `max_seq_length`
+- `eval_frequency`
 - `prune_method`
 - `resolved_prune_method`
 - `compression_ratio`
@@ -241,4 +242,3 @@ On failure, telemetry status is `failed` and `failure` contains:
 - `memory_at_failure`
 
 The original exception is re-raised after telemetry is written.
-

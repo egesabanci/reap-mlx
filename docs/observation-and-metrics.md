@@ -14,6 +14,7 @@ observe_model(
     *,
     adapter=None,
     debug_memory=False,
+    eval_frequency=1,
     eval_fn=None,
     mask_fn=None,
 ) -> dict[int, dict[str, Any]]
@@ -22,9 +23,13 @@ observe_model(
 Returns observer reports keyed by MoE layer index. Dense layers are replayed but
 do not receive reports.
 
-`eval_fn` defaults to `mx.eval`. It is called after every layer to force MLX
-evaluation boundaries and avoid unbounded lazy graph growth across layers and
-sequences.
+`eval_fn` defaults to `mx.eval`. By default, it is called after every layer to
+force MLX evaluation boundaries and avoid unbounded lazy graph growth across
+layers and sequences.
+
+`eval_frequency` controls that boundary. Values greater than 1 evaluate every N
+layers and also flush the final layer of each sequence when needed. Higher
+values reduce GPU synchronization barriers but increase peak memory.
 
 ## Qwen3 Replay
 
@@ -40,7 +45,7 @@ For each sequence:
    - run `post_attention_layernorm`;
    - run either MoE observation or dense MLP;
    - add the MLP residual;
-   - evaluate the hidden state.
+   - evaluate the hidden state when the configured eval boundary is reached.
 
 Qwen3 MoE layers route with `Qwen3MoeRouter`.
 
@@ -60,7 +65,7 @@ For each sequence:
    - run `ffn_norm`;
    - run either MoE observation or dense feed-forward;
    - add the feed-forward residual;
-   - evaluate the hidden state.
+   - evaluate the hidden state when the configured eval boundary is reached.
 
 LFM2 MoE layers route with `Lfm2MoeRouter`.
 
