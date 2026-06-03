@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -509,3 +510,34 @@ def test_generation_smoke_formats_chat_prompt_and_calls_generate():
 
     assert result == "hello"
     assert calls == [(model, tokenizer, "<chat>Who are you?</chat>", 4)]
+
+
+def test_generation_smoke_falls_back_to_raw_prompt_when_chat_template_fails(caplog):
+    calls = []
+
+    class Tokenizer:
+        chat_template = "template"
+
+        def apply_chat_template(self, messages, *, add_generation_prompt):
+            del messages, add_generation_prompt
+            raise RuntimeError("broken template")
+
+    def generate_fn(model, tokenizer, *, prompt, max_tokens):
+        calls.append((model, tokenizer, prompt, max_tokens))
+        return "hello"
+
+    model = object()
+    tokenizer = Tokenizer()
+    caplog.set_level(logging.WARNING, logger="reap.save")
+
+    result = generation_smoke(
+        model,
+        tokenizer,
+        prompt="Who are you?",
+        max_tokens=4,
+        generate_fn=generate_fn,
+    )
+
+    assert result == "hello"
+    assert calls == [(model, tokenizer, "Who are you?", 4)]
+    assert "Chat template application failed" in caplog.text
