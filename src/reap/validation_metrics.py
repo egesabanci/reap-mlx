@@ -134,6 +134,7 @@ class RunMetrics:
                 "seed": getattr(args, "seed", None),
                 "max_samples": getattr(args, "max_samples", None),
                 "max_seq_length": getattr(args, "max_seq_length", None),
+                "eval_frequency": getattr(args, "eval_frequency", None),
                 "prune_method": getattr(args, "prune_method", None),
                 "resolved_prune_method": _resolve_method_or_none(
                     getattr(args, "prune_method", None)

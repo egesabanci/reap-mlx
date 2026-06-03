@@ -90,6 +90,7 @@ def test_help_works_without_heavy_runtime_imports():
     assert result.returncode == 0, result.stderr + result.stdout
     assert "--model-name" in result.stdout
     assert "--dataset-name" in result.stdout
+    assert "--eval-frequency" in result.stdout
     assert "--smoke-prompt" in result.stdout
     assert "--smoke-max-tokens" in result.stdout
 
@@ -103,6 +104,7 @@ def test_help_works_without_heavy_runtime_imports():
         (["--prune-method", "ean_ca"], "Unsupported prune method"),
         (["--max-samples", "0"], "max_samples"),
         (["--max-seq-length", "0"], "max_seq_length"),
+        (["--eval-frequency", "0"], "eval_frequency"),
         (["--smoke-max-tokens", "0"], "smoke_max_tokens"),
     ],
 )
@@ -142,8 +144,8 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         events.append(("calibrate", tokenizer_arg, dataset_name, kwargs))
         return [{"input_ids": [1, 2, 3]}]
 
-    def fake_observe_model(model_arg, sequences, config_arg):
-        events.append(("observe", model_arg, sequences, config_arg))
+    def fake_observe_model(model_arg, sequences, config_arg, **kwargs):
+        events.append(("observe", model_arg, sequences, config_arg, kwargs))
         return {0: {"reap": [1.0, 0.5, 0.25, 0.0]}}
 
     def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio):
@@ -222,6 +224,7 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         "max_seq_length": 16,
         "seed": 9,
     }
+    assert events[2][4] == {"eval_frequency": 1}
     assert events[3][4:] == ("frequency", 0.25)
     assert events[4][6]["smoke_fn"] is smoke
     assert events[4][6]["smoke_prompt"] == "What is your name?"
@@ -238,9 +241,48 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     assert payload["status"] == "success"
     assert payload["run_config"]["model_name"] == "mlx-model"
+    assert payload["run_config"]["eval_frequency"] == 1
     assert payload["run_config"]["actual_sample_count"] == 1
     assert payload["pruning"]["expert_count_before"] == 4
     assert payload["pruning"]["expert_count_after"] == 3
+
+
+def test_main_passes_configured_eval_frequency_to_observer(tmp_path):
+    observe_kwargs = {}
+
+    def fake_observe_model(model_arg, sequences, config_arg, **kwargs):
+        del model_arg, sequences, config_arg
+        observe_kwargs.update(kwargs)
+        return {0: {"reap": [1.0]}}
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--output-dir",
+            str(tmp_path),
+            "--eval-frequency",
+            "4",
+        ],
+        load_model_fn=lambda model_name: (object(), object(), {"num_experts": 1}),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=fake_observe_model,
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert observe_kwargs == {"eval_frequency": 4}
+
+    payload = json.loads(
+        (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["run_config"]["eval_frequency"] == 4
 
 
 def test_main_configures_default_generation_smoke_from_cli(tmp_path, monkeypatch):
@@ -362,8 +404,8 @@ def test_keyboard_interrupt_returns_130_without_success_message():
 def test_main_writes_failed_metrics_when_pipeline_phase_raises(tmp_path):
     output_dir = tmp_path / "failed-run"
 
-    def fail_observe(model, sequences, config):
-        del model, sequences, config
+    def fail_observe(model, sequences, config, **kwargs):
+        del model, sequences, config, kwargs
         raise RuntimeError("observer failed")
 
     with pytest.raises(RuntimeError, match="observer failed"):

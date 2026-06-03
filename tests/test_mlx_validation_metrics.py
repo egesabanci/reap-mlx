@@ -107,6 +107,7 @@ def test_run_metrics_writes_success_json_with_timings_and_throughput(tmp_path):
         seed=42,
         max_samples=2,
         max_seq_length=8,
+        eval_frequency=1,
         prune_method="reap",
         compression_ratio=0.25,
         output_dir=str(tmp_path),

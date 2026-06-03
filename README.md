@@ -180,6 +180,7 @@ Core options:
 | `--compression-ratio` | `0.25` | Fraction of experts to remove per MoE layer. |
 | `--max-samples` | `128` | Number of non-empty calibration samples. |
 | `--max-seq-length` | `2048` | Maximum token length per calibration sample. |
+| `--eval-frequency` | `1` | Evaluate the MLX graph every N observation layers. |
 | `--seed` | `42` | Dataset shuffle seed when shuffle is available. |
 | `--output-dir` | required | Directory for the pruned MLX-LM artifact. |
 | `--metrics-file` | `validation-metrics.json` | Metrics filename or absolute path. |

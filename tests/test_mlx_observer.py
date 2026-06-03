@@ -421,6 +421,70 @@ def test_observe_model_calls_eval_fn_after_each_layer():
 
 
 @requires_mlx
+def test_observe_model_eval_frequency_flushes_final_partial_group():
+    import mlx.core as mx
+
+    layers = [
+        TinyLayer(mx, TinyDenseMlp(mx)),
+        TinyLayer(mx, TinyMoeMlp(mx, top_k=1)),
+        TinyLayer(mx, TinyDenseMlp(mx)),
+    ]
+    model = TinyModel(mx, layers)
+    eval_calls = []
+
+    observe_model(
+        model,
+        [[0, 1]],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+        eval_frequency=2,
+        mask_fn=lambda h, cache=None: None,
+        eval_fn=lambda h: eval_calls.append(h.shape),
+    )
+
+    assert eval_calls == [(1, 2, 2), (1, 2, 2)]
+
+
+@requires_mlx
+def test_observe_model_eval_frequency_does_not_duplicate_exact_final_group():
+    import mlx.core as mx
+
+    layers = [
+        TinyLayer(mx, TinyDenseMlp(mx)),
+        TinyLayer(mx, TinyMoeMlp(mx, top_k=1)),
+        TinyLayer(mx, TinyDenseMlp(mx)),
+        TinyLayer(mx, TinyDenseMlp(mx)),
+    ]
+    model = TinyModel(mx, layers)
+    eval_calls = []
+
+    observe_model(
+        model,
+        [[0, 1]],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+        eval_frequency=2,
+        mask_fn=lambda h, cache=None: None,
+        eval_fn=lambda h: eval_calls.append(h.shape),
+    )
+
+    assert eval_calls == [(1, 2, 2), (1, 2, 2)]
+
+
+@requires_mlx
+def test_observe_model_rejects_invalid_eval_frequency():
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, TinyMoeMlp(mx, top_k=1))])
+
+    with pytest.raises(ValueError, match="eval_frequency"):
+        observe_model(
+            model,
+            [[0]],
+            {"num_experts": 3, "num_experts_per_tok": 1},
+            eval_frequency=0,
+        )
+
+
+@requires_mlx
 def test_observe_model_adds_shared_expert_to_hidden_flow_only():
     import mlx.core as mx
 
@@ -514,3 +578,48 @@ def test_observe_model_replays_lfm2_conv_attention_dense_and_moe_layers():
     assert eval_calls == [(1, 2, 2), (1, 2, 2)]
     assert len(dense_feed_forward.inputs) == 1
     assert np.isfinite(observer_data[1]["reap"]).all()
+
+
+@requires_mlx
+def test_observe_model_lfm2_eval_frequency_flushes_final_partial_group():
+    import mlx.core as mx
+
+    model = TinyModel(
+        mx,
+        [
+            TinyLfmLayer(
+                mx,
+                is_attention_layer=False,
+                feed_forward=TinyLfmDenseFeedForward(mx),
+            ),
+            TinyLfmLayer(
+                mx,
+                is_attention_layer=True,
+                feed_forward=TinyLfmMoeFeedForward(mx, top_k=1),
+            ),
+            TinyLfmLayer(
+                mx,
+                is_attention_layer=False,
+                feed_forward=TinyLfmDenseFeedForward(mx),
+            ),
+        ],
+    )
+    eval_calls = []
+
+    observer_data = observe_model(
+        model,
+        [[0, 1]],
+        {
+            "model_type": "lfm2_moe",
+            "num_experts": 3,
+            "num_experts_per_tok": 1,
+            "norm_topk_prob": False,
+            "use_expert_bias": False,
+        },
+        eval_frequency=2,
+        mask_fn=lambda h, cache=None, kind=None: kind,
+        eval_fn=lambda h: eval_calls.append(h.shape),
+    )
+
+    assert set(observer_data) == {1}
+    assert eval_calls == [(1, 2, 2), (1, 2, 2)]

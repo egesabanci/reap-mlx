@@ -31,6 +31,7 @@ def observe_model(
     *,
     adapter: Any | None = None,
     debug_memory: bool = False,
+    eval_frequency: int = 1,
     eval_fn: Callable[[Any], Any] | None = None,
     mask_fn: Callable[..., Any] | None = None,
 ) -> dict[int, dict[str, Any]]:
@@ -38,6 +39,7 @@ def observe_model(
     mx = _require_mlx_core()
     config = {} if config is None else config
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    eval_frequency = _validate_eval_frequency(eval_frequency)
     eval_fn = mx.eval if eval_fn is None else eval_fn
 
     if getattr(adapter, "adapter_name", None) == "lfm2_moe":
@@ -47,6 +49,7 @@ def observe_model(
             config,
             adapter=adapter,
             debug_memory=debug_memory,
+            eval_frequency=eval_frequency,
             eval_fn=eval_fn,
             mask_fn=mask_fn,
         )
@@ -57,6 +60,7 @@ def observe_model(
         config,
         adapter=adapter,
         debug_memory=debug_memory,
+        eval_frequency=eval_frequency,
         eval_fn=eval_fn,
         mask_fn=mask_fn,
     )
@@ -69,6 +73,7 @@ def _observe_qwen3_model(
     *,
     adapter: Any,
     debug_memory: bool,
+    eval_frequency: int,
     eval_fn: Callable[[Any], Any],
     mask_fn: Callable[..., Any] | None,
 ) -> dict[int, dict[str, Any]]:
@@ -123,7 +128,8 @@ def _observe_qwen3_model(
                 dense_mlp = adapter.get_dense_mlp(layer)
                 h = h + dense_mlp(moe_input)
 
-            eval_fn(h)
+            if _should_eval_layer(layer_idx, len(layers), eval_frequency):
+                eval_fn(h)
             if debug_memory:
                 _log_memory(mx, layer_idx)
 
@@ -137,6 +143,7 @@ def _observe_lfm2_model(
     *,
     adapter: Any,
     debug_memory: bool,
+    eval_frequency: int,
     eval_fn: Callable[[Any], Any],
     mask_fn: Callable[..., Any] | None,
 ) -> dict[int, dict[str, Any]]:
@@ -179,7 +186,8 @@ def _observe_lfm2_model(
                 dense_mlp = adapter.get_dense_mlp(layer)
                 h = h_mid + dense_mlp(ffn_input)
 
-            eval_fn(h)
+            if _should_eval_layer(layer_idx, len(layers), eval_frequency):
+                eval_fn(h)
             if debug_memory:
                 _log_memory(mx, layer_idx)
 
@@ -195,6 +203,19 @@ def _require_mlx_core():
             "Install MLX in the active environment before observing."
         ) from exc
     return mx
+
+
+def _validate_eval_frequency(eval_frequency: int) -> int:
+    value = int(eval_frequency)
+    if value < 1:
+        raise ValueError(
+            f"eval_frequency must be a positive integer, got {eval_frequency}."
+        )
+    return value
+
+
+def _should_eval_layer(layer_idx: int, layer_count: int, eval_frequency: int) -> bool:
+    return (layer_idx + 1) % eval_frequency == 0 or layer_idx == layer_count - 1
 
 
 def _get_embed_tokens(model: Any) -> Callable[[Any], Any]:

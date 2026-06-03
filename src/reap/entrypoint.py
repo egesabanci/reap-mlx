@@ -39,6 +39,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=128,
     )
     parser.add_argument("--max-seq-length", type=int, default=2048)
+    parser.add_argument(
+        "--eval-frequency",
+        type=int,
+        default=1,
+        help=(
+            "Evaluate the MLX graph every N layers during observation. "
+            "Higher values reduce GPU syncs but increase peak memory."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
@@ -153,6 +162,7 @@ def main(
                 model,
                 calibration_sequences,
                 config,
+                eval_frequency=args.eval_frequency,
             )
         metrics.record_observer(observer_data, args.prune_method)
         metrics.sample_memory("after_observe")
@@ -215,6 +225,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     resolve_prune_method(args.prune_method)
     _validate_positive_int(args.max_samples, "max_samples")
     _validate_positive_int(args.max_seq_length, "max_seq_length")
+    _validate_positive_int(args.eval_frequency, "eval_frequency")
     _validate_positive_int(args.smoke_max_tokens, "smoke_max_tokens")
 
     ratio = float(args.compression_ratio)
