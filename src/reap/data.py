@@ -198,6 +198,8 @@ def _normalize_content(content: Any) -> str:
             if isinstance(item, Mapping):
                 if item.get("type") == "text" and isinstance(item.get("text"), str):
                     parts.append(item["text"])
+                elif item.get("type") not in (None, "text"):
+                    continue
                 else:
                     parts.append(json.dumps(dict(item), sort_keys=True))
             else:
