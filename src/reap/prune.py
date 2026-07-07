@@ -142,13 +142,14 @@ def prune_experts(
             top_k=config_top_k or config_num_experts,
         )
 
-    return keep_by_layer
     if total_pruned_global == 0:
         logger.warning(
             "compression_ratio=%s resulted in zero experts being pruned "
             "across all layers. Use a larger ratio to reduce the model.",
             compression_ratio,
         )
+
+    return keep_by_layer
 
 
 def resolve_prune_method(prune_method: str) -> str:
