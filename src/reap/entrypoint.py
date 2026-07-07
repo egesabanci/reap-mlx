@@ -136,6 +136,18 @@ def main(
             raise ValueError("MLX-LM load must return a mapping config.")
         adapter = _infer_adapter_safely(model, config)
         metrics.record_model_metadata(model, config, adapter=adapter)
+        if adapter is None:
+            raise ValueError(
+                "Could not determine the MoE architecture adapter for this model. "
+                "REAP pruning currently supports Qwen3-MoE and LFM2-MoE architectures. "
+                f"Model type: {config.get('model_type', 'unknown')}."
+            )
+        moe_layer_indices = adapter.identify_moe_layers(model)
+        if not moe_layer_indices:
+            raise ValueError(
+                f"Model has no MoE layers detected by the {adapter.adapter_name} adapter. "
+                "REAP pruning requires an MoE model with at least one MoE layer."
+            )
         metrics.sample_memory("after_model_load")
 
         current_phase = "calibration"
@@ -165,6 +177,11 @@ def main(
                 eval_frequency=args.eval_frequency,
             )
         metrics.record_observer(observer_data, args.prune_method)
+        if not observer_data:
+            raise RuntimeError(
+                "Observer returned no data. The model may have no observable MoE layers "
+                "or the adapter could not identify them."
+            )
         metrics.sample_memory("after_observe")
 
         current_phase = "prune"
@@ -231,6 +248,12 @@ def _validate_args(args: argparse.Namespace) -> None:
     ratio = float(args.compression_ratio)
     if not math.isfinite(ratio) or ratio < 0.0 or ratio >= 1.0:
         raise ValueError(f"compression_ratio must be in [0, 1), got {ratio}.")
+
+    if args.compression_ratio == 0.0:
+        logger.warning(
+            "compression_ratio=0.0 will prune zero experts; "
+            "the saved model will be identical to the input."
+        )
 
 
 def _validate_positive_int(value: Any, name: str) -> None:

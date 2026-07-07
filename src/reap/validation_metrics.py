@@ -23,6 +23,7 @@ from typing import Any
 
 from reap.model_adapters import infer_model_adapter
 from reap.prune import resolve_prune_method
+from reap.save import artifact_summary
 
 
 _PACKAGE_VERSION_NAMES = (
@@ -32,7 +33,6 @@ _PACKAGE_VERSION_NAMES = (
     "huggingface-hub",
     "safetensors",
 )
-_ARTIFACT_PATTERNS = ("*.safetensors", "*.npz", "*.json", "*.model", "*.txt")
 
 
 @dataclass
@@ -333,7 +333,7 @@ class RunMetrics:
         """Record save/reload artifact, shape validation, and smoke metrics."""
         output_dir = Path(getattr(result, "output_dir", self.output_dir))
         result_metrics = getattr(result, "metrics", None) or {}
-        artifact_summary = result_metrics.get("artifacts") or _artifact_summary(
+        artifact_result = result_metrics.get("artifacts") or artifact_summary(
             output_dir
         )
         reloaded_config = getattr(result, "reloaded_config", {}) or {}
@@ -346,7 +346,7 @@ class RunMetrics:
             "reloaded_config_expert_count": reloaded_config.get("num_experts"),
             "reloaded_adapter_moe_layer_count": len(reloaded_moe_layers),
             "reloaded_adapter_moe_layer_indices": reloaded_moe_layers,
-            "artifacts": artifact_summary,
+            "artifacts": artifact_result,
             "timings": result_metrics.get("timings", {}),
             "shape_summary": _reloaded_shape_summary(adapter, reloaded_model),
         }
@@ -660,27 +660,6 @@ def _resolve_method_or_none(prune_method: str | None) -> str | None:
         return None
 
 
-def _artifact_summary(output_dir: Path) -> dict[str, Any]:
-    files = []
-    seen: set[Path] = set()
-    for pattern in _ARTIFACT_PATTERNS:
-        for path in output_dir.glob(pattern):
-            if path in seen or not path.is_file():
-                continue
-            seen.add(path)
-            files.append(
-                {
-                    "path": str(path.relative_to(output_dir)),
-                    "bytes": path.stat().st_size,
-                }
-            )
-    files.sort(key=lambda item: item["path"])
-    return {
-        "file_count": len(files),
-        "total_bytes": sum(int(item["bytes"]) for item in files),
-        "files": files,
-    }
-
 
 def _sample_mlx_memory() -> dict[str, Any]:
     try:
@@ -711,9 +690,13 @@ def _sample_mlx_memory() -> dict[str, Any]:
 
 def _sample_process_memory() -> dict[str, Any]:
     usage = resource.getrusage(resource.RUSAGE_SELF)
+    raw = int(usage.ru_maxrss)
+    # ru_maxrss is in bytes on macOS, kilobytes on Linux/BSD
+    divisor = 1_000_000 if sys.platform == "darwin" else 1_000
     return {
-        "max_rss": int(usage.ru_maxrss),
-        "max_rss_units": "platform_ru_maxrss",
+        "max_rss_mb": round(raw / divisor, 1),
+        "max_rss_bytes": raw if sys.platform == "darwin" else raw * 1000,
+        "max_rss_units": "megabytes",
     }
 
 

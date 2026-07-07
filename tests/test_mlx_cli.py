@@ -15,6 +15,23 @@ import pytest
 from reap.entrypoint import main
 
 
+def _moe_model_and_config():
+    """Return (model, config) tuple with minimal MoE structure for pipeline tests."""
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[]),
+    )
+    mock_mlp = SimpleNamespace(switch_mlp=object())
+    mock_layer = SimpleNamespace(mlp=mock_mlp)
+    model.model.layers = [mock_layer]
+    config = {
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+    }
+    return model, object(), config
+
+
 def _subprocess_with_import_blocker(body: str) -> subprocess.CompletedProcess[str]:
     repo_root = Path(__file__).resolve().parents[1]
     src_dir = repo_root / "src"
@@ -129,11 +146,23 @@ def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
 
 
 def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_path):
+    from types import SimpleNamespace
     events = []
     output = []
-    model = object()
+    mock_switch_mlp = object()
+    mock_mlp = SimpleNamespace(switch_mlp=mock_switch_mlp)
+    mock_layer = SimpleNamespace(mlp=mock_mlp)
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[mock_layer]),
+    )
     tokenizer = object()
-    config = {"num_experts": 4, "num_experts_per_tok": 2}
+    config = {
+        "model_type": "qwen2_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+    }
     smoke = object()
 
     def fake_load_model(model_name):
@@ -266,7 +295,7 @@ def test_main_passes_configured_eval_frequency_to_observer(tmp_path):
             "--eval-frequency",
             "4",
         ],
-        load_model_fn=lambda model_name: (object(), object(), {"num_experts": 1}),
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
         load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
         observe_model_fn=fake_observe_model,
         prune_experts_fn=lambda *args, **kwargs: {},
@@ -313,7 +342,7 @@ def test_main_configures_default_generation_smoke_from_cli(tmp_path, monkeypatch
             "--smoke-max-tokens",
             "7",
         ],
-        load_model_fn=lambda model_name: (object(), object(), {"num_experts": 1}),
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
         load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
         observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
         prune_experts_fn=lambda *args, **kwargs: {},
@@ -361,7 +390,7 @@ def test_no_smoke_passes_no_smoke_function_to_save(tmp_path):
             str(tmp_path),
             "--no-smoke",
         ],
-        load_model_fn=lambda model_name: (object(), object(), {"num_experts": 1}),
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
         load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
         observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
         prune_experts_fn=lambda *args, **kwargs: {},
@@ -418,11 +447,7 @@ def test_main_writes_failed_metrics_when_pipeline_phase_raises(tmp_path):
                 "--output-dir",
                 str(output_dir),
             ],
-            load_model_fn=lambda model_name: (
-                object(),
-                object(),
-                {"num_experts": 1, "num_experts_per_tok": 1},
-            ),
+            load_model_fn=lambda model_name: (*_moe_model_and_config(),),
             load_calibration_sequences_fn=lambda *args, **kwargs: [
                 {"input_ids": [1, 2]},
             ],

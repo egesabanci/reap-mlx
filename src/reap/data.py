@@ -6,10 +6,13 @@ The dataset dependency is imported lazily only when calibration data is loaded.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def load_calibration_sequences(
@@ -53,6 +56,12 @@ def load_calibration_sequences(
         if len(sequences) >= max_samples:
             break
 
+    if len(sequences) < max_samples:
+        logger.warning(
+            "Loaded %d calibration sequences (requested %d). "
+            "Observations will use fewer tokens than configured.",
+            len(sequences), max_samples,
+        )
     return sequences
 
 

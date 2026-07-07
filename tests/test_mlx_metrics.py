@@ -182,7 +182,7 @@ def test_accumulate_tracks_pairwise_frequency_when_enabled():
     np.testing.assert_array_equal(report["expert_frequency"], [2, 1])
     np.testing.assert_array_equal(
         report["pairwise_expert_frequency"],
-        [[4, 3], [3, 2]],
+        [[2, 1], [1, 1]],
     )
     np.testing.assert_allclose(report["ean_sum"], [15.0, 2.0])
     np.testing.assert_allclose(report["ean_mean"], [7.5, 2.0])

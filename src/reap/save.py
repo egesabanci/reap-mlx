@@ -74,7 +74,7 @@ def save_pruned_model(
         ) from exc
 
     _validate_saved_artifacts(output_path)
-    artifact_summary = _artifact_summary(output_path)
+    summary = artifact_summary(output_path)
 
     reload_started = time.perf_counter()
     reloaded_model, reloaded_tokenizer, reloaded_config = _load_reloaded_model(
@@ -83,6 +83,12 @@ def save_pruned_model(
     )
     timings["reload_seconds"] = time.perf_counter() - reload_started
 
+    # If adapter inference failed on the original model, try the reloaded model
+    if adapter is None:
+        try:
+            adapter = infer_model_adapter(reloaded_model, reloaded_config)
+        except Exception:
+            pass
     validation_started = time.perf_counter()
     _validate_reloaded_config(reloaded_config, expected_count)
     _validate_reloaded_model_shapes(
@@ -133,7 +139,7 @@ def save_pruned_model(
         smoke_result=smoke_result,
         metrics={
             "timings": timings,
-            "artifacts": artifact_summary,
+            "artifacts": summary,
             "smoke": smoke_metrics,
         },
     )
@@ -179,6 +185,11 @@ def _prepare_output_dir(output_dir: str | Path) -> Path:
     output_path = Path(output_dir)
     if output_path.exists() and not output_path.is_dir():
         raise OSError(f"Output path exists and is not a directory: {output_path}")
+    if output_path.exists():
+        # Clean stale artifacts from previous runs to avoid masking failed saves
+        for pattern in ("*.safetensors", "*.npz", "config.json"):
+            for f in output_path.glob(pattern):
+                f.unlink(missing_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
     return output_path
 
@@ -244,8 +255,14 @@ def _validate_saved_artifacts(output_dir: Path) -> None:
             f"{_WEIGHT_PATTERNS} in {output_dir}."
         )
 
+    _TOKENIZER_PATTERNS = ("tokenizer.json", "tokenizer_config.json")
+    if not any((output_dir / pattern).is_file() for pattern in _TOKENIZER_PATTERNS):
+        raise RuntimeError(
+            "Saved MLX model is missing tokenizer files matching "
+            f"{_TOKENIZER_PATTERNS} in {output_dir}."
+        )
 
-def _artifact_summary(output_dir: Path) -> dict[str, Any]:
+def artifact_summary(output_dir: Path) -> dict[str, Any]:
     files = []
     seen: set[Path] = set()
     for pattern in _WEIGHT_PATTERNS + ("*.json", "*.model", "*.txt"):
