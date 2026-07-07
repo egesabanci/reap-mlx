@@ -6,6 +6,7 @@ module import time.
 """
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping, MutableMapping
 from typing import Any
@@ -17,6 +18,8 @@ from reap.model_adapters import (
     update_lfm2_moe_config,
     update_qwen3_moe_config,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _PRUNE_METHOD_ALIASES = {
@@ -64,6 +67,7 @@ def prune_experts(
     config_num_experts: int | None = None
     config_top_k: int | None = None
 
+    total_pruned_global = 0
     for layer_idx in adapter.identify_moe_layers(model):
         if layer_idx not in observer_data:
             raise ValueError(
@@ -102,6 +106,16 @@ def prune_experts(
                 layer_idx=layer_idx,
             )
         keep_by_layer[layer_idx] = keep_indices
+        if retained_count >= layer_config.num_experts:
+            logger.warning(
+                "Layer %d compression_ratio=%s retains all %d experts "
+                "(no pruning).",
+                layer_idx,
+                compression_ratio,
+                layer_config.num_experts,
+            )
+        else:
+            total_pruned_global += layer_config.num_experts - retained_count
 
         new_top_k = min(layer_config.top_k, retained_count)
         if config_num_experts is None:
@@ -126,6 +140,13 @@ def prune_experts(
             config,
             num_experts=config_num_experts,
             top_k=config_top_k or config_num_experts,
+        )
+
+    if total_pruned_global == 0:
+        logger.warning(
+            "compression_ratio=%s resulted in zero experts being pruned "
+            "across all layers. Use a larger ratio to reduce the model.",
+            compression_ratio,
         )
 
     return keep_by_layer

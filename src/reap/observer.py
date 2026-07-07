@@ -129,7 +129,23 @@ def _observe_qwen3_model(
                 h = h + dense_mlp(moe_input)
 
             if _should_eval_layer(layer_idx, len(layers), eval_frequency):
-                eval_fn(h)
+                try:
+                    eval_fn(h)
+                except (RuntimeError, MemoryError) as eval_err:
+                    logger.warning(
+                        "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
+                        "Falling back to eval_frequency=1 for remaining layers.",
+                        layer_idx, len(layers), eval_frequency, eval_err,
+                    )
+                    eval_frequency = 1
+                    try:
+                        eval_fn(h)
+                    except (RuntimeError, MemoryError):
+                        logger.error(
+                            "eval_fn retry also failed at layer %d. Raising.",
+                            layer_idx,
+                        )
+                        raise
             if debug_memory:
                 _log_memory(mx, layer_idx)
 
@@ -187,7 +203,23 @@ def _observe_lfm2_model(
                 h = h_mid + dense_mlp(ffn_input)
 
             if _should_eval_layer(layer_idx, len(layers), eval_frequency):
-                eval_fn(h)
+                try:
+                    eval_fn(h)
+                except (RuntimeError, MemoryError) as eval_err:
+                    logger.warning(
+                        "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
+                        "Falling back to eval_frequency=1 for remaining layers.",
+                        layer_idx, len(layers), eval_frequency, eval_err,
+                    )
+                    eval_frequency = 1
+                    try:
+                        eval_fn(h)
+                    except (RuntimeError, MemoryError):
+                        logger.error(
+                            "eval_fn retry also failed at layer %d. Raising.",
+                            layer_idx,
+                        )
+                        raise
             if debug_memory:
                 _log_memory(mx, layer_idx)
 

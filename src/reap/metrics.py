@@ -124,7 +124,7 @@ class PruningState:
         self.expert_frequency += batch_frequency
         if self.pairwise_expert_frequency is not None:
             self.pairwise_expert_frequency += (
-                batch_frequency[:, None] + batch_frequency[None, :]
+                batch_frequency[:, None] * batch_frequency[None, :]
             )
 
         flat_norms = norms_array.reshape(-1).astype(np.float64, copy=False)
@@ -231,7 +231,7 @@ class PruningState:
 
         outputs_array = np.asarray(selected_outputs)
         self._validate_selected_output_shape(outputs_array, indices_array.shape)
-        return np.max(outputs_array, axis=-1).astype(np.float32, copy=False)
+        return np.max(np.abs(outputs_array), axis=-1).astype(np.float32, copy=False)
 
     def _validate_selected_stat_shape(
         self,

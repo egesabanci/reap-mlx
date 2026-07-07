@@ -82,11 +82,15 @@ def test_save_module_import_does_not_import_heavy_runtime_packages():
 
 
 class ConfigTrapModel:
+    """Mock model with minimal MoE structure for adapter inference."""
     @property
     def config(self):
         raise AssertionError("save helper must not read model.config")
 
-
+# Give it MoE-like structure so infer_model_adapter recognizes it
+ConfigTrapModel.model = SimpleNamespace(
+    layers=[SimpleNamespace(mlp=SimpleNamespace(switch_mlp=object()))],
+)
 class TinyLinear:
     def __init__(self, num_experts: int):
         self.weight = np.zeros((num_experts, 2), dtype=np.float32)
@@ -169,6 +173,7 @@ def write_required_artifacts(
         encoding="utf-8",
     )
     (output_path / "model.safetensors").write_bytes(b"weights")
+    (output_path / "tokenizer.json").write_bytes(b"{}")
 
 
 def fake_save_factory(calls, *, write_artifacts=True, save_passed_config=False):

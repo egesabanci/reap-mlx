@@ -123,6 +123,11 @@ class Qwen3MoeRouter:
                 f"top_k={self.top_k} cannot exceed num_experts={num_experts}."
             )
 
+        # Qwen3-MoE architecture uses precise softmax (`precise=True`) to match
+        # the upstream MLX-LM forward pass behavior for this architecture.
+        # The LFM2-MoE router below intentionally omits `precise` for the same reason:
+        # it mirrors that architecture's own MLX-LM forward pass.
+        # See docs/observation-and-metrics.md for full router semantics.
         gates = mx.softmax(logits, axis=-1, precise=True)
         flat_indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[
             ..., -self.top_k :
@@ -213,6 +218,9 @@ class Lfm2MoeRouter:
                 f"top_k={self.top_k} cannot exceed num_experts={num_experts}."
             )
 
+        # LFM2 architecture does NOT use precise softmax — this is intentional
+        # and matches the upstream MLX-LM LFM2 forward pass.
+        # See docs/observation-and-metrics.md for full router semantics.
         gates = mx.softmax(logits, axis=-1)
         if self.use_expert_bias:
             gates = gates + self.expert_bias

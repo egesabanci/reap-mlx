@@ -321,7 +321,10 @@ def infer_model_adapter(
     model: Any | None = None,
     config: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Infer the MLX architecture adapter from config or model layout."""
+    """Infer the MLX architecture adapter from config or model layout.
+
+    Returns ``None`` when no supported MoE architecture can be detected.
+    """
     model_type = _config_value(config, "model_type")
     architectures = _config_value(config, "architectures", default=()) or ()
     if model_type == "lfm2_moe" or any(
@@ -334,6 +337,8 @@ def infer_model_adapter(
             layers = get_model_layers(model)
         except ValueError:
             layers = ()
+
+        # Check for LFM2 MoE layers (feed_forward.switch_mlp)
         if any(
             getattr(getattr(layer, "feed_forward", None), "switch_mlp", None)
             is not None
@@ -341,7 +346,15 @@ def infer_model_adapter(
         ):
             return Lfm2MoeModelAdapter()
 
-    return Qwen3MoeModelAdapter()
+        # Check for Qwen3 MoE layers (mlp.switch_mlp)
+        if any(
+            getattr(getattr(layer, "mlp", None), "switch_mlp", None)
+            is not None
+            for layer in layers
+        ):
+            return Qwen3MoeModelAdapter()
+
+    return None
 
 
 __all__ = [
