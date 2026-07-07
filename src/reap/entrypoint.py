@@ -30,7 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="train")
     parser.add_argument("--dataset-config-name")
     parser.add_argument("--prune-method", default="reap")
-    parser.add_argument("--compression-ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--compression-ratio",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of MoE experts to prune (0 <= ratio < 1). "
+            "All MoE layers prune to the same retained expert count; "
+            "models with per-layer heterogeneous expert counts are not yet "
+            "supported. A value of 0.0 prunes zero experts (no-op)."
+        ),
+    )
     parser.add_argument(
         "--max-samples",
         "--num-calibration-sequences",

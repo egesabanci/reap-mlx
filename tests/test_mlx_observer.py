@@ -623,3 +623,28 @@ def test_observe_model_lfm2_eval_frequency_flushes_final_partial_group():
 
     assert set(observer_data) == {1}
     assert eval_calls == [(1, 2, 2), (1, 2, 2)]
+
+
+@requires_mlx
+def test_observe_model_raises_for_all_dense_non_moe_model():
+    """observe_model must fail fast with a clear error when no MoE layers exist.
+
+    This is the regression guard for #65/#67: an all-dense (non-MoE) model has no
+    observable MoE layers, so the adapter cannot be inferred. observe_model must
+    raise a ValueError rather than silently returning {} or crashing with an
+    opaque AttributeError downstream.
+    """
+    import mlx.core as mx
+
+    layers = [
+        TinyLayer(mx, TinyDenseMlp(mx)),
+        TinyLayer(mx, TinyDenseMlp(mx)),
+    ]
+    model = TinyModel(mx, layers)
+
+    with pytest.raises(ValueError, match="MoE architecture adapter"):
+        observe_model(
+            model,
+            [[0]],
+            {"num_experts": 3, "num_experts_per_tok": 1},
+        )

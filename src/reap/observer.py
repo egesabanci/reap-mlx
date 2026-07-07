@@ -39,6 +39,12 @@ def observe_model(
     mx = _require_mlx_core()
     config = {} if config is None else config
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    if adapter is None:
+        raise ValueError(
+            "Could not determine the MoE architecture adapter for this model. "
+            "observe_model requires an MoE model (Qwen3-MoE or LFM2-MoE) with at "
+            "least one MoE layer."
+        )
     eval_frequency = _validate_eval_frequency(eval_frequency)
     eval_fn = mx.eval if eval_fn is None else eval_fn
 
