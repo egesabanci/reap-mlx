@@ -255,6 +255,89 @@ def prune_experts(
     return keep_by_layer
 
 
+def apply_keep_indices(
+    model: Any,
+    config: MutableMapping[str, Any],
+    keep_by_layer: Mapping[int, Any],
+    *,
+    adapter: Any | None = None,
+) -> dict[int, np.ndarray]:
+    """Re-apply a previously computed keep_by_layer to a fresh (unpruned) model.
+
+    This is the resume path for pipeline checkpointing: it slices each MoE
+    layer's experts to the provided retained indices without re-running
+    observation or saliency. ``keep_by_layer`` must have uniform retained
+    counts because mlx-lm reload rebuilds every MoE layer from a single
+    scalar ``num_experts`` in config.
+    """
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    _validate_adapter(adapter)
+    layers = adapter.layers(model)
+    config_num_experts: int | None = None
+    config_top_k: int | None = None
+    result: dict[int, np.ndarray] = {}
+
+    for layer_idx, keep in keep_by_layer.items():
+        keep_indices = np.asarray(keep)
+        if layer_idx < 0 or layer_idx >= len(layers):
+            raise ValueError(
+                f"keep_by_layer layer index {layer_idx} is out of range "
+                f"(model has {len(layers)} layers)."
+            )
+        layer = layers[layer_idx]
+        moe = adapter.get_moe(layer)
+        if not callable(getattr(moe, "switch_mlp", None)):
+            raise ValueError(
+                f"Layer {layer_idx} is not an MoE layer; cannot apply keep "
+                "indices. Ensure the checkpoint matches the loaded model."
+            )
+        layer_config = adapter.get_layer_config(layer, config)
+        retained_count = int(len(keep_indices))
+        if adapter.adapter_name == "lfm2_moe":
+            _prune_lfm2_moe_layer(
+                moe,
+                keep_indices,
+                num_experts=layer_config.num_experts,
+                old_top_k=layer_config.top_k,
+                layer_idx=layer_idx,
+            )
+        else:
+            _prune_qwen3_moe_layer(
+                moe,
+                keep_indices,
+                num_experts=layer_config.num_experts,
+                old_top_k=layer_config.top_k,
+                layer_idx=layer_idx,
+            )
+        new_top_k = min(layer_config.top_k, retained_count)
+        if config_num_experts is None:
+            config_num_experts = retained_count
+            config_top_k = new_top_k
+        elif config_num_experts != retained_count:
+            raise ValueError(
+                "keep_by_layer has non-uniform retained counts; mlx-lm "
+                "reload requires a uniform num_experts. Layer "
+                f"{layer_idx} retains {retained_count}, expected "
+                f"{config_num_experts}."
+            )
+        else:
+            config_top_k = min(config_top_k or new_top_k, new_top_k)
+        result[layer_idx] = keep_indices
+
+    if config_num_experts is not None:
+        update_config = (
+            update_lfm2_moe_config
+            if adapter.adapter_name == "lfm2_moe"
+            else update_qwen3_moe_config
+        )
+        update_config(
+            config,
+            num_experts=config_num_experts,
+            top_k=config_top_k or config_num_experts,
+        )
+    return result
+
+
 def resolve_prune_method(prune_method: str) -> str:
     """Return the observer-data key for a supported prune method or alias."""
     resolved = _PRUNE_METHOD_ALIASES.get(prune_method, prune_method)
@@ -565,6 +648,7 @@ def _validate_first_dim(value: Any, *, field_name: str, num_experts: int) -> Non
 
 
 __all__ = [
+    "apply_keep_indices",
     "compute_keep_indices",
     "prune_experts",
     "resolve_prune_method",

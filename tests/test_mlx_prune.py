@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from reap.prune import (
+    apply_keep_indices,
     compute_keep_indices,
     prune_experts,
     resolve_prune_method,
@@ -682,3 +683,37 @@ def test_prune_experts_per_layer_ratios_unknown_index_raises():
             0.5,
             per_layer_ratios={99: 0.5},
         )
+
+
+def test_apply_keep_indices_reproduces_prune_result_on_fresh_model():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {
+        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+        1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+    }
+    keep_by_layer = prune_experts(model, config, observer_data, "reap", 0.5)
+
+    # Fresh, unpruned model + original config: re-applying the stored keep
+    # indices must reproduce the exact same sliced weights and config.
+    fresh = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    fresh_config = qwen_config(num_experts=4, top_k=3)
+    reapplied = apply_keep_indices(fresh, fresh_config, keep_by_layer)
+
+    assert set(reapplied) == {0, 1}
+    for layer_idx in (0, 1):
+        np.testing.assert_array_equal(reapplied[layer_idx], keep_by_layer[layer_idx])
+        np.testing.assert_array_equal(
+            fresh.model.layers[layer_idx].mlp.switch_mlp.gate_proj.weight,
+            model.model.layers[layer_idx].mlp.switch_mlp.gate_proj.weight,
+        )
+        assert fresh.model.layers[layer_idx].mlp.num_experts == 2
+    assert fresh_config["num_experts"] == 2
+
+
+def test_apply_keep_indices_rejects_non_moe_layer_index():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    # Layer index 5 is out of range for a 2-layer model.
+    with pytest.raises(ValueError, match="out of range"):
+        apply_keep_indices(model, config, {5: np.array([0, 1])})

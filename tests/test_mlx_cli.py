@@ -270,6 +270,8 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
     metrics_path = tmp_path / "pruned" / "validation-metrics.json"
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     assert payload["status"] == "success"
+    # A prune checkpoint is written so a failed save can be resumed.
+    assert (tmp_path / "pruned" / "reap-checkpoint.json").exists()
     assert payload["run_config"]["model_name"] == "mlx-model"
     assert payload["run_config"]["eval_frequency"] == 1
     assert payload["run_config"]["actual_sample_count"] == 1
@@ -559,4 +561,87 @@ def test_main_rejects_malformed_per_layer_ratios(tmp_path):
             print_fn=lambda message: None,
         )
     # argparse parser.error exits with code 2 on bad --per-layer-ratios format.
+    assert exc_info.value.code == 2
+
+
+def test_main_resume_skips_observe_and_prune_and_applies_checkpoint(tmp_path):
+    import numpy as np
+    from reap.checkpoint import write_checkpoint
+
+    ckpt_path = tmp_path / "reap-checkpoint.json"
+    write_checkpoint(
+        ckpt_path,
+        keep_by_layer={0: np.array([1, 3])},
+        config_before_prune={"num_experts": 4, "top_k": 3},
+        model_name="model",
+        prune_method="reap",
+        compression_ratio=0.5,
+        adapter_name="qwen3_moe",
+    )
+
+    events: list[str] = []
+    apply_calls: list[dict[int, list[int]]] = []
+
+    def fake_observe(*args, **kwargs):
+        events.append("observe")
+        return {0: {"reap": [1.0]}}
+
+    def fake_prune(*args, **kwargs):
+        events.append("prune")
+        return {0: [0, 1]}
+
+    def fake_apply(model_arg, config_arg, keep_by_layer, **kwargs):
+        del model_arg, config_arg, kwargs
+        apply_calls.append({int(k): list(v) for k, v in keep_by_layer.items()})
+        return {int(k): np.asarray(v) for k, v in keep_by_layer.items()}
+
+    def fake_save(*args, **kwargs):
+        events.append("save")
+        return SimpleNamespace(output_dir=tmp_path)
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--output-dir",
+            str(tmp_path),
+            "--resume-from-checkpoint",
+            str(ckpt_path),
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        observe_model_fn=fake_observe,
+        prune_experts_fn=fake_prune,
+        apply_keep_indices_fn=fake_apply,
+        save_pruned_model_fn=fake_save,
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    # Resume must skip observation and pruning, and only run save.
+    assert "observe" not in events
+    assert "prune" not in events
+    assert "save" in events
+    # The checkpoint keep indices were forwarded to apply_keep_indices.
+    assert apply_calls == [{0: [1, 3]}]
+
+
+def test_main_resume_requires_existing_checkpoint_file(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--model-name",
+                "model",
+                "--output-dir",
+                str(tmp_path),
+                "--resume-from-checkpoint",
+                str(tmp_path / "does-not-exist.json"),
+            ],
+            load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+            observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+            prune_experts_fn=lambda *args, **kwargs: {},
+            save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+                output_dir=tmp_path
+            ),
+            print_fn=lambda message: None,
+        )
     assert exc_info.value.code == 2
