@@ -178,9 +178,15 @@ def generation_smoke(
                 messages,
                 add_generation_prompt=True,
             )
-        except Exception:
+        except (TypeError, ValueError, KeyError, AttributeError) as chat_err:
+            # Narrow the catch so a genuinely broken tokenizer surfaces real
+            # errors instead of silently falling back to a raw prompt that
+            # masks chat-template failures. Log the exception for debuggability.
             logger.warning(
-                "Chat template application failed, using raw prompt for smoke test",
+                "Chat template application failed (%s: %s); using raw "
+                "prompt for smoke test",
+                type(chat_err).__name__,
+                chat_err,
             )
 
     return generate_fn(

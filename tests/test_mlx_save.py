@@ -574,7 +574,8 @@ def test_generation_smoke_falls_back_to_raw_prompt_when_chat_template_fails(capl
 
         def apply_chat_template(self, messages, *, add_generation_prompt):
             del messages, add_generation_prompt
-            raise RuntimeError("broken template")
+            # Realistic template-application failure (malformed template).
+            raise ValueError("broken template")
 
     def generate_fn(model, tokenizer, *, prompt, max_tokens):
         calls.append((model, tokenizer, prompt, max_tokens))
@@ -594,4 +595,24 @@ def test_generation_smoke_falls_back_to_raw_prompt_when_chat_template_fails(capl
 
     assert result == "hello"
     assert calls == [(model, tokenizer, "Who are you?", 4)]
-    assert "Chat template application failed" in caplog.text
+    # The fallback should be logged with the exception details.
+    assert any("Chat template application failed" in rec.message for rec in caplog.records)
+
+
+def test_generation_smoke_propagates_unexpected_chat_template_errors():
+    """Errors outside the narrow template-failure set must not be swallowed."""
+
+    class Tokenizer:
+        chat_template = "template"
+
+        def apply_chat_template(self, messages, *, add_generation_prompt):
+            raise OSError("tokenizer file is gone")
+
+    with pytest.raises(OSError, match="tokenizer file is gone"):
+        generation_smoke(
+            object(),
+            Tokenizer(),
+            prompt="Who are you?",
+            max_tokens=4,
+            generate_fn=lambda model, tokenizer, *, prompt, max_tokens: "hello",
+        )
