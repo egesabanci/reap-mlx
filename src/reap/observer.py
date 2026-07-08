@@ -127,7 +127,9 @@ def _observe_qwen3_model(
                     mask_fn=mask_fn,
                 )
             )
-            h = _run_attention(layer, h, mask)
+            normalized = _call_required(layer, "input_layernorm", h)
+            attention_output = _run_attention(layer, normalized, mask)
+            h = h + attention_output
             moe_input = _call_required(layer, "post_attention_layernorm", h)
 
             if layer_idx in moe_layer_indices:
@@ -396,16 +398,15 @@ def _call_mask_fn(
         return mask_fn(hidden_states, cache=None)
 
 
-def _run_attention(layer: Any, h: Any, mask: Any | None) -> Any:
-    normalized = _call_required(layer, "input_layernorm", h)
+def _run_attention(layer: Any, normalized: Any, mask: Any | None) -> Any:
+    """Run self-attention on pre-normalized hidden states, returning residual."""
     self_attn = getattr(layer, "self_attn", None)
     if not callable(self_attn):
         raise ValueError("Layer does not expose a callable self_attn module.")
-
     attention_output = self_attn(normalized, mask, cache=None)
     if isinstance(attention_output, tuple):
         attention_output = attention_output[0]
-    return h + attention_output
+    return attention_output
 
 
 def _is_lfm2_attention_layer(layer: Any) -> bool:
