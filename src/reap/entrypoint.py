@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import inspect
 import logging
 import math
@@ -197,7 +198,7 @@ def main(
 
         current_phase = "prune"
         _emit(print_fn, "prune: mutating selected experts")
-        config_before_prune = dict(config)
+        config_before_prune = copy.deepcopy(config)
         with metrics.phase("prune"):
             keep_by_layer = prune_experts_fn(
                 model,
