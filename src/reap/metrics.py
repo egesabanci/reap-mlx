@@ -157,8 +157,32 @@ class PruningState:
 
         return self
 
+    def _require_finite_accumulators(self) -> None:
+        """Raise if any accumulated statistic contains NaN or Inf.
+
+        Catching this here (per-layer, before saliency is derived) avoids
+        wasting the entire observation run only to fail later in
+        compute_keep_indices with a context-free "saliency scores must not
+        contain NaN values" error.
+        """
+        checks = {
+            "ean_sum": self.ean_sum,
+            "weighted_ean_sum": self.weighted_ean_sum,
+            "weighted_expert_frequency_sum": self.weighted_expert_frequency_sum,
+            "max_activations": self.max_activations,
+            "expert_frequency": self.expert_frequency,
+        }
+        for name, values in checks.items():
+            arr = np.asarray(values)
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(
+                    f"PruningState metric {name!r} contains non-finite "
+                    f"values (NaN/Inf): {arr.tolist()}",
+                )
+
     def report(self) -> dict[str, Any]:
         """Return pruning data compatible with the existing observer schema."""
+        self._require_finite_accumulators()
         slot_denominator = max(self.total_slots, 1)
         count_denominator = np.maximum(
             self.expert_frequency.astype(np.float64),

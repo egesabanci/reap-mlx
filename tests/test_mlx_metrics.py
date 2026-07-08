@@ -281,6 +281,22 @@ def test_never_selected_experts_report_finite_zeros():
     np.testing.assert_allclose(report["expert_proba"], [1.0, 0.0, 0.0])
 
 
+def test_report_raises_on_non_finite_accumulators():
+    state = PruningState.initialize(2)
+    # Inject NaN through the selected-output norms path; it flows into ean_sum.
+    state.accumulate(
+        indices=np.array([[0]], dtype=np.int64),
+        scores=np.array([[np.nan]], dtype=np.float32),
+        selected_output_norms=np.array([[np.nan]], dtype=np.float32),
+        selected_output_maxes=np.array([[np.inf]], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="non-finite") as excinfo:
+        state.report()
+    # The offending metric name should be surfaced in the message.
+    assert "ean_sum" in str(excinfo.value) or "weighted_ean_sum" in str(excinfo.value)
+
+
 def test_accumulate_validates_required_stats_and_shapes():
     state = PruningState.initialize(2)
 

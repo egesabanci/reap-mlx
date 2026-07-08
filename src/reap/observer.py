@@ -155,7 +155,7 @@ def _observe_qwen3_model(
             if debug_memory:
                 _log_memory(mx, layer_idx)
 
-    return {layer_idx: state.report() for layer_idx, state in accumulators.items()}
+    return _report_with_layer_guard(accumulators)
 
 
 def _observe_lfm2_model(
@@ -229,7 +229,7 @@ def _observe_lfm2_model(
             if debug_memory:
                 _log_memory(mx, layer_idx)
 
-    return {layer_idx: state.report() for layer_idx, state in accumulators.items()}
+    return _report_with_layer_guard(accumulators)
 
 
 def _require_mlx_core():
@@ -296,6 +296,16 @@ def _batch_tokens(mx: Any, sequence: Any) -> Any:
         f"got {tokens.shape}."
     )
 
+
+def _report_with_layer_guard(accumulators: dict[int, PruningState]) -> dict[int, dict]:
+    """Build observer data, surfacing NaN/Inf with the offending layer index."""
+    observer_data: dict[int, dict] = {}
+    for layer_idx, state in accumulators.items():
+        try:
+            observer_data[layer_idx] = state.report()
+        except ValueError as exc:
+            raise ValueError(f"Layer {layer_idx}: {exc}") from exc
+    return observer_data
 
 def _initialize_accumulators(
     layers: Any,
