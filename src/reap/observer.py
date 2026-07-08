@@ -433,10 +433,17 @@ def _observe_selected_moe_layer(
     saliency_scores = routing.saliency_scores
     if saliency_scores is None:
         saliency_scores = routing.scores
+    # Force evaluation of the arrays that PruningState.accumulate will
+    # convert via np.asarray. Without this, np.asarray triggers an implicit
+    # eval mid-loop -- an uncontrolled synchronization point that defeats
+    # the eval_frequency cadence and can read stale graph state.
+    saliency_scores = saliency_scores.astype(mx.float32)
+    selected_outputs = selected_outputs.astype(mx.float32)
+    mx.eval(routing.indices, saliency_scores, selected_outputs)
     state.accumulate(
         indices=routing.indices,
-        scores=saliency_scores.astype(mx.float32),
-        selected_outputs=selected_outputs.astype(mx.float32),
+        scores=saliency_scores,
+        selected_outputs=selected_outputs,
     )
 
     moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
