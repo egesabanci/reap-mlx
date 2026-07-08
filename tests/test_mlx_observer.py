@@ -649,3 +649,37 @@ def test_observe_model_raises_for_all_dense_non_moe_model():
             [[0]],
             {"num_experts": 3, "num_experts_per_tok": 1},
         )
+
+
+class BadShapeSwitchMlp:
+    """switch_mlp that returns the wrong hidden dim to exercise shape validation."""
+
+    def __init__(self, mx):
+        self.mx = mx
+
+    def __call__(self, hidden_states, indices):
+        expert_values = indices.astype(self.mx.float32)
+        # Wrong hidden dim (3 instead of the model's 2) -> shape mismatch.
+        return self.mx.stack(
+            [expert_values + 1.0, expert_values + 2.0, expert_values + 3.0],
+            axis=-1,
+        )
+
+
+@requires_mlx
+def test_observe_model_raises_when_switch_mlp_returns_wrong_shape():
+    import mlx.core as mx
+
+    moe = TinyMoeMlp(mx, top_k=1)
+    moe.switch_mlp = BadShapeSwitchMlp(mx)
+    model = TinyModel(mx, [TinyLayer(mx, moe)])
+
+    with pytest.raises(ValueError, match="switch_mlp returned shape") as excinfo:
+        observe_model(
+            model,
+            [{"input_ids": [0, 1]}],
+            {"num_experts": 3, "num_experts_per_tok": 1},
+        )
+    # The error should surface both the actual and expected shapes.
+    msg = str(excinfo.value)
+    assert "(" in msg and ")" in msg

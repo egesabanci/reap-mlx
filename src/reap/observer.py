@@ -421,6 +421,15 @@ def _observe_selected_moe_layer(
         raise ValueError("MoE layer does not expose a callable switch_mlp module.")
 
     selected_outputs = switch_mlp(moe_input, routing.indices)
+    # Validate switch_mlp output shape early so a mismatch produces a
+    # descriptive REAP error instead of an opaque downstream MLX shape error.
+    expected_shape = (*routing.indices.shape, moe_input.shape[-1])
+    if tuple(selected_outputs.shape) != tuple(expected_shape):
+        raise ValueError(
+            "switch_mlp returned shape "
+            f"{tuple(selected_outputs.shape)}, expected {tuple(expected_shape)} "
+            "(indices shape + hidden dim) for this MoE layer.",
+        )
     saliency_scores = routing.saliency_scores
     if saliency_scores is None:
         saliency_scores = routing.scores
