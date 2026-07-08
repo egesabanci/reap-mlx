@@ -616,3 +616,29 @@ def test_generation_smoke_propagates_unexpected_chat_template_errors():
             max_tokens=4,
             generate_fn=lambda model, tokenizer, *, prompt, max_tokens: "hello",
         )
+
+
+
+def test_generation_smoke_times_out_when_generate_stalls():
+    """A stalling generate_fn must be interrupted by the wall-clock timeout."""
+    import time as _time
+
+    class Tokenizer:
+        chat_template = None
+
+    def stalling_generate(model, tokenizer, *, prompt, max_tokens):
+        # Simulate a degenerate pruned model that never returns.
+        while True:
+            _time.sleep(0.01)
+
+    with pytest.raises(TimeoutError, match="generation smoke exceeded") as excinfo:
+        generation_smoke(
+            object(),
+            Tokenizer(),
+            prompt="Who are you?",
+            max_tokens=4,
+            generate_fn=stalling_generate,
+            timeout_seconds=0.2,
+        )
+    # The timeout message should surface the configured value.
+    assert "0.2" in str(excinfo.value)

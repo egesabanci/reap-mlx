@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import signal
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -163,6 +164,7 @@ def generation_smoke(
     prompt: str = "What is your name?",
     max_tokens: int = 16,
     generate_fn: Callable[..., Any] | None = None,
+    timeout_seconds: float | None = 120.0,
 ) -> Any:
     """Run a short MLX-LM generation smoke test."""
     del config
@@ -189,12 +191,38 @@ def generation_smoke(
                 chat_err,
             )
 
-    return generate_fn(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=max_tokens,
+    # Guard against a degenerate pruned model that loops or stalls: bound the
+    # generation wall-clock time. SIGALRM is Unix-only; on platforms without
+    # it the timeout is a no-op rather than a hard failure.
+    use_alarm = (
+        timeout_seconds is not None
+        and float(timeout_seconds) > 0
+        and hasattr(signal, "SIGALRM")
     )
+
+    def _run_generation() -> Any:
+        return generate_fn(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+        )
+
+    if not use_alarm:
+        return _run_generation()
+
+    def _alarm_handler(signum: int, frame: Any) -> None:
+        raise TimeoutError(
+            f"generation smoke exceeded timeout_seconds={timeout_seconds}"
+        )
+
+    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, float(timeout_seconds))
+    try:
+        return _run_generation()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def _prepare_output_dir(output_dir: str | Path) -> Path:
