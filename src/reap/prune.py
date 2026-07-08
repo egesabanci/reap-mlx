@@ -42,6 +42,48 @@ _SWITCH_PROJECTION_NAMES = ("gate_proj", "up_proj", "down_proj")
 _TOP_K_ATTRS = ("top_k", "num_experts_per_tok", "k")
 
 
+def _select_moe_layers(
+    all_moe_indices: list[int],
+    skip_layer_indices: list[int] | None,
+    prune_layer_indices: list[int] | None,
+) -> list[int]:
+    """Filter the MoE layer indices to prune.
+
+    ``prune_layer_indices`` (when truthy) restricts pruning to exactly those
+    indices; ``skip_layer_indices`` removes indices from the selection. Both
+    are validated against the adapter-discovered MoE layers. An empty/None
+    filter selects all MoE layers.
+    """
+    all_set = set(all_moe_indices)
+    if prune_layer_indices:
+        prune_set = set(prune_layer_indices)
+        invalid = prune_set - all_set
+        if invalid:
+            raise ValueError(
+                "prune_layer_indices contains non-MoE layer indices: "
+                f"{sorted(invalid)}. Available MoE layers: {sorted(all_moe_indices)}.",
+            )
+        selected = [i for i in all_moe_indices if i in prune_set]
+    else:
+        selected = list(all_moe_indices)
+    if skip_layer_indices:
+        skip_set = set(skip_layer_indices)
+        invalid_skip = skip_set - all_set
+        if invalid_skip:
+            raise ValueError(
+                "skip_layer_indices contains non-MoE layer indices: "
+                f"{sorted(invalid_skip)}. Available MoE layers: {sorted(all_moe_indices)}.",
+            )
+        selected = [i for i in selected if i not in skip_set]
+    if not selected:
+        raise ValueError(
+            "No MoE layers selected for pruning after applying "
+            "skip_layer_indices/prune_layer_indices. At least one MoE layer "
+            "must be pruned.",
+        )
+    return selected
+
+
 def prune_experts(
     model: Any,
     config: MutableMapping[str, Any],
@@ -50,6 +92,8 @@ def prune_experts(
     compression_ratio: float,
     *,
     adapter: Any | None = None,
+    skip_layer_indices: list[int] | None = None,
+    prune_layer_indices: list[int] | None = None,
 ) -> dict[int, np.ndarray]:
     """Prune adapter-discovered MLX MoE experts in place.
 
@@ -68,7 +112,12 @@ def prune_experts(
     config_top_k: int | None = None
 
     total_pruned_global = 0
-    for layer_idx in adapter.identify_moe_layers(model):
+    all_moe_indices = list(adapter.identify_moe_layers(model))
+    selected_moe_indices = _select_moe_layers(
+        all_moe_indices, skip_layer_indices, prune_layer_indices
+    )
+    selected_set = set(selected_moe_indices)
+    for layer_idx in selected_moe_indices:
         if layer_idx not in observer_data:
             raise ValueError(
                 f"Missing observer data for MoE layer {layer_idx}. "
@@ -147,6 +196,33 @@ def prune_experts(
         else:
             config_top_k = min(config_top_k or new_top_k, new_top_k)
 
+    # mlx-lm rebuilds every MoE layer from a single scalar num_experts in
+    # config, so save/reload requires a uniform expert count across ALL MoE
+    # layers (pruned and skipped). Selective pruning that leaves skipped MoE
+    # layers at a different count than the pruned retained count cannot be
+    # reloaded; fail early with an actionable message instead of letting the
+    # mismatch surface later during save/reload validation.
+    if (
+        config_num_experts is not None
+        and len(selected_moe_indices) < len(all_moe_indices)
+    ):
+        skipped_counts: dict[int, int] = {}
+        for i in all_moe_indices:
+            if i in selected_set:
+                continue
+            skipped_cfg = adapter.get_layer_config(layers[i], config)
+            if skipped_cfg.num_experts != config_num_experts:
+                skipped_counts[i] = skipped_cfg.num_experts
+        if skipped_counts:
+            raise ValueError(
+                "Selective pruning leaves MoE layers with differing expert "
+                f"counts: pruned layers retain {config_num_experts} expert(s), "
+                f"skipped layers: {skipped_counts}. mlx-lm rebuilds every MoE "
+                "layer from a single scalar num_experts in config, so "
+                "save/reload requires a uniform expert count across all MoE "
+                "layers. Either prune all MoE layers or choose a setup that "
+                "keeps a uniform count.",
+            )
     if config_num_experts is not None:
         update_config = (
             update_lfm2_moe_config

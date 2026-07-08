@@ -506,3 +506,99 @@ def test_prune_experts_clamps_lfm2_top_k_below_retained_count():
     assert moe.num_experts_per_tok == 1
     assert config["num_experts"] == 1
     assert config["num_experts_per_tok"] == 1
+
+
+def make_multi_moe_model(num_layers: int = 2, num_experts: int = 4, top_k: int = 3):
+    """Build a Qwen3-style model with several MoE layers for selective pruning tests."""
+    layers = [
+        SimpleNamespace(mlp=TinyMoe(num_experts=num_experts, top_k=top_k))
+        for _ in range(num_layers)
+    ]
+    return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+def test_prune_experts_prune_layer_indices_selecting_all_layers_works():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {
+        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+        1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+    }
+    keep_by_layer = prune_experts(
+        model,
+        config,
+        observer_data,
+        "reap",
+        0.5,
+        prune_layer_indices=[0, 1],
+    )
+    assert set(keep_by_layer) == {0, 1}
+    assert model.model.layers[0].mlp.num_experts == 2
+    assert model.model.layers[1].mlp.num_experts == 2
+    assert config["num_experts"] == 2
+
+
+def test_prune_experts_selective_subset_raises_reload_safety_guard():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {
+        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+        1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+    }
+    with pytest.raises(ValueError, match="differing expert counts"):
+        prune_experts(
+            model,
+            config,
+            observer_data,
+            "reap",
+            0.5,
+            prune_layer_indices=[0],
+        )
+
+
+def test_prune_experts_skip_layer_indices_raises_reload_safety_guard():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {
+        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+        1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+    }
+    with pytest.raises(ValueError, match="differing expert counts"):
+        prune_experts(
+            model,
+            config,
+            observer_data,
+            "reap",
+            0.5,
+            skip_layer_indices=[1],
+        )
+
+
+def test_prune_experts_rejects_invalid_prune_layer_index():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}}
+    with pytest.raises(ValueError, match="non-MoE layer indices"):
+        prune_experts(
+            model,
+            config,
+            observer_data,
+            "reap",
+            0.5,
+            prune_layer_indices=[0, 99],
+        )
+
+
+def test_prune_experts_rejects_invalid_skip_layer_index():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}}
+    with pytest.raises(ValueError, match="non-MoE layer indices"):
+        prune_experts(
+            model,
+            config,
+            observer_data,
+            "reap",
+            0.5,
+            skip_layer_indices=[99],
+        )

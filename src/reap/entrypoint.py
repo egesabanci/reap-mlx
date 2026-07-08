@@ -43,6 +43,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--skip-layer-indices",
+        nargs="*",
+        type=int,
+        default=None,
+        help=(
+            "MoE layer indices to skip during pruning (default: none). "
+            "NOTE: mlx-lm reloads require a uniform expert count across all "
+            "MoE layers, so skipping layers that would keep a different count "
+            "than the pruned layers is not save/reload-safe and will raise."
+        ),
+    )
+    parser.add_argument(
+        "--prune-layer-indices",
+        nargs="*",
+        type=int,
+        default=None,
+        help=(
+            "Specific MoE layer indices to prune (default: all). "
+            "Indices not present in the adapter's MoE layers raise an error."
+        ),
+    )
+    parser.add_argument(
         "--max-samples",
         "--num-calibration-sequences",
         dest="max_samples",
@@ -206,6 +228,8 @@ def main(
                 observer_data,
                 args.prune_method,
                 args.compression_ratio,
+                skip_layer_indices=args.skip_layer_indices,
+                prune_layer_indices=args.prune_layer_indices,
             )
         metrics.record_pruning(
             keep_by_layer,
