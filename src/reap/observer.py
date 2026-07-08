@@ -107,6 +107,11 @@ def _observe_qwen3_model(
         eval_frequency = requested_eval_frequency
         tokens = _batch_tokens(mx, sequence)
         h = embed_tokens(tokens)
+        # Compute the attention mask once and reuse it across all layers.
+        # This assumes a static causal mask that depends only on sequence length,
+        # not on hidden-state values. Decoder-only models (Qwen3-MoE, LFM2-MoE)
+        # satisfy this; future model adapters with layer-specific or dynamic masks
+        # must compute masks per-layer instead.
         default_mask = (
             _attention_mask(
                 h,
