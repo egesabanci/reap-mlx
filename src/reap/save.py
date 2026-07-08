@@ -186,8 +186,21 @@ def _prepare_output_dir(output_dir: str | Path) -> Path:
     if output_path.exists() and not output_path.is_dir():
         raise OSError(f"Output path exists and is not a directory: {output_path}")
     if output_path.exists():
-        # Clean stale artifacts from previous runs to avoid masking failed saves
-        for pattern in ("*.safetensors", "*.npz", "config.json"):
+        # Clean stale artifacts from previous runs to avoid masking failed saves.
+        # Tokenizer files are included so that pruning a *different* model into the
+        # same output directory cannot leave an incompatible (stale) tokenizer behind.
+        for pattern in (
+            "*.safetensors",
+            "*.npz",
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "tokenizer.model",
+            "special_tokens_map.json",
+            "added_tokens.json",
+            "merges.txt",
+            "vocab.json",
+        ):
             for f in output_path.glob(pattern):
                 f.unlink(missing_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
