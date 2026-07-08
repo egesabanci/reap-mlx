@@ -100,84 +100,99 @@ def _observe_qwen3_model(
         config=config,
     )
 
-    for sequence in calibration_sequences:
-        # Reset to the requested cadence for each sequence so a transient
-        # eval failure in one sequence does not permanently downgrade the
-        # whole run to eval_frequency=1.
-        eval_frequency = requested_eval_frequency
-        tokens = _batch_tokens(mx, sequence)
-        h = embed_tokens(tokens)
-        # Compute the attention mask once and reuse it across all layers.
-        # This assumes a static causal mask that depends only on sequence length,
-        # not on hidden-state values. Decoder-only models (Qwen3-MoE, LFM2-MoE)
-        # satisfy this; future model adapters with layer-specific or dynamic masks
-        # must compute masks per-layer instead.
-        default_mask = (
-            _attention_mask(
-                h,
-                sequence_length=tokens.shape[-1],
-                mask_fn=None,
-            )
-            if mask_fn is None
-            else None
-        )
-
-        for layer_idx, layer in enumerate(layers):
-            mask = (
-                default_mask
-                if mask_fn is None
-                else _attention_mask(
+    for seq_idx, sequence in enumerate(calibration_sequences):
+        try:
+            # Reset to the requested cadence for each sequence so a transient
+            # eval failure in one sequence does not permanently downgrade the
+            # whole run to eval_frequency=1.
+            eval_frequency = requested_eval_frequency
+            tokens = _batch_tokens(mx, sequence)
+            h = embed_tokens(tokens)
+            # Compute the attention mask once and reuse it across all layers.
+            # This assumes a static causal mask that depends only on sequence length,
+            # not on hidden-state values. Decoder-only models (Qwen3-MoE, LFM2-MoE)
+            # satisfy this; future model adapters with layer-specific or dynamic masks
+            # must compute masks per-layer instead.
+            default_mask = (
+                _attention_mask(
                     h,
                     sequence_length=tokens.shape[-1],
-                    mask_fn=mask_fn,
+                    mask_fn=None,
                 )
+                if mask_fn is None
+                else None
             )
-            normalized = _call_required(layer, "input_layernorm", h)
-            attention_output = _run_attention(layer, normalized, mask)
-            h = h + attention_output
-            moe_input = _call_required(layer, "post_attention_layernorm", h)
 
-            if layer_idx in moe_layer_indices:
-                h = h + _observe_selected_moe_layer(
-                    layer,
-                    moe_input,
-                    accumulators[layer_idx],
-                    adapter=adapter,
-                    config=config,
-                    router_cls=Qwen3MoeRouter,
-                )
-            else:
-                dense_mlp = adapter.get_dense_mlp(layer)
-                h = h + dense_mlp(moe_input)
-
-            if _should_eval_layer(layer_idx, len(layers), eval_frequency):
-                try:
-                    eval_fn(h)
-                except (RuntimeError, MemoryError) as eval_err:
-                    logger.warning(
-                        "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
-                        "Falling back to eval_frequency=1 for remaining layers.",
-                        layer_idx, len(layers), eval_frequency, eval_err,
+            for layer_idx, layer in enumerate(layers):
+                mask = (
+                    default_mask
+                    if mask_fn is None
+                    else _attention_mask(
+                        h,
+                        sequence_length=tokens.shape[-1],
+                        mask_fn=mask_fn,
                     )
-                    # Surface the fallback to the user (logging may be quiet
-                    # without --verbose) so the performance regression is visible.
-                    if print_fn is not None:
-                        print_fn(
-                            f"[reap-mlx] observe: eval_fn failed at layer "
-                            f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
-                            "falling back to eval_frequency=1 for this sequence.",
-                        )
-                    eval_frequency = 1
+                )
+                normalized = _call_required(layer, "input_layernorm", h)
+                attention_output = _run_attention(layer, normalized, mask)
+                h = h + attention_output
+                moe_input = _call_required(layer, "post_attention_layernorm", h)
+
+                if layer_idx in moe_layer_indices:
+                    h = h + _observe_selected_moe_layer(
+                        layer,
+                        moe_input,
+                        accumulators[layer_idx],
+                        adapter=adapter,
+                        config=config,
+                        router_cls=Qwen3MoeRouter,
+                    )
+                else:
+                    dense_mlp = adapter.get_dense_mlp(layer)
+                    h = h + dense_mlp(moe_input)
+
+                if _should_eval_layer(layer_idx, len(layers), eval_frequency):
                     try:
                         eval_fn(h)
-                    except (RuntimeError, MemoryError):
-                        logger.error(
-                            "eval_fn retry also failed at layer %d. Raising.",
-                            layer_idx,
+                    except (RuntimeError, MemoryError) as eval_err:
+                        logger.warning(
+                            "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
+                            "Falling back to eval_frequency=1 for remaining layers.",
+                            layer_idx, len(layers), eval_frequency, eval_err,
                         )
-                        raise
-            if debug_memory:
-                _log_memory(mx, layer_idx)
+                        # Surface the fallback to the user (logging may be quiet
+                        # without --verbose) so the performance regression is visible.
+                        if print_fn is not None:
+                            print_fn(
+                                f"[reap-mlx] observe: eval_fn failed at layer "
+                                f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
+                                "falling back to eval_frequency=1 for this sequence.",
+                            )
+                        eval_frequency = 1
+                        try:
+                            eval_fn(h)
+                        except (RuntimeError, MemoryError):
+                            logger.error(
+                                "eval_fn retry also failed at layer %d. Raising.",
+                                layer_idx,
+                            )
+                            raise
+                if debug_memory:
+                    _log_memory(mx, layer_idx)
+        except MemoryError:
+            logger.warning(
+                "MemoryError processing sequence %d/%d. "
+                "Skipping remaining sequences (%d processed). "
+                "Observer data collected so far is retained.",
+                seq_idx + 1, len(calibration_sequences), seq_idx,
+            )
+            if print_fn is not None:
+                print_fn(
+                    f"[reap-mlx] observe: out of memory at sequence "
+                    f"{seq_idx + 1}/{len(calibration_sequences)}; "
+                    f"salvaging {seq_idx} processed sequence(s)."
+                )
+            break
 
     return _report_with_layer_guard(accumulators)
 
@@ -207,65 +222,81 @@ def _observe_lfm2_model(
         config=config,
     )
 
-    for sequence in calibration_sequences:
-        # Reset to the requested cadence for each sequence so a transient
-        # eval failure in one sequence does not permanently downgrade the
-        # whole run to eval_frequency=1.
-        eval_frequency = requested_eval_frequency
-        tokens = _batch_tokens(mx, sequence)
-        h = embed_tokens(tokens)
-        attn_mask, conv_mask = _lfm2_masks(
-            h,
-            sequence_length=tokens.shape[-1],
-            mask_fn=mask_fn,
-        )
+    for seq_idx, sequence in enumerate(calibration_sequences):
+        try:
+            # Reset to the requested cadence for each sequence so a transient
+            # eval failure in one sequence does not permanently downgrade the
+            # whole run to eval_frequency=1.
+            eval_frequency = requested_eval_frequency
+            tokens = _batch_tokens(mx, sequence)
+            h = embed_tokens(tokens)
+            attn_mask, conv_mask = _lfm2_masks(
+                h,
+                sequence_length=tokens.shape[-1],
+                mask_fn=mask_fn,
+            )
 
-        for layer_idx, layer in enumerate(layers):
-            operator_mask = attn_mask if _is_lfm2_attention_layer(layer) else conv_mask
-            h_mid = _run_lfm2_operator(layer, h, operator_mask)
-            ffn_input = _call_required(layer, "ffn_norm", h_mid)
+            for layer_idx, layer in enumerate(layers):
+                operator_mask = attn_mask if _is_lfm2_attention_layer(layer) else conv_mask
+                h_mid = _run_lfm2_operator(layer, h, operator_mask)
+                ffn_input = _call_required(layer, "ffn_norm", h_mid)
 
-            if layer_idx in moe_layer_indices:
-                h = h_mid + _observe_selected_moe_layer(
-                    layer,
-                    ffn_input,
-                    accumulators[layer_idx],
-                    adapter=adapter,
-                    config=config,
-                    router_cls=Lfm2MoeRouter,
-                )
-            else:
-                dense_mlp = adapter.get_dense_mlp(layer)
-                h = h_mid + dense_mlp(ffn_input)
-
-            if _should_eval_layer(layer_idx, len(layers), eval_frequency):
-                try:
-                    eval_fn(h)
-                except (RuntimeError, MemoryError) as eval_err:
-                    logger.warning(
-                        "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
-                        "Falling back to eval_frequency=1 for remaining layers.",
-                        layer_idx, len(layers), eval_frequency, eval_err,
+                if layer_idx in moe_layer_indices:
+                    h = h_mid + _observe_selected_moe_layer(
+                        layer,
+                        ffn_input,
+                        accumulators[layer_idx],
+                        adapter=adapter,
+                        config=config,
+                        router_cls=Lfm2MoeRouter,
                     )
-                    # Surface the fallback to the user (logging may be quiet
-                    # without --verbose) so the performance regression is visible.
-                    if print_fn is not None:
-                        print_fn(
-                            f"[reap-mlx] observe: eval_fn failed at layer "
-                            f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
-                            "falling back to eval_frequency=1 for this sequence.",
-                        )
-                    eval_frequency = 1
+                else:
+                    dense_mlp = adapter.get_dense_mlp(layer)
+                    h = h_mid + dense_mlp(ffn_input)
+
+                if _should_eval_layer(layer_idx, len(layers), eval_frequency):
                     try:
                         eval_fn(h)
-                    except (RuntimeError, MemoryError):
-                        logger.error(
-                            "eval_fn retry also failed at layer %d. Raising.",
-                            layer_idx,
+                    except (RuntimeError, MemoryError) as eval_err:
+                        logger.warning(
+                            "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
+                            "Falling back to eval_frequency=1 for remaining layers.",
+                            layer_idx, len(layers), eval_frequency, eval_err,
                         )
-                        raise
-            if debug_memory:
-                _log_memory(mx, layer_idx)
+                        # Surface the fallback to the user (logging may be quiet
+                        # without --verbose) so the performance regression is visible.
+                        if print_fn is not None:
+                            print_fn(
+                                f"[reap-mlx] observe: eval_fn failed at layer "
+                                f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
+                                "falling back to eval_frequency=1 for this sequence.",
+                            )
+                        eval_frequency = 1
+                        try:
+                            eval_fn(h)
+                        except (RuntimeError, MemoryError):
+                            logger.error(
+                                "eval_fn retry also failed at layer %d. Raising.",
+                                layer_idx,
+                            )
+                            raise
+                if debug_memory:
+                    _log_memory(mx, layer_idx)
+        except MemoryError:
+            logger.warning(
+                "MemoryError processing sequence %d/%d. "
+                "Skipping remaining sequences (%d processed). "
+                "Observer data collected so far is retained.",
+                seq_idx + 1, len(calibration_sequences), seq_idx,
+            )
+            if print_fn is not None:
+                print_fn(
+                    f"[reap-mlx] observe: out of memory at sequence "
+                    f"{seq_idx + 1}/{len(calibration_sequences)}; "
+                    f"salvaging {seq_idx} processed sequence(s)."
+                )
+            break
+
 
     return _report_with_layer_guard(accumulators)
 

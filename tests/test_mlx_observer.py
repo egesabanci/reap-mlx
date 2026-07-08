@@ -724,3 +724,44 @@ def test_observe_model_raises_when_switch_mlp_returns_wrong_shape():
     # The error should surface both the actual and expected shapes.
     msg = str(excinfo.value)
     assert "(" in msg and ")" in msg
+
+
+class FlakyEmbed:
+    """embed_tokens that raises MemoryError after the first successful call."""
+
+    def __init__(self, mx):
+        self.mx = mx
+        self.calls = 0
+
+    def __call__(self, tokens):
+        self.calls += 1
+        if self.calls > 1:
+            raise MemoryError("simulated OOM on second sequence")
+        token_values = tokens.astype(self.mx.float32)
+        return self.mx.stack([token_values, token_values + 1.0], axis=-1)
+
+
+@requires_mlx
+def test_observe_model_salvages_data_on_memory_error():
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, TinyMoeMlp(mx, top_k=1))])
+    flaky = FlakyEmbed(mx)
+    model.model.embed_tokens = flaky
+
+    messages: list[str] = []
+    observer_data = observe_model(
+        model,
+        [{"input_ids": [0, 1]}, {"input_ids": [2, 3]}],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+        print_fn=messages.append,
+    )
+
+    # First sequence processed; second triggered MemoryError and was skipped.
+    assert flaky.calls == 2
+    assert set(observer_data) == {0}
+    report = observer_data[0]
+    assert set(report) == EXPECTED_PRUNING_KEYS
+    assert report["total_tokens"] == 2
+    # A user-visible salvage notice was emitted.
+    assert any("out of memory" in m for m in messages)
