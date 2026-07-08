@@ -110,6 +110,11 @@ def update_qwen3_moe_config(
     top_k: int,
 ) -> MutableMapping[str, Any]:
     """Update a Qwen3-MoE config dict after expert pruning."""
+    if not isinstance(config, MutableMapping):
+        raise TypeError(
+            f"Config must be a mutable mapping, got {type(config).__name__}. "
+            "Pruning requires in-place config mutation.",
+        )
     num_experts = _positive_int(num_experts, "num_experts")
     top_k = min(_positive_int(top_k, "top_k"), num_experts)
 
