@@ -268,11 +268,22 @@ def _validate_saved_artifacts(output_dir: Path) -> None:
             f"{_WEIGHT_PATTERNS} in {output_dir}."
         )
 
-    _TOKENIZER_PATTERNS = ("tokenizer.json", "tokenizer_config.json")
+    _TOKENIZER_PATTERNS = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "tokenizer.model",
+        "vocab.json",
+        "merges.txt",
+    )
     if not any((output_dir / pattern).is_file() for pattern in _TOKENIZER_PATTERNS):
-        raise RuntimeError(
-            "Saved MLX model is missing tokenizer files matching "
-            f"{_TOKENIZER_PATTERNS} in {output_dir}."
+        # Some valid MLX-LM saves (e.g. SentencePiece or BPE-only tokenizers) ship
+        # without tokenizer.json/tokenizer_config.json. A hard failure here would
+        # reject a perfectly good save, so warn and let the reload step decide.
+        logger.warning(
+            "Saved MLX model in %s has no files matching %s; reload may fail "
+            "if the tokenizer is unavailable via the Hugging Face Hub.",
+            output_dir,
+            _TOKENIZER_PATTERNS,
         )
 
 def artifact_summary(output_dir: Path) -> dict[str, Any]:
