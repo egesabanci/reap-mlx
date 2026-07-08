@@ -76,6 +76,15 @@ def prune_experts(
             )
 
         layer = layers[layer_idx]
+        moe = adapter.get_moe(layer)
+        # Structural integrity: ensure the MoE module at this position still has
+        # a callable switch_mlp, guarding against model mutation between the
+        # observe and prune phases (which would silently use wrong metrics).
+        if not callable(getattr(moe, "switch_mlp", None)):
+            raise ValueError(
+                f"MoE layer {layer_idx} no longer has a callable switch_mlp. "
+                "The model may have been modified between observation and pruning.",
+            )
         layer_config = adapter.get_layer_config(layer, config)
         retained_count = _retained_expert_count(
             layer_config.num_experts,
