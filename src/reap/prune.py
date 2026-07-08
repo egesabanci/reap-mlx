@@ -90,6 +90,14 @@ def prune_experts(
             layer_config.num_experts,
             compression_ratio,
         )
+        if retained_count <= 2:
+            logger.warning(
+                "Layer %d: compression_ratio=%.2f retains %d/%d experts. "
+                "With fewer than 3 experts the model may lose effective "
+                "MoE routing diversity.",
+                layer_idx, compression_ratio, retained_count,
+                layer_config.num_experts,
+            )
         saliency = _saliency_scores(
             observer_data[layer_idx],
             prune_method,
