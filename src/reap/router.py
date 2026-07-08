@@ -215,51 +215,52 @@ class Lfm2MoeRouter:
             raise ValueError(
                 "Lfm2MoeRouter expects hidden states with shape "
                 "[tokens, hidden] or [batch, seq, hidden], got "
-                f"{hidden_states.shape}."
+                f"{hidden_states.shape}.",
             )
 
-        logits = self.gate(hidden_states).astype(mx.float32)
+        # Flatten to 2D for the gate (consistent with Qwen3MoeRouter).
+        leading_shape = hidden_states.shape[:-1]
+        hidden_size = hidden_states.shape[-1]
+        flat_hidden_states = hidden_states.reshape(-1, hidden_size)
+
+        logits = self.gate(flat_hidden_states).astype(mx.float32)
         num_experts = logits.shape[-1]
         if self.top_k > num_experts:
             raise ValueError(
-                f"top_k={self.top_k} cannot exceed num_experts={num_experts}."
+                f"top_k={self.top_k} cannot exceed num_experts={num_experts}.",
             )
 
-        # LFM2 architecture does NOT use precise softmax — this is intentional
-        # and matches the upstream MLX-LM LFM2 forward pass.
-        # See docs/observation-and-metrics.md for full router semantics.
+        # LFM2 architecture does NOT use precise softmax \xe2\x80\x94 intentional
         gates = mx.softmax(logits, axis=-1)
         if self.use_expert_bias:
             gates = gates + self.expert_bias
 
-        indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
-        scores = mx.take_along_axis(gates, indices, axis=-1)
+        flat_indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]
+        flat_scores = mx.take_along_axis(gates, flat_indices, axis=-1)
         if self.norm_topk_prob:
-            scores = scores / (
-                mx.sum(scores, axis=-1, keepdims=True) + _NORM_EPSILON
+            flat_scores = flat_scores / (
+                mx.sum(flat_scores, axis=-1, keepdims=True) + _NORM_EPSILON
             )
-        scores = scores.astype(hidden_states.dtype)
+        scores = flat_scores.astype(hidden_states.dtype)
 
-        # Saliency scores use the *pure* softmax probabilities (before
-        # expert_bias) so REAP weighting reflects routing probability rather
-        # than additive bias. Bias can drive scores negative or above 1.0 and
-        # would otherwise distort expert ranking even when activations are
-        # high. The same indices and (optional) norm_topk_prob normalization
-        # are applied to keep saliency consistent with routing geometry.
+        # Saliency scores: pure softmax before expert_bias
         pure_gates = mx.softmax(logits, axis=-1)
-        saliency_scores = mx.take_along_axis(pure_gates, indices, axis=-1)
+        pure_flat_scores = mx.take_along_axis(pure_gates, flat_indices, axis=-1)
         if self.norm_topk_prob:
-            saliency_scores = saliency_scores / (
-                mx.sum(saliency_scores, axis=-1, keepdims=True) + _NORM_EPSILON
+            pure_flat_scores = pure_flat_scores / (
+                mx.sum(pure_flat_scores, axis=-1, keepdims=True) + _NORM_EPSILON
             )
-        saliency_scores = saliency_scores.astype(hidden_states.dtype)
+        saliency_scores = pure_flat_scores.astype(hidden_states.dtype)
 
+        output_shape = (*leading_shape, self.top_k)
         return RouterResult(
-            indices=indices,
-            scores=scores,
+            indices=flat_indices.reshape(output_shape),
+            scores=scores.reshape(output_shape),
             logits=None,
             score_mode="actual",
-            saliency_scores=saliency_scores,
+            saliency_scores=saliency_scores.reshape(output_shape),
         )
 
 
