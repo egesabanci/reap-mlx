@@ -183,10 +183,11 @@ def test_accumulate_tracks_pairwise_frequency_when_enabled():
 
     report = state.report()
     assert report["total_tokens"] == 3
+    assert report["total_slots"] == 3
     np.testing.assert_array_equal(report["expert_frequency"], [2, 1])
     np.testing.assert_array_equal(
         report["pairwise_expert_frequency"],
-        [[2, 1], [1, 1]],
+        [[2, 0], [0, 1]],
     )
     np.testing.assert_allclose(report["ean_sum"], [15.0, 2.0])
     np.testing.assert_allclose(report["ean_mean"], [7.5, 2.0])
@@ -197,6 +198,32 @@ def test_accumulate_tracks_pairwise_frequency_when_enabled():
     )
     np.testing.assert_allclose(report["reap"], [4.0, 1.4])
     np.testing.assert_allclose(report["max_activations"], [8.0, 9.0])
+
+def test_pairwise_frequency_counts_per_token_cooccurrence_for_topk_gt_one():
+    # Two tokens, top_k=2:
+    #   token 0 selects experts {0, 1}
+    #   token 1 selects experts {0, 2}
+    # Per-token co-occurrence:
+    #   (0,0)=2 (both tokens), (0,1)=1 (token 0), (0,2)=1 (token 1),
+    #   (1,1)=1, (1,2)=0, (2,2)=1. The batch-level outer product would have
+    #   instead produced frequency=[2,1,1] outer itself = [[4,2,2],[2,1,1],[2,1,1]].
+    state = PruningState.initialize(3, track_pairwise=True)
+
+    state.accumulate(
+        indices=np.array([[0, 1], [0, 2]], dtype=np.int64),
+        scores=np.array([[0.6, 0.4], [0.7, 0.3]], dtype=np.float32),
+        selected_output_norms=np.array([[5.0, 2.0], [3.0, 1.0]], dtype=np.float32),
+        selected_output_maxes=np.array([[4.0, 1.0], [2.0, 0.5]], dtype=np.float32),
+    )
+
+    report = state.report()
+    assert report["total_tokens"] == 2
+    assert report["total_slots"] == 4
+    np.testing.assert_array_equal(report["expert_frequency"], [2, 1, 1])
+    np.testing.assert_array_equal(
+        report["pairwise_expert_frequency"],
+        [[2, 1, 1], [1, 1, 0], [1, 0, 1]],
+    )
 
 
 def test_accumulate_accepts_router_result():

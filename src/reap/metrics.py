@@ -131,9 +131,20 @@ class PruningState:
         self.total_slots += slot_count
         self.expert_frequency += batch_frequency
         if self.pairwise_expert_frequency is not None:
-            self.pairwise_expert_frequency += (
-                batch_frequency[:, None] * batch_frequency[None, :]
+            # Per-token co-occurrence: count how often experts i and j are
+            # selected for the SAME token. A batch-level outer product of
+            # bincount frequencies would inflate co-occurrence for experts
+            # selected on different tokens, so build a per-token one-hot
+            # matrix and accumulate one_hot.T @ one_hot instead.
+            top_k = indices_array.shape[-1]
+            per_token = indices_array.reshape(token_count, top_k)
+            one_hot = np.zeros((token_count, self.num_experts), dtype=np.int64)
+            np.add.at(
+                one_hot,
+                (np.arange(token_count)[:, None], per_token),
+                1,
             )
+            self.pairwise_expert_frequency += one_hot.T @ one_hot
 
         flat_norms = norms_array.reshape(-1).astype(np.float64, copy=False)
         flat_scores = scores_array.reshape(-1)
