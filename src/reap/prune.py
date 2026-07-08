@@ -199,7 +199,6 @@ def slice_first_dim(
     Returns ``True`` if at least one field was sliced.
     """
     sliced_any = False
-    keep_list = _keep_list(keep_indices)
 
     for field_name in field_names:
         value = _get_module_value(module, field_name)
@@ -210,7 +209,10 @@ def slice_first_dim(
             field_name=field_name,
             num_experts=num_experts,
         )
-        _set_module_value(module, field_name, value[keep_list])
+        # Use np.take for broader compatibility (MLX arrays, NumPy arrays, lists)
+        # instead of Python list indexing which may fail on quantized or
+        # custom array types.
+        _set_module_value(module, field_name, np.take(value, keep_indices, axis=0))
         sliced_any = True
 
     if required and not sliced_any:
@@ -444,7 +446,7 @@ def _slice_value_first_dim(
     field_name: str,
 ) -> Any:
     _validate_first_dim(value, field_name=field_name, num_experts=num_experts)
-    return value[_keep_list(keep_indices)]
+    return np.take(value, keep_indices, axis=0)
 
 
 def _validate_first_dim(value: Any, *, field_name: str, num_experts: int) -> None:
@@ -457,9 +459,6 @@ def _validate_first_dim(value: Any, *, field_name: str, num_experts: int) -> Non
             f"got shape {shape}."
         )
 
-
-def _keep_list(keep_indices: np.ndarray) -> list[int]:
-    return [int(idx) for idx in np.asarray(keep_indices, dtype=np.int64).tolist()]
 
 
 __all__ = [
