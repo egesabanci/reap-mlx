@@ -84,6 +84,17 @@ def _select_moe_layers(
     return selected
 
 
+def _layer_ratio(
+    layer_idx: int,
+    per_layer_ratios: dict[int, float] | None,
+    compression_ratio: float,
+) -> float:
+    """Return the compression ratio for a layer, preferring a per-layer override."""
+    if per_layer_ratios:
+        return per_layer_ratios.get(layer_idx, compression_ratio)
+    return compression_ratio
+
+
 def prune_experts(
     model: Any,
     config: MutableMapping[str, Any],
@@ -94,6 +105,7 @@ def prune_experts(
     adapter: Any | None = None,
     skip_layer_indices: list[int] | None = None,
     prune_layer_indices: list[int] | None = None,
+    per_layer_ratios: dict[int, float] | None = None,
 ) -> dict[int, np.ndarray]:
     """Prune adapter-discovered MLX MoE experts in place.
 
@@ -117,6 +129,36 @@ def prune_experts(
         all_moe_indices, skip_layer_indices, prune_layer_indices
     )
     selected_set = set(selected_moe_indices)
+    # Validate per-layer ratios and pre-check reload safety up front. mlx-lm
+    # rebuilds every MoE layer from a single scalar num_experts in config, so
+    # save/reload requires a uniform expert count across ALL MoE layers (pruned
+    # and skipped). Computing the final count per MoE layer before the loop
+    # lets us fail BEFORE any weights are sliced, avoiding a half-pruned model.
+    if per_layer_ratios:
+        unknown = set(per_layer_ratios) - set(all_moe_indices)
+        if unknown:
+            raise ValueError(
+                "per_layer_ratios contains non-MoE layer indices: "
+                f"{sorted(unknown)}. Available MoE layers: {sorted(all_moe_indices)}.",
+            )
+        for _r in per_layer_ratios.values():
+            _validate_compression_ratio(_r)
+    final_counts: dict[int, int] = {}
+    for _i in all_moe_indices:
+        _layer_cfg = adapter.get_layer_config(layers[_i], config)
+        if _i in selected_set:
+            _ratio_i = _layer_ratio(_i, per_layer_ratios, compression_ratio)
+            final_counts[_i] = _retained_expert_count(_layer_cfg.num_experts, _ratio_i)
+        else:
+            final_counts[_i] = _layer_cfg.num_experts
+    if len(set(final_counts.values())) > 1:
+        raise ValueError(
+            "Pruning would leave MoE layers with differing expert counts "
+            f"({final_counts}). mlx-lm rebuilds every MoE layer from a single "
+            "scalar num_experts in config, so save/reload requires a uniform "
+            "expert count across all MoE layers. Use uniform ratios or prune "
+            "all layers."
+        )
     for layer_idx in selected_moe_indices:
         if layer_idx not in observer_data:
             raise ValueError(
@@ -135,16 +177,17 @@ def prune_experts(
                 "The model may have been modified between observation and pruning.",
             )
         layer_config = adapter.get_layer_config(layer, config)
+        layer_ratio = _layer_ratio(layer_idx, per_layer_ratios, compression_ratio)
         retained_count = _retained_expert_count(
             layer_config.num_experts,
-            compression_ratio,
+            layer_ratio,
         )
         if retained_count <= 2:
             logger.warning(
                 "Layer %d: compression_ratio=%.2f retains %d/%d experts. "
                 "With fewer than 3 experts the model may lose effective "
                 "MoE routing diversity.",
-                layer_idx, compression_ratio, retained_count,
+                layer_idx, layer_ratio, retained_count,
                 layer_config.num_experts,
             )
         saliency = _saliency_scores(
@@ -177,7 +220,7 @@ def prune_experts(
                 "Layer %d compression_ratio=%s retains all %d experts "
                 "(no pruning).",
                 layer_idx,
-                compression_ratio,
+                layer_ratio,
                 layer_config.num_experts,
             )
         else:
@@ -187,42 +230,9 @@ def prune_experts(
         if config_num_experts is None:
             config_num_experts = retained_count
             config_top_k = new_top_k
-        elif config_num_experts != retained_count:
-            raise ValueError(
-                "MLX MoE config update requires all pruned layers to retain "
-                f"the same expert count. Layer {layer_idx} retained "
-                f"{retained_count}, expected {config_num_experts}."
-            )
         else:
             config_top_k = min(config_top_k or new_top_k, new_top_k)
 
-    # mlx-lm rebuilds every MoE layer from a single scalar num_experts in
-    # config, so save/reload requires a uniform expert count across ALL MoE
-    # layers (pruned and skipped). Selective pruning that leaves skipped MoE
-    # layers at a different count than the pruned retained count cannot be
-    # reloaded; fail early with an actionable message instead of letting the
-    # mismatch surface later during save/reload validation.
-    if (
-        config_num_experts is not None
-        and len(selected_moe_indices) < len(all_moe_indices)
-    ):
-        skipped_counts: dict[int, int] = {}
-        for i in all_moe_indices:
-            if i in selected_set:
-                continue
-            skipped_cfg = adapter.get_layer_config(layers[i], config)
-            if skipped_cfg.num_experts != config_num_experts:
-                skipped_counts[i] = skipped_cfg.num_experts
-        if skipped_counts:
-            raise ValueError(
-                "Selective pruning leaves MoE layers with differing expert "
-                f"counts: pruned layers retain {config_num_experts} expert(s), "
-                f"skipped layers: {skipped_counts}. mlx-lm rebuilds every MoE "
-                "layer from a single scalar num_experts in config, so "
-                "save/reload requires a uniform expert count across all MoE "
-                "layers. Either prune all MoE layers or choose a setup that "
-                "keeps a uniform count.",
-            )
     if config_num_experts is not None:
         update_config = (
             update_lfm2_moe_config

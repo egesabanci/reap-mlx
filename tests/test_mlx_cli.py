@@ -500,3 +500,63 @@ def test_main_passes_layer_selection_flags_to_prune(tmp_path):
     assert code == 0
     assert prune_kwargs["prune_layer_indices"] == [0]
     assert prune_kwargs["skip_layer_indices"] == [3]
+
+
+def test_main_passes_per_layer_ratios_to_prune(tmp_path):
+    prune_kwargs = {}
+
+    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
+        del model_arg, config_arg, observer_data, method, ratio
+        prune_kwargs.update(kwargs)
+        return {0: [0, 1, 2]}
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--output-dir",
+            str(tmp_path),
+            "--per-layer-ratios",
+            "0:0.5",
+            "1:0.75",
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=fake_prune_experts,
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert prune_kwargs["per_layer_ratios"] == {0: 0.5, 1: 0.75}
+
+
+def test_main_rejects_malformed_per_layer_ratios(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--model-name",
+                "model",
+                "--dataset-name",
+                "dataset",
+                "--output-dir",
+                str(tmp_path),
+                "--per-layer-ratios",
+                "0-0.5",
+            ],
+            load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+            load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+            observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+            prune_experts_fn=lambda *args, **kwargs: {},
+            save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+                output_dir=tmp_path
+            ),
+            print_fn=lambda message: None,
+        )
+    # argparse parser.error exits with code 2 on bad --per-layer-ratios format.
+    assert exc_info.value.code == 2

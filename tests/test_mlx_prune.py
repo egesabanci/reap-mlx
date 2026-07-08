@@ -602,3 +602,83 @@ def test_prune_experts_rejects_invalid_skip_layer_index():
             0.5,
             skip_layer_indices=[99],
         )
+
+
+def _make_heterogeneous_model():
+    """Two MoE layers with different expert counts (4 and 8)."""
+    layers = [
+        SimpleNamespace(mlp=TinyMoe(num_experts=4, top_k=3)),
+        SimpleNamespace(mlp=TinyMoe(num_experts=8, top_k=3)),
+    ]
+    return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+def test_prune_experts_per_layer_ratios_uniform_retained_count_works():
+    model = _make_heterogeneous_model()
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {
+        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+        1: {"reap": np.array([0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6])},
+    }
+    # 4 experts * 0.5 -> retain 2; 8 experts * 0.75 -> retain 2. Uniform 2.
+    keep_by_layer = prune_experts(
+        model,
+        config,
+        observer_data,
+        "reap",
+        0.5,
+        per_layer_ratios={0: 0.5, 1: 0.75},
+    )
+    assert set(keep_by_layer) == {0, 1}
+    assert model.model.layers[0].mlp.num_experts == 2
+    assert model.model.layers[1].mlp.num_experts == 2
+    assert config["num_experts"] == 2
+
+
+def test_prune_experts_per_layer_ratios_differing_counts_raises():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {
+        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+        1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+    }
+    # 4 * 0.5 -> 2; 4 * 0.25 -> 3. Differing -> reload-unsafe.
+    with pytest.raises(ValueError, match="differing expert counts"):
+        prune_experts(
+            model,
+            config,
+            observer_data,
+            "reap",
+            0.5,
+            per_layer_ratios={0: 0.5, 1: 0.25},
+        )
+
+
+def test_prune_experts_per_layer_ratios_invalid_ratio_raises():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}}
+    with pytest.raises(ValueError, match="compression_ratio must be in"):
+        prune_experts(
+            model,
+            config,
+            observer_data,
+            "reap",
+            0.5,
+            per_layer_ratios={0: 1.5},
+        )
+
+
+def test_prune_experts_per_layer_ratios_unknown_index_raises():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}}
+    with pytest.raises(ValueError, match="non-MoE layer indices"):
+        prune_experts(
+            model,
+            config,
+            observer_data,
+            "reap",
+            0.5,
+            per_layer_ratios={99: 0.5},
+        )

@@ -65,6 +65,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--per-layer-ratios",
+        nargs="*",
+        default=None,
+        help=(
+            "Per-layer compression ratios as 'index:ratio' pairs, e.g. "
+            "--per-layer-ratios 0:0.5 1:0.25. Layers not listed use "
+            "--compression-ratio. NOTE: mlx-lm reloads require a uniform "
+            "expert count across all MoE layers, so ratios that produce "
+            "differing retained counts across layers are not save/reload-safe "
+            "and will raise."
+        ),
+    )
+    parser.add_argument(
         "--max-samples",
         "--num-calibration-sequences",
         dest="max_samples",
@@ -106,6 +119,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum tokens for the generation smoke test.",
     )
     return parser
+
+
+def _parse_per_layer_ratios(values: list[str] | None) -> dict[int, float] | None:
+    """Parse 'index:ratio' CLI pairs into a {layer_idx: ratio} mapping."""
+    if not values:
+        return None
+    parsed: dict[int, float] = {}
+    for item in values:
+        if ":" not in item:
+            raise ValueError(
+                "--per-layer-ratios entries must be 'index:ratio' pairs, "
+                f"got {item!r}."
+            )
+        index_str, _, ratio_str = item.partition(":")
+        try:
+            index = int(index_str)
+            ratio = float(ratio_str)
+        except ValueError as exc:
+            raise ValueError(
+                "--per-layer-ratios entries must be 'index:ratio' with an "
+                f"int index and float ratio, got {item!r}."
+            ) from exc
+        parsed[index] = ratio
+    return parsed
 
 
 def main(
@@ -230,6 +267,7 @@ def main(
                 args.compression_ratio,
                 skip_layer_indices=args.skip_layer_indices,
                 prune_layer_indices=args.prune_layer_indices,
+                per_layer_ratios=_parse_per_layer_ratios(args.per_layer_ratios),
             )
         metrics.record_pruning(
             keep_by_layer,
@@ -290,6 +328,10 @@ def _validate_args(args: argparse.Namespace) -> None:
             "compression_ratio=0.0 will prune zero experts; "
             "the saved model will be identical to the input."
         )
+
+    # Parse and validate per-layer ratios early so malformed input surfaces
+    # via argparse error handling rather than mid-pipeline.
+    _parse_per_layer_ratios(args.per_layer_ratios)
 
 
 def _validate_positive_int(value: Any, name: str) -> None:
