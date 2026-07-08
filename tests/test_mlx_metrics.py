@@ -20,6 +20,7 @@ def test_pruning_state_initialize_shapes_and_dtypes():
 
     assert state.num_experts == 3
     assert state.total_tokens == 0
+    assert state.total_slots == 0
     assert state.expert_frequency.shape == (3,)
     assert state.expert_frequency.dtype == np.int64
     assert state.pairwise_expert_frequency is None
@@ -30,6 +31,7 @@ def test_pruning_state_initialize_shapes_and_dtypes():
 
     report = state.report()
     assert report["total_tokens"] == 0
+    assert report["total_slots"] == 0
     np.testing.assert_array_equal(report["expert_frequency"], np.zeros(3))
     assert "pairwise_expert_frequency" not in report
     np.testing.assert_allclose(report["expert_proba"], np.zeros(3))
@@ -114,6 +116,7 @@ def test_accumulate_from_selected_outputs_topk_one():
 
     report = state.report()
     assert report["total_tokens"] == 3
+    assert report["total_slots"] == 3
     np.testing.assert_array_equal(report["expert_frequency"], [2, 1])
     np.testing.assert_allclose(report["expert_proba"], [2 / 3, 1 / 3])
     np.testing.assert_allclose(report["ean_sum"], [18.0, 6.0])
@@ -144,8 +147,9 @@ def test_accumulate_from_precomputed_stats_topk_greater_than_one():
 
     report = state.report()
     assert report["total_tokens"] == 3
+    assert report["total_slots"] == 6
     np.testing.assert_array_equal(report["expert_frequency"], [2, 2, 2])
-    np.testing.assert_allclose(report["expert_proba"], [2 / 3, 2 / 3, 2 / 3])
+    np.testing.assert_allclose(report["expert_proba"], [1 / 3, 1 / 3, 1 / 3])
     np.testing.assert_allclose(report["ean_sum"], [12.0, 14.0, 15.0])
     np.testing.assert_allclose(report["ean_mean"], [6.0, 7.0, 7.5])
     np.testing.assert_allclose(report["weighted_ean_sum"], [6.3, 4.9, 8.4])

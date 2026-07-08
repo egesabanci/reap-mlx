@@ -21,6 +21,7 @@ class PruningState:
 
     num_experts: int
     total_tokens: int
+    total_slots: int
     expert_frequency: np.ndarray
     pairwise_expert_frequency: np.ndarray | None
     ean_sum: np.ndarray
@@ -48,6 +49,7 @@ class PruningState:
         return cls(
             num_experts=num_experts,
             total_tokens=0,
+            total_slots=0,
             expert_frequency=np.zeros(num_experts, dtype=np.int64),
             pairwise_expert_frequency=pairwise,
             ean_sum=np.zeros(num_experts, dtype=np.float64),
@@ -121,6 +123,12 @@ class PruningState:
         )[: self.num_experts].astype(np.int64, copy=False)
 
         self.total_tokens += token_count
+        # total_slots counts every selected (token, expert) slot, i.e.
+        # total_tokens * top_k. expert_frequency is summed over slots, so the
+        # true per-expert probability is frequency / total_slots -- using
+        # total_tokens instead would let expert_proba exceed 1.0 for top_k > 1.
+        slot_count = token_count * int(indices_array.shape[-1])
+        self.total_slots += slot_count
         self.expert_frequency += batch_frequency
         if self.pairwise_expert_frequency is not None:
             self.pairwise_expert_frequency += (
@@ -140,7 +148,7 @@ class PruningState:
 
     def report(self) -> dict[str, Any]:
         """Return pruning data compatible with the existing observer schema."""
-        token_denominator = max(self.total_tokens, 1)
+        slot_denominator = max(self.total_slots, 1)
         count_denominator = np.maximum(
             self.expert_frequency.astype(np.float64),
             _FLOAT_EPS,
@@ -148,9 +156,12 @@ class PruningState:
 
         report = {
             "total_tokens": int(self.total_tokens),
+            "total_slots": int(self.total_slots),
             "expert_frequency": self.expert_frequency.copy(),
+            # expert_proba is a true probability distribution over experts:
+            # frequency (slot counts) divided by total_slots (total slots).
             "expert_proba": self.expert_frequency.astype(np.float64)
-            / token_denominator,
+            / slot_denominator,
             "ean_sum": self.ean_sum.copy(),
             "ean_mean": (self.ean_sum / count_denominator).astype(np.float32),
             "weighted_ean_sum": self.weighted_ean_sum.copy(),

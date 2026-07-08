@@ -24,6 +24,7 @@ requires_mlx = pytest.mark.skipif(
 
 EXPECTED_PRUNING_KEYS = {
     "total_tokens",
+    "total_slots",
     "expert_frequency",
     "expert_proba",
     "ean_sum",
