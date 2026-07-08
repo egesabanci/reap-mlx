@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -307,8 +308,44 @@ def test_dataset_shuffle_is_used_with_seed_before_sampling():
         load_dataset_fn=lambda dataset_name, **kwargs: dataset,
     )
 
+
     assert dataset.seeds == [7]
     np.testing.assert_array_equal(sequences[0]["input_ids"], [5])
+
+
+def test_dataset_without_shuffle_uses_sequential_order(caplog):
+    dataset = [{"text": "a"}, {"text": "b"}]  # plain list, no .shuffle
+    with caplog.at_level(logging.INFO, logger="reap.data"):
+        seqs = load_calibration_sequences(
+            WhitespaceTokenizer(),
+            "no-shuffle/data",
+            max_samples=2,
+            max_seq_length=10,
+            seed=3,
+            load_dataset_fn=lambda dataset_name, **kwargs: dataset,
+        )
+    assert len(seqs) == 2
+    # Sequential (un-shuffled) order preserved + a log explaining why.
+    assert any("does not support shuffle" in rec.message for rec in caplog.records)
+
+
+def test_dataset_shuffle_failure_falls_back_to_sequential(caplog):
+    class BrokenShuffleDataset(list):
+        def shuffle(self, *, seed):
+            raise RuntimeError("shuffle not supported for streaming")
+
+    dataset = BrokenShuffleDataset([{"text": "x"}, {"text": "y"}])
+    with caplog.at_level(logging.WARNING, logger="reap.data"):
+        seqs = load_calibration_sequences(
+            WhitespaceTokenizer(),
+            "broken-shuffle/data",
+            max_samples=2,
+            max_seq_length=10,
+            seed=3,
+            load_dataset_fn=lambda dataset_name, **kwargs: dataset,
+        )
+    assert len(seqs) == 2
+    assert any("shuffle failed" in rec.message for rec in caplog.records)
 
 
 def test_callable_tokenizer_outputs_are_supported_and_flattened():

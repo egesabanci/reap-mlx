@@ -145,8 +145,20 @@ def _positive_int(value: Any, name: str) -> int:
 def _maybe_shuffle(dataset: Iterable[Any], seed: int) -> Iterable[Any]:
     shuffle = getattr(dataset, "shuffle", None)
     if callable(shuffle):
-        return shuffle(seed=seed)
-
+        try:
+            return shuffle(seed=seed)
+        except Exception as exc:
+            # Streaming/IterableDataset.shuffle can raise (unsupported). Log and
+            # fall back to sequential order rather than crashing the pipeline.
+            logger.warning(
+                "Dataset shuffle failed (%s: %s); using sequential order",
+                type(exc).__name__,
+                exc,
+            )
+            return dataset
+    logger.info(
+        "Dataset does not support shuffle; using sequential calibration order",
+    )
     return dataset
 
 
