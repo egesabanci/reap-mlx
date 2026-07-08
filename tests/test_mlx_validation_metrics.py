@@ -223,6 +223,31 @@ def test_run_metrics_writes_failure_payload(tmp_path):
     assert payload["failure"]["message"] == "boom"
 
 
+def test_run_metrics_write_survives_non_finite_values(tmp_path):
+    """write() must never crash on NaN/Inf in metrics data (failure telemetry)."""
+    import math
+
+    metrics = RunMetrics(tmp_path, clock=FakeClock())
+    # Inject NaN/Inf directly into the metrics payload -- _json_safe should
+    # convert these, but the write path must still succeed even if it missed one.
+    metrics.data["nan_value"] = float("nan")
+    metrics.data["inf_value"] = float("inf")
+    metrics.data["nested"] = {"bad": [float("nan"), float("-inf"), 1.0]}
+
+    path = metrics.write(status="failed", failure=metrics.failure_payload("observe", RuntimeError("x")))
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    # Non-finite floats become null, not NaN/Infinity tokens.
+    assert payload["nan_value"] is None
+    assert payload["inf_value"] is None
+    assert payload["nested"]["bad"][0] is None
+    assert payload["nested"]["bad"][2] == 1.0
+    # The JSON file must be valid (no raw NaN/Infinity tokens).
+    raw = path.read_text(encoding="utf-8")
+    assert "NaN" not in raw and "Infinity" not in raw
+
+
 def test_record_model_metadata_handles_adapter_none_and_dense_model(tmp_path):
     """record_model_metadata must default gracefully when no adapter is detected."""
     metrics = RunMetrics(tmp_path)

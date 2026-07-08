@@ -8,6 +8,7 @@ its no-heavy-import package boundary.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import platform
 import resource
@@ -24,6 +25,8 @@ from typing import Any
 from reap.model_adapters import infer_model_adapter
 from reap.prune import resolve_prune_method
 from reap.save import artifact_summary
+
+logger = logging.getLogger(__name__)
 
 
 _PACKAGE_VERSION_NAMES = (
@@ -379,11 +382,24 @@ class RunMetrics:
 
         path = self.path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(_json_safe(self.data), indent=2, sort_keys=True, allow_nan=False)
-            + "\n",
-            encoding="utf-8",
-        )
+        # _json_safe should already replace non-finite floats with None, but
+        # guard against any residual NaN/Inf that slipped through (e.g. via
+        # custom objects) so a metrics write can never crash the failure
+        # telemetry path itself.
+        payload = _strip_nonfinite(_json_safe(self.data))
+        try:
+            text = json.dumps(
+                payload, indent=2, sort_keys=True, allow_nan=False
+            )
+        except ValueError:
+            logger.warning(
+                "metrics payload still contained non-finite values after "
+                "sanitization; writing with allow_nan=True to preserve telemetry",
+            )
+            text = json.dumps(
+                payload, indent=2, sort_keys=True, allow_nan=True
+            )
+        path.write_text(text + "\n", encoding="utf-8")
         return path
 
     def failure_payload(self, phase: str, exc: BaseException) -> dict[str, Any]:
@@ -757,6 +773,23 @@ def _json_safe(value: Any) -> Any:
             "shape": [int(dim) for dim in shape],
         }
     return str(value)
+
+
+def _strip_nonfinite(value: Any) -> Any:
+    """Recursively replace any remaining non-finite floats with None.
+
+    _json_safe already handles scalars/arrays, but a custom object may fall
+    through to str() while still yielding a nested float elsewhere. This is a
+    final safety net so json.dumps(..., allow_nan=False) cannot raise and lose
+    failure telemetry.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(key): _strip_nonfinite(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_strip_nonfinite(item) for item in value]
+    return value
 
 
 def _utc_now() -> str:
