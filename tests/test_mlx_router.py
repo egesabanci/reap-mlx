@@ -415,3 +415,28 @@ def test_lfm2_router_renormalizes_biased_scores_with_epsilon():
 
     assert result.indices.shape == (1, 2, 3)
     assert_allclose(mx, selected_score_sums, mx.ones(selected_score_sums.shape))
+
+
+@requires_mlx
+def test_lfm2_router_saliency_scores_exclude_expert_bias():
+    import mlx.core as mx
+
+    moe = TinyLfm2Moe(
+        mx,
+        top_k=1,
+        norm_topk_prob=False,
+        use_expert_bias=True,
+        expert_bias=[0.0, 0.55, 0.0, 0.0],
+    )
+    hidden_states = mx.array([[[1.0, 0.0, 0.0]]])
+
+    result = Lfm2MoeRouter(moe)(hidden_states)
+    assert result.saliency_scores is not None
+
+    # saliency_scores must be the pure softmax prob at the selected index,
+    # i.e. NOT shifted by expert_bias (which would add 0.55 to expert 1).
+    pure = mx.softmax(moe.gate(hidden_states), axis=-1)
+    expected = mx.take_along_axis(pure, result.indices, axis=-1)
+    assert_allclose(mx, result.saliency_scores, expected)
+    # Routing scores still carry the bias, so they differ from saliency here.
+    assert not mx.allclose(result.scores, result.saliency_scores).item()

@@ -18,12 +18,19 @@ class RouterResult:
     """Architecture-neutral selected-router output.
 
     Indices and scores are in argpartition order, not sorted by score.
+
+    ``scores`` are the scores actually used to weight expert outputs in the
+    forward pass (e.g. bias-adjusted for LFM2). ``saliency_scores``, when
+    provided, are bias-free scores intended for REAP metric accumulation so
+    that saliency reflects pure routing probability rather than additive
+    expert bias; consumers fall back to ``scores`` when it is None.
     """
 
     indices: Any
     scores: Any
     logits: Any | None = None
     score_mode: str = "actual"
+    saliency_scores: Any | None = None
 
 
 def _require_mlx_core():
@@ -233,11 +240,26 @@ class Lfm2MoeRouter:
             )
         scores = scores.astype(hidden_states.dtype)
 
+        # Saliency scores use the *pure* softmax probabilities (before
+        # expert_bias) so REAP weighting reflects routing probability rather
+        # than additive bias. Bias can drive scores negative or above 1.0 and
+        # would otherwise distort expert ranking even when activations are
+        # high. The same indices and (optional) norm_topk_prob normalization
+        # are applied to keep saliency consistent with routing geometry.
+        pure_gates = mx.softmax(logits, axis=-1)
+        saliency_scores = mx.take_along_axis(pure_gates, indices, axis=-1)
+        if self.norm_topk_prob:
+            saliency_scores = saliency_scores / (
+                mx.sum(saliency_scores, axis=-1, keepdims=True) + _NORM_EPSILON
+            )
+        saliency_scores = saliency_scores.astype(hidden_states.dtype)
+
         return RouterResult(
             indices=indices,
             scores=scores,
             logits=None,
             score_mode="actual",
+            saliency_scores=saliency_scores,
         )
 
 

@@ -421,9 +421,12 @@ def _observe_selected_moe_layer(
         raise ValueError("MoE layer does not expose a callable switch_mlp module.")
 
     selected_outputs = switch_mlp(moe_input, routing.indices)
+    saliency_scores = routing.saliency_scores
+    if saliency_scores is None:
+        saliency_scores = routing.scores
     state.accumulate(
         indices=routing.indices,
-        scores=routing.scores.astype(mx.float32),
+        scores=saliency_scores.astype(mx.float32),
         selected_outputs=selected_outputs.astype(mx.float32),
     )
 
