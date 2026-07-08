@@ -380,6 +380,17 @@ def test_prune_experts_rejects_missing_observer_layer_data():
         prune_experts(model, config, {}, "reap", 0.5)
 
 
+def test_prune_experts_raises_clear_message_when_no_moe_architecture_detected():
+    # No switch_mlp anywhere + an unrecognized model_type -> adapter is None.
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=object())])
+    )
+    with pytest.raises(ValueError, match="Cannot detect a supported MoE architecture") as excinfo:
+        prune_experts(model, {"model_type": "bert"}, {}, "reap", 0.5)
+    # The message should point to supported architectures, not print 'None'.
+    assert "Qwen3-MoE" in str(excinfo.value) and "LFM2-MoE" in str(excinfo.value)
+
+
 def test_prune_experts_rejects_wrong_saliency_length():
     model = make_model(num_experts=4)
     config = qwen_config(num_experts=4)

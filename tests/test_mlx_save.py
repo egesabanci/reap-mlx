@@ -363,9 +363,12 @@ def test_save_pruned_model_requires_lazy_mlx_lm_without_injected_functions(tmp_p
 
 
 def test_save_pruned_model_rejects_missing_expected_expert_count(tmp_path):
+    moe_model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=SimpleNamespace(switch_mlp=object()))])
+    )
     with pytest.raises(ValueError, match="expected_expert_count"):
         save_pruned_model(
-            object(),
+            moe_model,
             object(),
             {},
             tmp_path / "saved",
@@ -373,6 +376,29 @@ def test_save_pruned_model_rejects_missing_expected_expert_count(tmp_path):
             save_fn=fake_save_factory([]),
             load_fn=fake_load_factory(make_reloaded_model(1), object(), {}),
         )
+
+
+def test_save_pruned_model_raises_clear_message_when_no_moe_architecture_detected(tmp_path):
+    # Neither the original nor the reloaded model expose MoE structure, so
+    # adapter inference returns None for both -> fail with a clear message.
+    dense_model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=object())])
+    )
+    dense_reloaded = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=object())])
+    )
+    with pytest.raises(ValueError, match="Cannot detect a supported MoE architecture") as excinfo:
+        save_pruned_model(
+            dense_model,
+            object(),
+            {"num_experts": 1, "num_experts_per_tok": 1},
+            tmp_path / "saved",
+            "source-model",
+            save_fn=fake_save_factory([]),
+            load_fn=fake_load_factory(dense_reloaded, object(), {}),
+        )
+    assert "Qwen3-MoE" in str(excinfo.value) and "LFM2-MoE" in str(excinfo.value)
+
 
 
 def test_save_pruned_model_rejects_missing_saved_artifacts(tmp_path):

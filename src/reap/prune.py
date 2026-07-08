@@ -222,12 +222,19 @@ def slice_first_dim(
 
 
 def _validate_adapter(adapter: Any) -> None:
+    if adapter is None:
+        raise ValueError(
+            "Cannot detect a supported MoE architecture. REAP currently "
+            "supports Qwen3-MoE and LFM2-MoE models. Ensure the model config "
+            "exposes a recognized model_type/architectures, or pass an "
+            "explicit adapter.",
+        )
     adapter_name = getattr(adapter, "adapter_name", None)
     if adapter_name not in {"qwen3_moe", "lfm2_moe"}:
         raise ValueError(
             "MLX expert pruning currently supports the qwen3_moe and "
             "lfm2_moe adapters only; "
-            f"got {adapter_name!r}."
+            f"got {adapter_name!r}.",
         )
 
 

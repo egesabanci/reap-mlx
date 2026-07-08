@@ -89,6 +89,16 @@ def save_pruned_model(
             adapter = infer_model_adapter(reloaded_model, reloaded_config)
         except Exception:
             pass
+    if adapter is None:
+        # Neither the original nor the reloaded model exposed a supported MoE
+        # architecture. Fail with a clear message instead of a confusing
+        # AttributeError deep in _validate_reloaded_model_shapes.
+        raise ValueError(
+            "Cannot detect a supported MoE architecture. REAP currently "
+            "supports Qwen3-MoE and LFM2-MoE models. Ensure the model config "
+            "exposes a recognized model_type/architectures, or pass an "
+            "explicit adapter.",
+        )
     validation_started = time.perf_counter()
     _validate_reloaded_config(reloaded_config, expected_count)
     _validate_reloaded_model_shapes(
