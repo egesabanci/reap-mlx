@@ -486,6 +486,47 @@ def test_observe_model_rejects_invalid_eval_frequency():
 
 
 @requires_mlx
+def test_observe_model_eval_fallback_is_user_visible_and_resets_per_sequence():
+    """eval_frequency fallback must print a user-visible message and reset per sequence."""
+    import mlx.core as mx
+
+    layers = [
+        TinyLayer(mx, TinyDenseMlp(mx)),
+        TinyLayer(mx, TinyMoeMlp(mx, top_k=1)),
+        TinyLayer(mx, TinyDenseMlp(mx)),
+    ]
+    model = TinyModel(mx, layers)
+
+    eval_calls = []
+    state = {"failed": False}
+
+    def flaky_eval(h):
+        # Fail exactly once (first eval), then succeed forever after.
+        if not state["failed"]:
+            state["failed"] = True
+            raise RuntimeError("transient eval failure")
+        eval_calls.append(h.shape)
+
+    messages = []
+    observe_model(
+        model,
+        [[0, 1], [0, 1]],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+        eval_frequency=2,
+        mask_fn=lambda h, cache=None: None,
+        eval_fn=flaky_eval,
+        print_fn=messages.append,
+    )
+
+    # The fallback was surfaced to the user via print_fn.
+    assert any("eval_fn failed" in m for m in messages)
+    # Per-sequence reset: seq 2 re-uses eval_frequency=2 (only layer 1 and the
+    # final layer eval), and flaky_eval no longer raises, so we get the seq-2
+    # evals in addition to the seq-1 retry+final.
+    assert len(eval_calls) >= 2
+
+
+@requires_mlx
 def test_observe_model_adds_shared_expert_to_hidden_flow_only():
     import mlx.core as mx
 

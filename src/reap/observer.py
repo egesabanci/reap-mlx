@@ -34,6 +34,7 @@ def observe_model(
     eval_frequency: int = 1,
     eval_fn: Callable[[Any], Any] | None = None,
     mask_fn: Callable[..., Any] | None = None,
+    print_fn: Callable[[str], Any] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Collect pruning-compatible observer data with explicit MLX layer replay."""
     mx = _require_mlx_core()
@@ -58,6 +59,7 @@ def observe_model(
             eval_frequency=eval_frequency,
             eval_fn=eval_fn,
             mask_fn=mask_fn,
+            print_fn=print_fn,
         )
 
     return _observe_qwen3_model(
@@ -69,6 +71,7 @@ def observe_model(
         eval_frequency=eval_frequency,
         eval_fn=eval_fn,
         mask_fn=mask_fn,
+        print_fn=print_fn,
     )
 
 
@@ -82,7 +85,9 @@ def _observe_qwen3_model(
     eval_frequency: int,
     eval_fn: Callable[[Any], Any],
     mask_fn: Callable[..., Any] | None,
+    print_fn: Callable[[str], Any] | None,
 ) -> dict[int, dict[str, Any]]:
+    requested_eval_frequency = eval_frequency
     mx = _require_mlx_core()
     layers = adapter.layers(model)
     moe_layer_indices = set(adapter.identify_moe_layers(model))
@@ -96,6 +101,10 @@ def _observe_qwen3_model(
     )
 
     for sequence in calibration_sequences:
+        # Reset to the requested cadence for each sequence so a transient
+        # eval failure in one sequence does not permanently downgrade the
+        # whole run to eval_frequency=1.
+        eval_frequency = requested_eval_frequency
         tokens = _batch_tokens(mx, sequence)
         h = embed_tokens(tokens)
         default_mask = (
@@ -143,6 +152,14 @@ def _observe_qwen3_model(
                         "Falling back to eval_frequency=1 for remaining layers.",
                         layer_idx, len(layers), eval_frequency, eval_err,
                     )
+                    # Surface the fallback to the user (logging may be quiet
+                    # without --verbose) so the performance regression is visible.
+                    if print_fn is not None:
+                        print_fn(
+                            f"[reap-mlx] observe: eval_fn failed at layer "
+                            f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
+                            "falling back to eval_frequency=1 for this sequence.",
+                        )
                     eval_frequency = 1
                     try:
                         eval_fn(h)
@@ -168,7 +185,9 @@ def _observe_lfm2_model(
     eval_frequency: int,
     eval_fn: Callable[[Any], Any],
     mask_fn: Callable[..., Any] | None,
+    print_fn: Callable[[str], Any] | None,
 ) -> dict[int, dict[str, Any]]:
+    requested_eval_frequency = eval_frequency
     mx = _require_mlx_core()
     layers = adapter.layers(model)
     moe_layer_indices = set(adapter.identify_moe_layers(model))
@@ -182,6 +201,10 @@ def _observe_lfm2_model(
     )
 
     for sequence in calibration_sequences:
+        # Reset to the requested cadence for each sequence so a transient
+        # eval failure in one sequence does not permanently downgrade the
+        # whole run to eval_frequency=1.
+        eval_frequency = requested_eval_frequency
         tokens = _batch_tokens(mx, sequence)
         h = embed_tokens(tokens)
         attn_mask, conv_mask = _lfm2_masks(
@@ -217,6 +240,14 @@ def _observe_lfm2_model(
                         "Falling back to eval_frequency=1 for remaining layers.",
                         layer_idx, len(layers), eval_frequency, eval_err,
                     )
+                    # Surface the fallback to the user (logging may be quiet
+                    # without --verbose) so the performance regression is visible.
+                    if print_fn is not None:
+                        print_fn(
+                            f"[reap-mlx] observe: eval_fn failed at layer "
+                            f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
+                            "falling back to eval_frequency=1 for this sequence.",
+                        )
                     eval_frequency = 1
                     try:
                         eval_fn(h)

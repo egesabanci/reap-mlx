@@ -253,7 +253,8 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         "max_seq_length": 16,
         "seed": 9,
     }
-    assert events[2][4] == {"eval_frequency": 1}
+    assert events[2][4]["eval_frequency"] == 1
+    assert "print_fn" in events[2][4]
     assert events[3][4:] == ("frequency", 0.25)
     assert events[4][6]["smoke_fn"] is smoke
     assert events[4][6]["smoke_prompt"] == "What is your name?"
@@ -306,7 +307,8 @@ def test_main_passes_configured_eval_frequency_to_observer(tmp_path):
     )
 
     assert code == 0
-    assert observe_kwargs == {"eval_frequency": 4}
+    assert observe_kwargs["eval_frequency"] == 4
+    assert "print_fn" in observe_kwargs
 
     payload = json.loads(
         (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")

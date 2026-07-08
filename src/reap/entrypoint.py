@@ -185,6 +185,7 @@ def main(
                 calibration_sequences,
                 config,
                 eval_frequency=args.eval_frequency,
+                print_fn=print_fn,
             )
         metrics.record_observer(observer_data, args.prune_method)
         if not observer_data:
