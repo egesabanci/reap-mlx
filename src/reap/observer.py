@@ -418,9 +418,17 @@ def _is_lfm2_attention_layer(layer: Any) -> bool:
     is_attention_layer = getattr(layer, "is_attention_layer", None)
     if is_attention_layer is not None:
         return bool(is_attention_layer)
-    return callable(getattr(layer, "self_attn", None))
-
-
+    # Without an explicit flag, fall back to checking self_attn. If the layer
+    # has both self_attn and conv (hybrid), this heuristic is ambiguous --
+    # raise a clear error instead of silently picking the wrong operator.
+    has_attn = callable(getattr(layer, "self_attn", None))
+    has_conv = callable(getattr(layer, "conv", None))
+    if has_attn and has_conv:
+        raise ValueError(
+            "Layer has both self_attn and conv modules but no "
+            "is_attention_layer flag. Cannot determine operator type.",
+        )
+    return has_attn
 def _run_lfm2_operator(layer: Any, h: Any, mask: Any | None) -> Any:
     normalized = _call_required(layer, "operator_norm", h)
     if _is_lfm2_attention_layer(layer):
