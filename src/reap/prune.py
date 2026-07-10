@@ -95,6 +95,62 @@ def _layer_ratio(
     return compression_ratio
 
 
+def validate_layer_prune_plan(
+    model: Any,
+    config: Mapping[str, Any],
+    compression_ratio: float,
+    *,
+    adapter: Any | None = None,
+    skip_layer_indices: list[int] | None = None,
+    prune_layer_indices: list[int] | None = None,
+    per_layer_ratios: dict[int, float] | None = None,
+) -> dict[int, int]:
+    """Validate layer filters/ratios and return final expert counts per MoE layer.
+
+    Call this after model load (before calibration/observe) so illegal selective
+    prune configs fail without burning observation compute.
+    """
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    _validate_adapter(adapter)
+    _validate_compression_ratio(compression_ratio)
+    layers = adapter.layers(model)
+    all_moe_indices = list(adapter.identify_moe_layers(model))
+    selected_moe_indices = _select_moe_layers(
+        all_moe_indices, skip_layer_indices, prune_layer_indices
+    )
+    selected_set = set(selected_moe_indices)
+    if per_layer_ratios:
+        unknown = set(per_layer_ratios) - set(all_moe_indices)
+        if unknown:
+            raise ValueError(
+                "per_layer_ratios contains non-MoE layer indices: "
+                f"{sorted(unknown)}. Available MoE layers: {sorted(all_moe_indices)}.",
+            )
+        for ratio in per_layer_ratios.values():
+            _validate_compression_ratio(ratio)
+
+    final_counts: dict[int, int] = {}
+    for layer_idx in all_moe_indices:
+        layer_cfg = adapter.get_layer_config(layers[layer_idx], config)
+        if layer_idx in selected_set:
+            ratio_i = _layer_ratio(layer_idx, per_layer_ratios, compression_ratio)
+            final_counts[layer_idx] = _retained_expert_count(
+                layer_cfg.num_experts, ratio_i
+            )
+        else:
+            final_counts[layer_idx] = layer_cfg.num_experts
+    if len(set(final_counts.values())) > 1:
+        raise ValueError(
+            "Pruning would leave MoE layers with differing expert counts "
+            f"({final_counts}). mlx-lm rebuilds every MoE layer from a single "
+            "scalar num_experts in config, so save/reload requires a uniform "
+            "expert count across all MoE layers. Use uniform ratios or prune "
+            "all layers. On homogeneous MoEs, --skip-layer-indices with "
+            "compression_ratio > 0 always diverges retained counts."
+        )
+    return final_counts
+
+
 def prune_experts(
     model: Any,
     config: MutableMapping[str, Any],
@@ -182,6 +238,16 @@ def prune_experts(
             layer_config.num_experts,
             layer_ratio,
         )
+        num_to_prune = int(layer_config.num_experts) - retained_count
+        if layer_ratio > 0.0 and num_to_prune == 0:
+            logger.warning(
+                "Layer %d: compression_ratio=%.4f prunes 0 of %d experts "
+                "(floor(num_experts * ratio) == 0). Increase the ratio or "
+                "use a model with more experts.",
+                layer_idx,
+                layer_ratio,
+                layer_config.num_experts,
+            )
         if retained_count <= 2:
             logger.warning(
                 "Layer %d: compression_ratio=%.2f retains %d/%d experts. "
@@ -277,8 +343,10 @@ def apply_keep_indices(
     config_top_k: int | None = None
     result: dict[int, np.ndarray] = {}
 
+    if not keep_by_layer:
+        raise ValueError("keep_by_layer must contain at least one MoE layer.")
+
     for layer_idx, keep in keep_by_layer.items():
-        keep_indices = np.asarray(keep)
         if layer_idx < 0 or layer_idx >= len(layers):
             raise ValueError(
                 f"keep_by_layer layer index {layer_idx} is out of range "
@@ -292,6 +360,11 @@ def apply_keep_indices(
                 "indices. Ensure the checkpoint matches the loaded model."
             )
         layer_config = adapter.get_layer_config(layer, config)
+        keep_indices = _validate_keep_indices(
+            keep,
+            num_experts=layer_config.num_experts,
+            layer_idx=int(layer_idx),
+        )
         retained_count = int(len(keep_indices))
         if adapter.adapter_name == "lfm2_moe":
             _prune_lfm2_moe_layer(
@@ -336,6 +409,33 @@ def apply_keep_indices(
             top_k=config_top_k or config_num_experts,
         )
     return result
+
+
+def _validate_keep_indices(
+    keep: Any,
+    *,
+    num_experts: int,
+    layer_idx: int,
+) -> np.ndarray:
+    """Validate resume/prune keep indices before slicing weights."""
+    keep_indices = np.asarray(keep, dtype=np.int64)
+    if keep_indices.ndim != 1 or keep_indices.size < 1:
+        raise ValueError(
+            f"Layer {layer_idx}: keep indices must be a non-empty 1-D array, "
+            f"got shape {keep_indices.shape}."
+        )
+    if keep_indices.size != np.unique(keep_indices).size:
+        raise ValueError(
+            f"Layer {layer_idx}: keep indices must be unique, got {keep_indices.tolist()}."
+        )
+    min_index = int(keep_indices.min())
+    max_index = int(keep_indices.max())
+    if min_index < 0 or max_index >= int(num_experts):
+        raise ValueError(
+            f"Layer {layer_idx}: keep indices must be in [0, {num_experts}), "
+            f"got min={min_index}, max={max_index}."
+        )
+    return keep_indices
 
 
 def resolve_prune_method(prune_method: str) -> str:
@@ -383,6 +483,10 @@ def slice_first_dim(
     """Slice present module fields on dimension 0.
 
     Returns ``True`` if at least one field was sliced.
+
+    MLX arrays stay as ``mlx.core.array`` so ``nn.Module.parameters()`` continues
+    to track them after pruning (``np.take`` would demote to NumPy and drop the
+    parameter from the module tree, breaking save/reload).
     """
     sliced_any = False
 
@@ -395,10 +499,16 @@ def slice_first_dim(
             field_name=field_name,
             num_experts=num_experts,
         )
-        # Use np.take for broader compatibility (MLX arrays, NumPy arrays, lists)
-        # instead of Python list indexing which may fail on quantized or
-        # custom array types.
-        _set_module_value(module, field_name, np.take(value, keep_indices, axis=0))
+        _set_module_value(
+            module,
+            field_name,
+            _slice_value_first_dim(
+                value,
+                keep_indices,
+                num_experts=num_experts,
+                field_name=field_name,
+            ),
+        )
         sliced_any = True
 
     if required and not sliced_any:
@@ -632,7 +742,26 @@ def _slice_value_first_dim(
     field_name: str,
 ) -> Any:
     _validate_first_dim(value, field_name=field_name, num_experts=num_experts)
-    return np.take(value, keep_indices, axis=0)
+    keep = np.asarray(keep_indices)
+
+    # Preserve MLX arrays: np.take demotes mx.array -> numpy.ndarray, which
+    # drops the field from mlx.nn.Module.parameters() and empties save_model.
+    mx_array_type = _mlx_array_type()
+    if mx_array_type is not None and isinstance(value, mx_array_type):
+        import mlx.core as mx
+
+        return mx.take(value, mx.array(keep), axis=0)
+
+    return np.take(value, keep, axis=0)
+
+
+def _mlx_array_type() -> type | None:
+    """Return ``mlx.core.array`` when MLX is importable, else ``None``."""
+    try:
+        import mlx.core as mx
+    except ModuleNotFoundError:
+        return None
+    return type(mx.zeros((1,)))
 
 
 def _validate_first_dim(value: Any, *, field_name: str, num_experts: int) -> None:
@@ -653,4 +782,5 @@ __all__ = [
     "prune_experts",
     "resolve_prune_method",
     "slice_first_dim",
+    "validate_layer_prune_plan",
 ]

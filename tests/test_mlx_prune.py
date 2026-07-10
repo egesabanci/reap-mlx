@@ -334,6 +334,8 @@ def test_slice_first_dim_handles_mlx_arrays():
     )
     mx.eval(module.weight, module.scales)
 
+    assert isinstance(module.weight, mx.array)
+    assert isinstance(module.scales, mx.array)
     assert module.weight.tolist() == [[0, 1], [4, 5]]
     assert module.scales.tolist() == [[10], [12]]
 
@@ -717,3 +719,122 @@ def test_apply_keep_indices_rejects_non_moe_layer_index():
     # Layer index 5 is out of range for a 2-layer model.
     with pytest.raises(ValueError, match="out of range"):
         apply_keep_indices(model, config, {5: np.array([0, 1])})
+
+
+@requires_mlx
+def test_slice_first_dim_preserves_mlx_array_type_and_module_parameters():
+    """np.take demotion must not drop weights from mlx.nn.Module.parameters()."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.arange(12, dtype=mx.float32).reshape(3, 4)
+            self.scales = mx.arange(6, dtype=mx.float32).reshape(3, 2)
+
+    module = Tiny()
+    mx.eval(module.parameters())
+    assert dict(tree_flatten(module.parameters()))
+
+    slice_first_dim(
+        module,
+        np.array([0, 2]),
+        num_experts=3,
+        field_names=("weight", "scales"),
+    )
+    flat = dict(tree_flatten(module.parameters()))
+    assert set(flat) == {"weight", "scales"}
+    assert isinstance(module.weight, mx.array)
+    assert isinstance(module.scales, mx.array)
+    assert module.weight.shape == (2, 4)
+    assert module.scales.shape == (2, 2)
+
+
+@requires_mlx
+def test_prune_experts_preserves_switch_glu_parameters_and_forward():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.switch_layers import SwitchGLU
+    from reap.model_adapters import Lfm2MoeModelAdapter
+
+    class Moe(nn.Module):
+        def __init__(self, n=4, k=2):
+            super().__init__()
+            self.num_experts = n
+            self.top_k = k
+            self.num_experts_per_tok = k
+            self.norm_topk_prob = True
+            self.use_expert_bias = True
+            self.gate = nn.Linear(8, n, bias=False)
+            self.switch_mlp = SwitchGLU(8, 16, n, bias=False)
+            self.expert_bias = mx.zeros((n,))
+
+    moe = Moe()
+    mx.eval(moe.parameters())
+    before = len(tree_flatten(moe.parameters()))
+    assert before >= 5
+
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)]))
+    config = {
+        "model_type": "lfm2_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "use_expert_bias": True,
+        "norm_topk_prob": True,
+    }
+    keep = prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8], dtype=np.float32)}},
+        "reap",
+        0.5,
+        adapter=Lfm2MoeModelAdapter(),
+    )
+    assert set(keep) == {0}
+    after = dict(tree_flatten(moe.parameters()))
+    assert after, "parameters must remain registered after prune"
+    assert all(isinstance(v, mx.array) for v in after.values())
+    assert moe.num_experts == 2
+    assert config["num_experts"] == 2
+
+    x = mx.random.normal((3, 8))
+    idx = mx.array([[0, 1], [0, 1], [1, 0]])
+    y = moe.switch_mlp(x, idx)
+    mx.eval(y)
+    assert y.shape[-1] == 8
+
+
+@requires_mlx
+def test_prune_quantized_switch_linear_preserves_parameters_and_forward():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    ql = QuantizedSwitchLinear(64, 32, num_experts=4, bias=False, group_size=64, bits=4)
+    mx.eval(ql.parameters())
+    keep = np.array([0, 2])
+    slice_first_dim(ql, keep, num_experts=4)
+    flat = dict(tree_flatten(ql.parameters()))
+    assert flat
+    assert isinstance(ql.weight, mx.array)
+    assert ql.weight.shape[0] == 2
+    x = mx.random.normal((2, 64))
+    idx = mx.array([[0, 1], [1, 0]])
+    y = ql(x[:, None, :], idx)
+    mx.eval(y)
+    assert y.shape[0] == 2
+
+
+def test_apply_keep_indices_rejects_out_of_range_and_duplicates():
+    model = make_model(num_experts=4, top_k=2)
+    config = qwen_config(num_experts=4, top_k=2)
+    with pytest.raises(ValueError, match="unique"):
+        apply_keep_indices(model, config, {0: np.array([0, 0])})
+    model = make_model(num_experts=4, top_k=2)
+    config = qwen_config(num_experts=4, top_k=2)
+    with pytest.raises(ValueError, match=r"\[0, 4\)"):
+        apply_keep_indices(model, config, {0: np.array([0, 4])})
