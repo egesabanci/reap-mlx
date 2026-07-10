@@ -58,7 +58,7 @@ def test_write_and_load_checkpoint_round_trips_keep_by_layer(tmp_path):
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert payload["model_name"] == "mlx-community/test"
     assert payload["keep_by_layer"] == {"0": [1, 3], "1": [0, 2, 4]}
     assert payload["config_before_prune"]["num_experts"] == 8
@@ -66,6 +66,26 @@ def test_write_and_load_checkpoint_round_trips_keep_by_layer(tmp_path):
     loaded = load_checkpoint(path)
     assert loaded["keep_by_layer"] == {0: [1, 3], 1: [0, 2, 4]}
     assert loaded["adapter_name"] == "qwen3_moe"
+
+
+def test_load_checkpoint_accepts_version_1(tmp_path):
+    path = tmp_path / "v1.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "model_name": "m",
+                "adapter_name": "qwen3_moe",
+                "prune_method": "reap",
+                "compression_ratio": 0.5,
+                "config_before_prune": {},
+                "keep_by_layer": {"0": [1, 2]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_checkpoint(path)
+    assert loaded["keep_by_layer"] == {0: [1, 2]}
 
 
 def test_load_checkpoint_rejects_unsupported_version(tmp_path):
