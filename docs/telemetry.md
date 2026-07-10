@@ -33,7 +33,12 @@ If `--metrics-file` is an absolute path, telemetry is written there instead.
 }
 ```
 
-Status is `running` while in memory, then `success` or `failed` when written.
+Status is `running` while in memory, then `success`, `failed`, or `interrupted`
+(Ctrl-C / `KeyboardInterrupt`, exit code 130) when written.
+
+Process memory samples include `max_rss_mb_approx`, raw `ru_maxrss_raw` with
+`ru_maxrss_unit` (`bytes` on Darwin, `kilobytes` elsewhere), and `platform` so
+cross-machine comparisons are unambiguous.
 
 ## Runtime
 

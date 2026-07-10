@@ -8,9 +8,21 @@ without loading real models, downloading datasets, or importing MLX.
 
 ```txt
 model_load
+  -> prune_plan_validation   # layer filters / ratios / uniform counts
   -> calibration
-  -> observe
+  -> observe                 # refuse zero-token / all-zero saliency
   -> prune
+  -> checkpoint write        # hard fail if checkpoint cannot be written
+  -> save_reload_smoke
+  -> metrics write
+```
+
+Resume branch (`--resume-from-checkpoint`):
+
+```txt
+model_load
+  -> checkpoint_load
+  -> apply_keep_indices
   -> save_reload_smoke
   -> metrics write
 ```

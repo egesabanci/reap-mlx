@@ -4,10 +4,13 @@ The command-line entry point is:
 
 ```bash
 uv run python -m reap.entrypoint
+# or after install:
+uv run reap-mlx
 ```
 
-It orchestrates model loading, calibration, observation, pruning, save/reload
-validation, optional smoke generation, and telemetry writing.
+It orchestrates model loading, prune-plan validation, calibration, observation,
+pruning, checkpoint write, save/reload validation, optional smoke generation,
+and telemetry writing. Resume mode skips calibration/observe/prune.
 
 ## Required Options
 
@@ -24,7 +27,14 @@ validation, optional smoke generation, and telemetry writing.
 | `--split` | `train` | Dataset split passed to `load_dataset`. |
 | `--dataset-config-name` | unset | Optional Hugging Face dataset config name. |
 | `--prune-method` | `reap` | Saliency key or alias used to rank experts. |
-| `--compression-ratio` | `0.25` | Fraction of experts to remove per MoE layer. |
+| `--compression-ratio` | `0.25` | Fraction of experts to remove per MoE layer (floor semantics). |
+| `--skip-layer-indices` | none | MoE layers to skip (must keep uniform retained counts for save/reload). |
+| `--prune-layer-indices` | all MoE | Restrict pruning to these MoE indices. |
+| `--per-layer-ratios` | none | `index:ratio` overrides; validated for uniform retained counts before observe. |
+| `--min-calibration-samples` | unset | Optional hard floor on non-empty sequences. |
+| `--allow-partial-calibration` | off | Allow fewer than `--min-calibration-samples`. |
+| `--resume-from-checkpoint` | unset | Re-apply keep indices and retry save only. |
+| `--strict-resume` / `--no-strict-resume` | strict on | Require checkpoint model/adapter to match. |
 | `--max-samples` | `128` | Maximum non-empty calibration samples. |
 | `--num-calibration-sequences` | alias | Alias for `--max-samples`. |
 | `--max-seq-length` | `2048` | Maximum tokens per calibration sequence. |

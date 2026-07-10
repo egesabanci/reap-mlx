@@ -31,6 +31,15 @@ layers and sequences.
 layers and also flush the final layer of each sequence when needed. Higher
 values reduce GPU synchronization barriers but increase peak memory.
 
+Only a `MemoryError` from `eval_fn` triggers a temporary fallback to
+`eval_frequency=1` for the rest of the current sequence. Other `RuntimeError`
+failures are re-raised so real graph bugs are not masked as memory pressure.
+
+On sequence-level `MemoryError`, observer state is rolled back to the snapshot
+taken before that sequence started (so MoE layers never disagree on how many
+sequences they saw), then observation stops and fully completed sequences are
+retained.
+
 ## Qwen3 Replay
 
 For each sequence:
@@ -126,10 +135,16 @@ LFM2 routing:
 
 When `use_expert_bias` is true, `moe.expert_bias` is required.
 
-The bias-adjusted selected scores flow into `PruningState.accumulate`, so
-`weighted_ean_sum` and `reap` include the LFM2 expert bias. This matches the
-actual routed model computation, but it can differ from the original REAP paper
-formulation that weights activations by pure softmax probabilities.
+LFM2 returns two score tensors:
+
+- `scores`: bias-adjusted values used to weight expert outputs in the residual
+  (matches mlx-lm forward).
+- `saliency_scores`: **pure softmax** probabilities at the selected indices
+  (bias-free), used by `PruningState.accumulate` for `weighted_ean_sum` and
+  `reap`.
+
+This keeps REAP ranking aligned with routing probability rather than additive
+expert bias, while the residual path still matches the live model.
 
 ## Selected Expert Outputs
 
@@ -186,7 +201,7 @@ output norms and maxes.
 | --- | --- |
 | `total_tokens` | Routed token positions. |
 | `expert_frequency` | Selected-route counts. |
-| `expert_proba` | `expert_frequency / max(total_tokens, 1)`. |
+| `expert_proba` | `expert_frequency / max(total_slots, 1)` where `total_slots` counts every selected (token, expert) slot (`total_tokens * top_k` accumulation). |
 | `ean_sum` | Sum of selected output norms. |
 | `ean_mean` | `ean_sum / max(expert_frequency, eps)`. |
 | `weighted_ean_sum` | Router-score-weighted output norm sum. |

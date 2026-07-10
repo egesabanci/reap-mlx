@@ -66,6 +66,8 @@ Check the CLI:
 
 ```bash
 uv run python -m reap.entrypoint --help
+# after install / uv sync:
+uv run reap-mlx --help
 ```
 
 Run the focused test suite:
@@ -139,9 +141,12 @@ Adding a model family should usually mean adding or extending an adapter in
 coverage in `tests/test_mlx_model_adapters.py`, `tests/test_mlx_router.py`, and
 `tests/test_mlx_prune.py`.
 
-All currently supported MoE layers must prune to the same retained expert count.
-The first pruned MoE layer sets the expected count for the run; per-layer expert
-counts and per-layer compression ratios are not yet supported.
+All MoE layers must end with the **same** retained expert count because mlx-lm
+stores a single global `num_experts`. Selective flags (`--skip-layer-indices`,
+`--per-layer-ratios`) are validated **before** calibration; on homogeneous MoEs,
+skipping layers with `compression_ratio > 0` always diverges counts and raises.
+Use uniform ratios, prune all layers, or (for research) heterogeneous native
+expert counts tuned to the same retained width.
 
 ## Pruning Methods
 
@@ -158,11 +163,12 @@ Higher scores are kept.
 | `ean_sum` | Sum of selected expert output norms. |
 | `ean_mean` | Mean selected expert output norm. |
 | `weighted_ean_sum` | Router-score-weighted sum of selected expert output norms. |
-| `max_activations` | Maximum selected expert output activation. |
+| `max_activations` | Max absolute element of selected expert outputs (not L2). |
 
-For LFM2 models with `use_expert_bias=True`, router-score-weighted methods use
-bias-adjusted selected scores. This matches the model's routed computation, but
-can rank experts differently from a pure-softmax REAP formulation.
+For LFM2 models with `use_expert_bias=True`, residual routing still uses
+bias-adjusted scores, but REAP saliency accumulation uses **pure softmax**
+probabilities at the selected indices so ranking is not distorted by additive
+bias.
 
 `--compression-ratio` must be in `[0, 1)`. For each MoE layer, REAP MLX prunes
 `int(num_experts * compression_ratio)` experts and always keeps at least one
@@ -286,6 +292,13 @@ Check formatting hygiene before committing:
 ```bash
 git diff --check
 ```
+
+## Third-party trees
+
+The `third-party/` directory holds reference evaluation stacks (EvalPlus,
+LiveCodeBench, HELM, etc.). They are **not** wired into `reap.entrypoint` or CI.
+Use them manually against a saved pruned artifact if you need task metrics beyond
+the built-in reload + generation smoke checks.
 
 ## License
 

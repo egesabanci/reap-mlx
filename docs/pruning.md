@@ -67,9 +67,15 @@ Ranking uses:
 np.lexsort((expert_ids, -saliency))
 ```
 
-This keeps highest saliency first and breaks ties by lower expert id. The final
-returned keep indices are sorted in ascending order so slicing preserves the
-original expert order among retained experts.
+This keeps highest saliency first and breaks ties by **lower expert id**
+(deterministic). The final returned keep indices are sorted in ascending order
+so slicing preserves the original expert order among retained experts.
+
+`max_activations` ranks by the maximum absolute element of each selected expert
+output (not the L2 norm used by EAN metrics).
+
+Expert weight slicing preserves MLX arrays (`mx.take`) so
+`mlx.nn.Module.parameters()` still tracks pruned tensors for save/reload.
 
 ## Qwen3 Slicing
 
