@@ -37,6 +37,9 @@ dev = [
 [project.urls]
 Repository = "https://github.com/egesabanci/reap-mlx"
 
+[project.scripts]
+reap-mlx = "reap.entrypoint:main"
+
 [tool.ruff]
 line-length = 88
 select = ["SIM"]

@@ -38,7 +38,10 @@ def load_calibration_sequences(
     dataset = _maybe_shuffle(dataset, seed)
 
     sequences: list[dict[str, np.ndarray]] = []
+    records_seen = 0
+    empty_text_or_tokens = 0
     for record in dataset:
+        records_seen += 1
         text = extract_text(record, tokenizer=tokenizer)
         token_ids = tokenize_text(
             tokenizer,
@@ -46,6 +49,7 @@ def load_calibration_sequences(
             max_seq_length=max_seq_length,
         )
         if not token_ids:
+            empty_text_or_tokens += 1
             continue
 
         sequences.append(
@@ -56,6 +60,20 @@ def load_calibration_sequences(
         if len(sequences) >= max_samples:
             break
 
+    if empty_text_or_tokens and records_seen:
+        empty_ratio = empty_text_or_tokens / records_seen
+        logger.warning(
+            "Skipped %d/%d calibration records with empty text/tokens "
+            "(%.0f%%). Check dataset fields or --dataset-config-name.",
+            empty_text_or_tokens,
+            records_seen,
+            100.0 * empty_ratio,
+        )
+        if empty_ratio > 0.5 and len(sequences) < max_samples:
+            logger.warning(
+                "More than half of scanned calibration records were empty; "
+                "expert ranking may be unstable."
+            )
     if len(sequences) < max_samples:
         logger.warning(
             "Loaded %d calibration sequences (requested %d). "

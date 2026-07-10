@@ -480,7 +480,12 @@ def _safe_adapter(
         return adapter
     try:
         return infer_model_adapter(model, config)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "adapter inference failed for metrics: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return None
 
 
@@ -489,7 +494,12 @@ def _safe_layers(adapter: Any | None, model: Any) -> list[Any]:
         return []
     try:
         return list(adapter.layers(model))
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "adapter.layers failed for metrics: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return []
 
 
@@ -498,7 +508,12 @@ def _safe_moe_layers(adapter: Any | None, model: Any) -> list[int]:
         return []
     try:
         return [int(idx) for idx in adapter.identify_moe_layers(model)]
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "adapter.identify_moe_layers failed for metrics: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
         return []
 
 
@@ -707,12 +722,24 @@ def _sample_mlx_memory() -> dict[str, Any]:
 def _sample_process_memory() -> dict[str, Any]:
     usage = resource.getrusage(resource.RUSAGE_SELF)
     raw = int(usage.ru_maxrss)
-    # ru_maxrss is in bytes on macOS, kilobytes on Linux/BSD
-    divisor = 1_000_000 if sys.platform == "darwin" else 1_000
+    # ru_maxrss is in bytes on macOS, kilobytes on Linux/BSD.
+    # Convert to approximate decimal megabytes for a cross-platform summary field.
+    if sys.platform == "darwin":
+        max_rss_bytes = raw
+        max_rss_mb_approx = round(raw / 1_000_000, 1)
+        ru_maxrss_unit = "bytes"
+    else:
+        max_rss_bytes = raw * 1000
+        max_rss_mb_approx = round(raw / 1_000, 1)
+        ru_maxrss_unit = "kilobytes"
     return {
-        "max_rss_mb": round(raw / divisor, 1),
-        "max_rss_bytes": raw if sys.platform == "darwin" else raw * 1000,
-        "max_rss_units": "megabytes",
+        "max_rss_mb": max_rss_mb_approx,
+        "max_rss_mb_approx": max_rss_mb_approx,
+        "max_rss_bytes": max_rss_bytes,
+        "max_rss_units": "megabytes_approx",
+        "ru_maxrss_raw": raw,
+        "ru_maxrss_unit": ru_maxrss_unit,
+        "platform": sys.platform,
     }
 
 

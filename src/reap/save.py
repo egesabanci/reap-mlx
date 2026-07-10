@@ -233,6 +233,8 @@ def _prepare_output_dir(output_dir: str | Path) -> Path:
         # Clean stale artifacts from previous runs to avoid masking failed saves.
         # Tokenizer files are included so that pruning a *different* model into the
         # same output directory cannot leave an incompatible (stale) tokenizer behind.
+        # Also clear prior validation metrics so a failed new run cannot be mistaken
+        # for a prior success. Keep reap-checkpoint.json so save retries can resume.
         for pattern in (
             "*.safetensors",
             "*.npz",
@@ -244,6 +246,7 @@ def _prepare_output_dir(output_dir: str | Path) -> Path:
             "added_tokens.json",
             "merges.txt",
             "vocab.json",
+            "validation-metrics.json",
         ):
             for f in output_path.glob(pattern):
                 f.unlink(missing_ok=True)

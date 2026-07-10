@@ -15,7 +15,12 @@ from reap.checkpoint import load_checkpoint, write_checkpoint
 from reap.data import load_calibration_sequences
 from reap.model_adapters import infer_model_adapter
 from reap.observer import observe_model
-from reap.prune import apply_keep_indices, prune_experts, resolve_prune_method
+from reap.prune import (
+    apply_keep_indices,
+    prune_experts,
+    resolve_prune_method,
+    validate_layer_prune_plan,
+)
 from reap.save import generation_smoke, save_pruned_model
 from reap.validation_metrics import RunMetrics
 
@@ -103,7 +108,40 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=128,
     )
+    parser.add_argument(
+        "--min-calibration-samples",
+        type=int,
+        default=None,
+        help=(
+            "Minimum non-empty calibration sequences required (default: "
+            "same as --max-samples). Use with --allow-partial-calibration "
+            "to accept fewer sequences when the dataset is small."
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial-calibration",
+        action="store_true",
+        help=(
+            "Allow fewer than --min-calibration-samples sequences after "
+            "filtering empty records (still requires at least one sequence)."
+        ),
+    )
     parser.add_argument("--max-seq-length", type=int, default=2048)
+    parser.add_argument(
+        "--strict-resume",
+        action="store_true",
+        default=True,
+        help=(
+            "On --resume-from-checkpoint, error when checkpoint model_name "
+            "or adapter_name does not match the loaded model (default: on)."
+        ),
+    )
+    parser.add_argument(
+        "--no-strict-resume",
+        action="store_false",
+        dest="strict_resume",
+        help="Allow resume when checkpoint model/adapter metadata mismatches.",
+    )
     parser.add_argument(
         "--eval-frequency",
         type=int,
@@ -242,23 +280,30 @@ def main(
                 "REAP pruning requires an MoE model with at least one MoE layer."
             )
         metrics.sample_memory("after_model_load")
+        per_layer_ratios = _parse_per_layer_ratios(args.per_layer_ratios)
+
         if args.resume_from_checkpoint:
             current_phase = "checkpoint_load"
             _emit(print_fn, f"resume: loading checkpoint {args.resume_from_checkpoint}")
             checkpoint = load_checkpoint(args.resume_from_checkpoint)
             ckpt_model = checkpoint.get("model_name")
             if ckpt_model and ckpt_model != args.model_name:
-                logger.warning(
-                    "Checkpoint was created for model %r but --model-name is "
-                    "%r; keep indices may not apply correctly.",
-                    ckpt_model, args.model_name,
+                message = (
+                    f"Checkpoint was created for model {ckpt_model!r} but "
+                    f"--model-name is {args.model_name!r}."
                 )
+                if args.strict_resume:
+                    raise ValueError(message + " Pass --no-strict-resume to override.")
+                logger.warning("%s Keep indices may not apply correctly.", message)
             ckpt_adapter = checkpoint.get("adapter_name")
             if ckpt_adapter and ckpt_adapter != adapter.adapter_name:
-                logger.warning(
-                    "Checkpoint adapter %r differs from inferred adapter %r.",
-                    ckpt_adapter, adapter.adapter_name,
+                message = (
+                    f"Checkpoint adapter {ckpt_adapter!r} differs from inferred "
+                    f"adapter {adapter.adapter_name!r}."
                 )
+                if args.strict_resume:
+                    raise ValueError(message + " Pass --no-strict-resume to override.")
+                logger.warning("%s", message)
             config_before_prune = copy.deepcopy(config)
             current_phase = "prune"
             _emit(print_fn, "resume: re-applying pruned experts from checkpoint")
@@ -279,6 +324,18 @@ def main(
             )
             metrics.sample_memory("after_prune")
         else:
+            # Fail illegal selective-prune / ratio plans before calibration.
+            current_phase = "prune_plan_validation"
+            validate_layer_prune_plan(
+                model,
+                config,
+                args.compression_ratio,
+                adapter=adapter,
+                skip_layer_indices=args.skip_layer_indices,
+                prune_layer_indices=args.prune_layer_indices,
+                per_layer_ratios=per_layer_ratios,
+            )
+
             current_phase = "calibration"
             _emit(print_fn, "calibrate: loading calibration sequences")
             with metrics.phase("calibration"):
@@ -293,6 +350,31 @@ def main(
                 )
             if not calibration_sequences:
                 raise RuntimeError("No non-empty calibration sequences were loaded.")
+            # Default floor is 1 (already enforced). Explicit
+            # --min-calibration-samples raises unless partial calibration is allowed.
+            if args.min_calibration_samples is not None:
+                min_samples = int(args.min_calibration_samples)
+                if (
+                    not args.allow_partial_calibration
+                    and len(calibration_sequences) < min_samples
+                ):
+                    raise RuntimeError(
+                        f"Loaded {len(calibration_sequences)} calibration sequences "
+                        f"but --min-calibration-samples requires {min_samples}. "
+                        "Pass --allow-partial-calibration to continue with fewer "
+                        "sequences, or reduce --min-calibration-samples."
+                    )
+            elif (
+                not args.allow_partial_calibration
+                and len(calibration_sequences) < args.max_samples
+            ):
+                logger.warning(
+                    "Loaded %d calibration sequences (requested max_samples=%d). "
+                    "Set --min-calibration-samples to enforce a hard floor, or "
+                    "--allow-partial-calibration to silence this concern.",
+                    len(calibration_sequences),
+                    args.max_samples,
+                )
             metrics.record_calibration(calibration_sequences)
             metrics.sample_memory("after_calibration")
 
@@ -312,6 +394,24 @@ def main(
                     "Observer returned no data. The model may have no observable MoE layers "
                     "or the adapter could not identify them."
                 )
+            total_observer_tokens = sum(
+                int(layer.get("total_tokens", 0)) for layer in observer_data.values()
+            )
+            saliency_all_zero = _observer_saliency_is_all_zero(
+                observer_data, args.prune_method
+            )
+            if total_observer_tokens < 1 and saliency_all_zero:
+                raise RuntimeError(
+                    "Observer collected zero tokens and no finite non-zero "
+                    "saliency across MoE layers; refusing to prune (would keep "
+                    "arbitrary lowest expert ids). Increase calibration samples "
+                    "or free memory and retry."
+                )
+            if saliency_all_zero:
+                raise RuntimeError(
+                    f"Observer saliency for method {args.prune_method!r} is all "
+                    "zeros or non-finite; refusing to prune without a routing signal."
+                )
             metrics.sample_memory("after_observe")
 
             current_phase = "prune"
@@ -326,7 +426,7 @@ def main(
                     args.compression_ratio,
                     skip_layer_indices=args.skip_layer_indices,
                     prune_layer_indices=args.prune_layer_indices,
-                    per_layer_ratios=_parse_per_layer_ratios(args.per_layer_ratios),
+                    per_layer_ratios=per_layer_ratios,
                 )
             metrics.record_pruning(
                 keep_by_layer,
@@ -337,21 +437,36 @@ def main(
             metrics.sample_memory("after_prune")
 
             # Persist the prune decision so a failed save can be resumed without
-            # re-running the expensive observe + prune phases.
+            # re-running the expensive observe + prune phases. Fail closed so
+            # users always have a recovery artifact after a successful prune.
             checkpoint_path = Path(args.output_dir) / "reap-checkpoint.json"
-            try:
-                write_checkpoint(
-                    checkpoint_path,
-                    keep_by_layer=keep_by_layer,
-                    config_before_prune=config_before_prune,
-                    model_name=args.model_name,
-                    prune_method=args.prune_method,
-                    compression_ratio=args.compression_ratio,
-                    adapter_name=adapter.adapter_name,
-                )
-                _emit(print_fn, f"checkpoint: wrote prune decision to {checkpoint_path}")
-            except (OSError, ValueError) as exc:
-                logger.warning("Failed to write prune checkpoint: %s", exc)
+            resolved_method = resolve_prune_method(args.prune_method)
+            write_checkpoint(
+                checkpoint_path,
+                keep_by_layer=keep_by_layer,
+                config_before_prune=config_before_prune,
+                model_name=args.model_name,
+                prune_method=args.prune_method,
+                compression_ratio=args.compression_ratio,
+                adapter_name=adapter.adapter_name,
+                dataset_name=args.dataset_name,
+                seed=args.seed,
+                max_samples=args.max_samples,
+                max_seq_length=args.max_seq_length,
+                skip_layer_indices=args.skip_layer_indices,
+                prune_layer_indices=args.prune_layer_indices,
+                per_layer_ratios=per_layer_ratios,
+                saliency_by_layer={
+                    int(idx): layer.get(resolved_method)
+                    for idx, layer in observer_data.items()
+                    if resolved_method in layer
+                },
+                observer_token_totals={
+                    int(idx): int(layer.get("total_tokens", 0))
+                    for idx, layer in observer_data.items()
+                },
+            )
+            _emit(print_fn, f"checkpoint: wrote prune decision to {checkpoint_path}")
             for layer_idx in sorted(keep_by_layer):
                 _emit(
                     print_fn,
@@ -380,6 +495,18 @@ def main(
         return 0
     except KeyboardInterrupt:
         _emit(print_fn, "interrupted: MLX pruning stopped")
+        try:
+            metrics.sample_memory("interrupted")
+            metrics.write(
+                status="interrupted",
+                failure={
+                    "phase": current_phase,
+                    "type": "KeyboardInterrupt",
+                    "message": "MLX pruning interrupted by user",
+                },
+            )
+        except Exception:
+            logger.exception("failed to write interrupted MLX validation metrics")
         return 130
     except Exception as exc:
         try:
@@ -410,6 +537,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     _validate_positive_int(args.max_seq_length, "max_seq_length")
     _validate_positive_int(args.eval_frequency, "eval_frequency")
     _validate_positive_int(args.smoke_max_tokens, "smoke_max_tokens")
+    if args.min_calibration_samples is not None:
+        _validate_positive_int(args.min_calibration_samples, "min_calibration_samples")
 
     ratio = float(args.compression_ratio)
     if not math.isfinite(ratio) or ratio < 0.0 or ratio >= 1.0:
@@ -422,8 +551,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
 
     # Parse and validate per-layer ratios early so malformed input surfaces
-    # via argparse error handling rather than mid-pipeline.
-    _parse_per_layer_ratios(args.per_layer_ratios)
+    # via argparse error handling rather than mid-pipeline. Range checks and
+    # uniform retained-count checks run after model load via
+    # validate_layer_prune_plan (before calibration/observe).
+    parsed_ratios = _parse_per_layer_ratios(args.per_layer_ratios)
+    if parsed_ratios:
+        for layer_idx, layer_ratio in parsed_ratios.items():
+            if not math.isfinite(layer_ratio) or layer_ratio < 0.0 or layer_ratio >= 1.0:
+                raise ValueError(
+                    f"per_layer_ratios[{layer_idx}] must be in [0, 1), got {layer_ratio}."
+                )
 
 
 def _validate_positive_int(value: Any, name: str) -> None:
@@ -484,11 +621,37 @@ def _supports_keyword(fn: Callable[..., Any], keyword: str) -> bool:
 
 
 def _infer_adapter_safely(model: Any, config: Mapping[str, Any]) -> Any | None:
+    """Infer adapter for control flow, chaining the original exception on failure."""
     try:
         return infer_model_adapter(model, config)
-    except Exception:
-        logger.debug("could not infer MLX model adapter for metrics", exc_info=True)
-        return None
+    except Exception as exc:
+        logger.debug("could not infer MLX model adapter", exc_info=True)
+        raise ValueError(
+            "Could not determine the MoE architecture adapter for this model. "
+            "REAP pruning currently supports Qwen3-MoE and LFM2-MoE architectures. "
+            f"Underlying error: {exc.__class__.__name__}: {exc}"
+        ) from exc
+
+
+def _observer_saliency_is_all_zero(
+    observer_data: Mapping[int, Mapping[str, Any]],
+    prune_method: str,
+) -> bool:
+    try:
+        resolved = resolve_prune_method(prune_method)
+    except ValueError:
+        resolved = prune_method
+    import numpy as np
+
+    saw_any = False
+    for layer_data in observer_data.values():
+        if resolved not in layer_data:
+            continue
+        scores = np.asarray(layer_data[resolved], dtype=np.float64)
+        saw_any = True
+        if scores.size and np.any(np.isfinite(scores) & (np.abs(scores) > 0)):
+            return False
+    return saw_any
 
 
 def _emit(print_fn: Callable[[str], Any], message: str) -> None:

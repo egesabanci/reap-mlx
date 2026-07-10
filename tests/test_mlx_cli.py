@@ -468,13 +468,37 @@ def test_main_writes_failed_metrics_when_pipeline_phase_raises(tmp_path):
     assert payload["failure"]["message"] == "observer failed"
 
 
+def _multi_moe_model_and_config(num_layers: int = 2, num_experts: int = 4):
+    """Return a multi-layer MoE model for selective-prune CLI tests."""
+    layers = []
+    for _ in range(num_layers):
+        layers.append(
+            SimpleNamespace(
+                mlp=SimpleNamespace(
+                    switch_mlp=object(),
+                    num_experts=num_experts,
+                    top_k=2,
+                    num_experts_per_tok=2,
+                )
+            )
+        )
+    model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+    config = {
+        "num_experts": num_experts,
+        "num_experts_per_tok": 2,
+        "hidden_size": 64,
+        "num_hidden_layers": num_layers,
+    }
+    return model, object(), config
+
+
 def test_main_passes_layer_selection_flags_to_prune(tmp_path):
     prune_kwargs = {}
 
     def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
         del model_arg, config_arg, observer_data, method, ratio
         prune_kwargs.update(kwargs)
-        return {0: [0, 1, 2]}
+        return {0: [0, 1, 2, 3]}
 
     code = main(
         [
@@ -484,14 +508,20 @@ def test_main_passes_layer_selection_flags_to_prune(tmp_path):
             "dataset",
             "--output-dir",
             str(tmp_path),
+            # ratio 0 keeps uniform expert counts when skipping a layer
+            "--compression-ratio",
+            "0",
             "--prune-layer-indices",
             "0",
             "--skip-layer-indices",
-            "3",
+            "1",
         ],
-        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_model_fn=lambda model_name: (*_multi_moe_model_and_config(2),),
         load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
-        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        observe_model_fn=lambda *args, **kwargs: {
+            0: {"reap": [1.0, 0.5, 0.25, 0.1], "total_tokens": 1},
+            1: {"reap": [1.0, 0.5, 0.25, 0.1], "total_tokens": 1},
+        },
         prune_experts_fn=fake_prune_experts,
         save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
             output_dir=tmp_path
@@ -501,7 +531,7 @@ def test_main_passes_layer_selection_flags_to_prune(tmp_path):
 
     assert code == 0
     assert prune_kwargs["prune_layer_indices"] == [0]
-    assert prune_kwargs["skip_layer_indices"] == [3]
+    assert prune_kwargs["skip_layer_indices"] == [1]
 
 
 def test_main_passes_per_layer_ratios_to_prune(tmp_path):
@@ -510,7 +540,37 @@ def test_main_passes_per_layer_ratios_to_prune(tmp_path):
     def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
         del model_arg, config_arg, observer_data, method, ratio
         prune_kwargs.update(kwargs)
-        return {0: [0, 1, 2]}
+        return {0: [0, 1], 1: [0, 1]}
+
+    # Heterogeneous experts: 4 * 0.5 -> 2 retained, 8 * 0.75 -> 2 retained.
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    mlp=SimpleNamespace(
+                        switch_mlp=object(),
+                        num_experts=4,
+                        top_k=2,
+                        num_experts_per_tok=2,
+                    )
+                ),
+                SimpleNamespace(
+                    mlp=SimpleNamespace(
+                        switch_mlp=object(),
+                        num_experts=8,
+                        top_k=2,
+                        num_experts_per_tok=2,
+                    )
+                ),
+            ]
+        )
+    )
+    config = {
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+    }
 
     code = main(
         [
@@ -524,9 +584,15 @@ def test_main_passes_per_layer_ratios_to_prune(tmp_path):
             "0:0.5",
             "1:0.75",
         ],
-        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_model_fn=lambda model_name: (model, object(), config),
         load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
-        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        observe_model_fn=lambda *args, **kwargs: {
+            0: {"reap": [1.0, 0.5, 0.25, 0.1], "total_tokens": 1},
+            1: {
+                "reap": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
+                "total_tokens": 1,
+            },
+        },
         prune_experts_fn=fake_prune_experts,
         save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
             output_dir=tmp_path
