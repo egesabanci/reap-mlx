@@ -33,6 +33,9 @@ EXPECTED_PRUNING_KEYS = {
     "weighted_expert_frequency_sum",
     "reap",
     "max_activations",
+    "shared_expert_ean_sum",
+    "shared_expert_ean_mean",
+    "shared_expert_tokens",
 }
 
 

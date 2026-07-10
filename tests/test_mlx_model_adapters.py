@@ -369,3 +369,30 @@ def test_make_attention_mask_requires_mlx_lm_when_missing():
 
     with pytest.raises(ModuleNotFoundError, match="mlx_lm"):
         make_attention_mask(hidden_states=object())
+
+
+def test_infer_mixtral_adapter_from_block_sparse_moe_layout():
+    from types import SimpleNamespace
+    from reap.model_adapters import MixtralMoeModelAdapter, infer_model_adapter
+
+    layer = SimpleNamespace(
+        block_sparse_moe=SimpleNamespace(
+            switch_mlp=object(),
+            num_experts=8,
+            num_experts_per_tok=2,
+        )
+    )
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+    adapter = infer_model_adapter(model, {"model_type": "mixtral"})
+    assert isinstance(adapter, MixtralMoeModelAdapter)
+    assert adapter.identify_moe_layers(model) == [0]
+    cfg = adapter.get_layer_config(layer, {"num_local_experts": 8, "num_experts_per_tok": 2})
+    assert cfg.num_experts == 8
+    assert cfg.top_k == 2
+
+
+def test_infer_qwen2_moe_config_only():
+    from reap.model_adapters import Qwen3MoeModelAdapter, infer_model_adapter
+
+    adapter = infer_model_adapter(None, {"model_type": "qwen2_moe"})
+    assert isinstance(adapter, Qwen3MoeModelAdapter)

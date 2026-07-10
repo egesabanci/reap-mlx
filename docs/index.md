@@ -29,6 +29,7 @@ function that needs those packages executes.
 | [Save Reload Validation](save-reload-validation.md) | Artifact saving, reload checks, shape validation, and smoke generation. |
 | [CLI](cli.md) | Command-line options, examples, wrapper script, and failure behavior. |
 | [Telemetry](telemetry.md) | `validation-metrics.json` schema and interpretation guide. |
+| [Eval](eval.md) | Calibration NLL and third-party evaluation recipes. |
 | [Development](development.md) | Test commands, import-safety checks, and extension workflow. |
 
 ## Core Guarantees

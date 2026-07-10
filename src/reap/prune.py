@@ -95,30 +95,24 @@ def _layer_ratio(
     return compression_ratio
 
 
-def validate_layer_prune_plan(
-    model: Any,
+def _compute_final_expert_counts(
+    layers: Any,
+    all_moe_indices: list[int],
+    selected_set: set[int],
     config: Mapping[str, Any],
+    adapter: Any,
     compression_ratio: float,
-    *,
-    adapter: Any | None = None,
-    skip_layer_indices: list[int] | None = None,
-    prune_layer_indices: list[int] | None = None,
-    per_layer_ratios: dict[int, float] | None = None,
+    per_layer_ratios: dict[int, float] | None,
+    target_experts: int | None = None,
 ) -> dict[int, int]:
-    """Validate layer filters/ratios and return final expert counts per MoE layer.
+    """Plan retained expert counts for every MoE layer (reload-safe uniform).
 
-    Call this after model load (before calibration/observe) so illegal selective
-    prune configs fail without burning observation compute.
+    Layers selected for the primary prune method use ``compression_ratio`` /
+    ``per_layer_ratios`` (or ``target_experts``). Layers skipped from the primary
+    method are still width-matched to the same retained count using a secondary
+    ranking (expert_frequency) so mlx-lm's single global ``num_experts`` remains
+    valid — they are not left at full width.
     """
-    adapter = infer_model_adapter(model, config) if adapter is None else adapter
-    _validate_adapter(adapter)
-    _validate_compression_ratio(compression_ratio)
-    layers = adapter.layers(model)
-    all_moe_indices = list(adapter.identify_moe_layers(model))
-    selected_moe_indices = _select_moe_layers(
-        all_moe_indices, skip_layer_indices, prune_layer_indices
-    )
-    selected_set = set(selected_moe_indices)
     if per_layer_ratios:
         unknown = set(per_layer_ratios) - set(all_moe_indices)
         if unknown:
@@ -129,26 +123,95 @@ def validate_layer_prune_plan(
         for ratio in per_layer_ratios.values():
             _validate_compression_ratio(ratio)
 
+    if target_experts is not None:
+        target_experts = int(target_experts)
+        if target_experts < 1:
+            raise ValueError(
+                f"target_experts must be a positive integer, got {target_experts}."
+            )
+
+    selected_retained: dict[int, int] = {}
+    for layer_idx in sorted(selected_set):
+        layer_cfg = adapter.get_layer_config(layers[layer_idx], config)
+        if target_experts is not None:
+            retained = min(target_experts, layer_cfg.num_experts)
+            retained = max(retained, 1)
+        else:
+            ratio_i = _layer_ratio(layer_idx, per_layer_ratios, compression_ratio)
+            retained = _retained_expert_count(layer_cfg.num_experts, ratio_i)
+        selected_retained[layer_idx] = retained
+
+    if len(set(selected_retained.values())) > 1:
+        raise ValueError(
+            "Primary prune selection would leave differing retained expert "
+            f"counts among selected layers ({selected_retained}). mlx-lm "
+            "requires a uniform num_experts. Align --per-layer-ratios / "
+            "--target-experts so selected layers retain the same count."
+        )
+    target_r = next(iter(selected_retained.values()))
+
     final_counts: dict[int, int] = {}
     for layer_idx in all_moe_indices:
         layer_cfg = adapter.get_layer_config(layers[layer_idx], config)
         if layer_idx in selected_set:
-            ratio_i = _layer_ratio(layer_idx, per_layer_ratios, compression_ratio)
-            final_counts[layer_idx] = _retained_expert_count(
-                layer_cfg.num_experts, ratio_i
+            final_counts[layer_idx] = selected_retained[layer_idx]
+            continue
+        # Width-match skipped layers to target_r for save/reload safety.
+        if layer_cfg.num_experts < target_r:
+            raise ValueError(
+                f"Skipped MoE layer {layer_idx} has only {layer_cfg.num_experts} "
+                f"experts but primary pruning retains {target_r}. Cannot "
+                "width-match for mlx-lm reload."
             )
-        else:
-            final_counts[layer_idx] = layer_cfg.num_experts
-    if len(set(final_counts.values())) > 1:
-        raise ValueError(
-            "Pruning would leave MoE layers with differing expert counts "
-            f"({final_counts}). mlx-lm rebuilds every MoE layer from a single "
-            "scalar num_experts in config, so save/reload requires a uniform "
-            "expert count across all MoE layers. Use uniform ratios or prune "
-            "all layers. On homogeneous MoEs, --skip-layer-indices with "
-            "compression_ratio > 0 always diverges retained counts."
-        )
+        final_counts[layer_idx] = target_r
+        if layer_cfg.num_experts > target_r:
+            logger.info(
+                "Layer %d skipped primary prune method; width-matching to %d "
+                "experts via expert_frequency so save/reload stays uniform.",
+                layer_idx,
+                target_r,
+            )
     return final_counts
+
+
+def validate_layer_prune_plan(
+    model: Any,
+    config: Mapping[str, Any],
+    compression_ratio: float,
+    *,
+    adapter: Any | None = None,
+    skip_layer_indices: list[int] | None = None,
+    prune_layer_indices: list[int] | None = None,
+    per_layer_ratios: dict[int, float] | None = None,
+    target_experts: int | None = None,
+) -> dict[int, int]:
+    """Validate layer filters/ratios and return final expert counts per MoE layer.
+
+    Call this after model load (before calibration/observe) so illegal selective
+    prune configs fail without burning observation compute.
+
+    Skipped / non-selected MoE layers are planned to the same retained width as
+    the primary selection (frequency fallback at prune time), not left full-size.
+    """
+    adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    _validate_adapter(adapter)
+    _validate_compression_ratio(compression_ratio)
+    layers = adapter.layers(model)
+    all_moe_indices = list(adapter.identify_moe_layers(model))
+    selected_moe_indices = _select_moe_layers(
+        all_moe_indices, skip_layer_indices, prune_layer_indices
+    )
+    selected_set = set(selected_moe_indices)
+    return _compute_final_expert_counts(
+        layers,
+        all_moe_indices,
+        selected_set,
+        config,
+        adapter,
+        compression_ratio,
+        per_layer_ratios,
+        target_experts=target_experts,
+    )
 
 
 def prune_experts(
@@ -162,11 +225,16 @@ def prune_experts(
     skip_layer_indices: list[int] | None = None,
     prune_layer_indices: list[int] | None = None,
     per_layer_ratios: dict[int, float] | None = None,
+    target_experts: int | None = None,
 ) -> dict[int, np.ndarray]:
     """Prune adapter-discovered MLX MoE experts in place.
 
     This mutates both the live model and the passed config mapping in place.
     Copy config before calling if pre-pruning values are still needed.
+
+    Layers excluded from the primary method (skip / not in prune_layer_indices)
+    are still width-matched to the same retained expert count via
+    ``expert_frequency`` so mlx-lm save/reload remains valid.
 
     Returns a mapping from layer index to ascending retained expert indices.
     """
@@ -185,37 +253,18 @@ def prune_experts(
         all_moe_indices, skip_layer_indices, prune_layer_indices
     )
     selected_set = set(selected_moe_indices)
-    # Validate per-layer ratios and pre-check reload safety up front. mlx-lm
-    # rebuilds every MoE layer from a single scalar num_experts in config, so
-    # save/reload requires a uniform expert count across ALL MoE layers (pruned
-    # and skipped). Computing the final count per MoE layer before the loop
-    # lets us fail BEFORE any weights are sliced, avoiding a half-pruned model.
-    if per_layer_ratios:
-        unknown = set(per_layer_ratios) - set(all_moe_indices)
-        if unknown:
-            raise ValueError(
-                "per_layer_ratios contains non-MoE layer indices: "
-                f"{sorted(unknown)}. Available MoE layers: {sorted(all_moe_indices)}.",
-            )
-        for _r in per_layer_ratios.values():
-            _validate_compression_ratio(_r)
-    final_counts: dict[int, int] = {}
-    for _i in all_moe_indices:
-        _layer_cfg = adapter.get_layer_config(layers[_i], config)
-        if _i in selected_set:
-            _ratio_i = _layer_ratio(_i, per_layer_ratios, compression_ratio)
-            final_counts[_i] = _retained_expert_count(_layer_cfg.num_experts, _ratio_i)
-        else:
-            final_counts[_i] = _layer_cfg.num_experts
-    if len(set(final_counts.values())) > 1:
-        raise ValueError(
-            "Pruning would leave MoE layers with differing expert counts "
-            f"({final_counts}). mlx-lm rebuilds every MoE layer from a single "
-            "scalar num_experts in config, so save/reload requires a uniform "
-            "expert count across all MoE layers. Use uniform ratios or prune "
-            "all layers."
-        )
-    for layer_idx in selected_moe_indices:
+    final_counts = _compute_final_expert_counts(
+        layers,
+        all_moe_indices,
+        selected_set,
+        config,
+        adapter,
+        compression_ratio,
+        per_layer_ratios,
+        target_experts=target_experts,
+    )
+
+    for layer_idx in all_moe_indices:
         if layer_idx not in observer_data:
             raise ValueError(
                 f"Missing observer data for MoE layer {layer_idx}. "
@@ -224,22 +273,19 @@ def prune_experts(
 
         layer = layers[layer_idx]
         moe = adapter.get_moe(layer)
-        # Structural integrity: ensure the MoE module at this position still has
-        # a callable switch_mlp, guarding against model mutation between the
-        # observe and prune phases (which would silently use wrong metrics).
         if not callable(getattr(moe, "switch_mlp", None)):
             raise ValueError(
                 f"MoE layer {layer_idx} no longer has a callable switch_mlp. "
                 "The model may have been modified between observation and pruning.",
             )
         layer_config = adapter.get_layer_config(layer, config)
+        retained_count = int(final_counts[layer_idx])
         layer_ratio = _layer_ratio(layer_idx, per_layer_ratios, compression_ratio)
-        retained_count = _retained_expert_count(
-            layer_config.num_experts,
-            layer_ratio,
-        )
+        primary = layer_idx in selected_set
+        method_for_layer = prune_method if primary else "expert_frequency"
+
         num_to_prune = int(layer_config.num_experts) - retained_count
-        if layer_ratio > 0.0 and num_to_prune == 0:
+        if primary and layer_ratio > 0.0 and num_to_prune == 0 and target_experts is None:
             logger.warning(
                 "Layer %d: compression_ratio=%.4f prunes 0 of %d experts "
                 "(floor(num_experts * ratio) == 0). Increase the ratio or "
@@ -250,15 +296,25 @@ def prune_experts(
             )
         if retained_count <= 2:
             logger.warning(
-                "Layer %d: compression_ratio=%.2f retains %d/%d experts. "
+                "Layer %d: retains %d/%d experts. "
                 "With fewer than 3 experts the model may lose effective "
                 "MoE routing diversity.",
-                layer_idx, layer_ratio, retained_count,
+                layer_idx,
+                retained_count,
                 layer_config.num_experts,
             )
+        if not primary and num_to_prune > 0:
+            logger.warning(
+                "Layer %d: not in primary prune set; width-matching with "
+                "expert_frequency (%d -> %d experts).",
+                layer_idx,
+                layer_config.num_experts,
+                retained_count,
+            )
+
         saliency = _saliency_scores(
             observer_data[layer_idx],
-            prune_method,
+            method_for_layer,
             num_experts=layer_config.num_experts,
             layer_idx=layer_idx,
         )
@@ -273,6 +329,8 @@ def prune_experts(
                 layer_idx=layer_idx,
             )
         else:
+            # qwen3_moe, mixtral_moe, and other switch_mlp families share
+            # gate/switch projection layouts for dim-0 expert slicing.
             _prune_qwen3_moe_layer(
                 adapter.get_moe(layer),
                 keep_indices,
@@ -282,13 +340,12 @@ def prune_experts(
             )
         keep_by_layer[layer_idx] = keep_indices
         if retained_count >= layer_config.num_experts:
-            logger.warning(
-                "Layer %d compression_ratio=%s retains all %d experts "
-                "(no pruning).",
-                layer_idx,
-                layer_ratio,
-                layer_config.num_experts,
-            )
+            if primary:
+                logger.warning(
+                    "Layer %d retains all %d experts (no pruning).",
+                    layer_idx,
+                    layer_config.num_experts,
+                )
         else:
             total_pruned_global += layer_config.num_experts - retained_count
 
@@ -310,11 +367,18 @@ def prune_experts(
             num_experts=config_num_experts,
             top_k=config_top_k or config_num_experts,
         )
+        # Audit metadata for heterogeneous native layouts / selective plans.
+        config["reap_retained_experts_by_layer"] = {
+            str(int(k)): int(v) for k, v in sorted(final_counts.items())
+        }
+        config["reap_primary_prune_layers"] = [
+            int(i) for i in sorted(selected_set)
+        ]
 
     if total_pruned_global == 0:
         logger.warning(
             "compression_ratio=%s resulted in zero experts being pruned "
-            "across all layers. Use a larger ratio to reduce the model.",
+            "across all layers. Use a larger ratio or --target-experts.",
             compression_ratio,
         )
 
@@ -528,10 +592,10 @@ def _validate_adapter(adapter: Any) -> None:
             "explicit adapter.",
         )
     adapter_name = getattr(adapter, "adapter_name", None)
-    if adapter_name not in {"qwen3_moe", "lfm2_moe"}:
+    if adapter_name not in {"qwen3_moe", "lfm2_moe", "mixtral_moe"}:
         raise ValueError(
-            "MLX expert pruning currently supports the qwen3_moe and "
-            "lfm2_moe adapters only; "
+            "MLX expert pruning currently supports the qwen3_moe, "
+            "lfm2_moe, and mixtral_moe adapters; "
             f"got {adapter_name!r}.",
         )
 

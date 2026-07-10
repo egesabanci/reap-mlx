@@ -541,40 +541,60 @@ def test_prune_experts_prune_layer_indices_selecting_all_layers_works():
     assert config["num_experts"] == 2
 
 
-def test_prune_experts_selective_subset_raises_reload_safety_guard():
+def test_prune_experts_selective_subset_width_matches_nonselected_layers():
     model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
     config = qwen_config(num_experts=4, top_k=3)
     observer_data = {
-        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
-        1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+        0: {
+            "reap": np.array([0.1, 0.9, 0.2, 0.8]),
+            "expert_frequency": np.array([1, 4, 2, 3]),
+        },
+        1: {
+            "reap": np.array([0.3, 0.7, 0.4, 0.6]),
+            "expert_frequency": np.array([5, 1, 1, 1]),
+        },
     }
-    with pytest.raises(ValueError, match="differing expert counts"):
-        prune_experts(
-            model,
-            config,
-            observer_data,
-            "reap",
-            0.5,
-            prune_layer_indices=[0],
-        )
+    keep = prune_experts(
+        model,
+        config,
+        observer_data,
+        "reap",
+        0.5,
+        prune_layer_indices=[0],
+    )
+    assert set(keep) == {0, 1}
+    assert len(keep[0]) == len(keep[1]) == 2
+    assert config["num_experts"] == 2
 
 
-def test_prune_experts_skip_layer_indices_raises_reload_safety_guard():
+def test_prune_experts_skip_layer_indices_width_matches_with_frequency():
+    """Skipped layers still compress to the primary retained count via frequency."""
     model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
     config = qwen_config(num_experts=4, top_k=3)
     observer_data = {
-        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
-        1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+        0: {
+            "reap": np.array([0.1, 0.9, 0.2, 0.8]),
+            "expert_frequency": np.array([1, 4, 2, 3]),
+        },
+        1: {
+            "reap": np.array([0.3, 0.7, 0.4, 0.6]),
+            "expert_frequency": np.array([10, 1, 1, 1]),
+        },
     }
-    with pytest.raises(ValueError, match="differing expert counts"):
-        prune_experts(
-            model,
-            config,
-            observer_data,
-            "reap",
-            0.5,
-            skip_layer_indices=[1],
-        )
+    keep = prune_experts(
+        model,
+        config,
+        observer_data,
+        "reap",
+        0.5,
+        skip_layer_indices=[1],
+    )
+    assert set(keep) == {0, 1}
+    assert len(keep[0]) == 2
+    assert len(keep[1]) == 2
+    assert model.model.layers[0].mlp.num_experts == 2
+    assert model.model.layers[1].mlp.num_experts == 2
+    assert config["num_experts"] == 2
 
 
 def test_prune_experts_rejects_invalid_prune_layer_index():
@@ -645,8 +665,8 @@ def test_prune_experts_per_layer_ratios_differing_counts_raises():
         0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
         1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
     }
-    # 4 * 0.5 -> 2; 4 * 0.25 -> 3. Differing -> reload-unsafe.
-    with pytest.raises(ValueError, match="differing expert counts"):
+    # 4 * 0.5 -> 2; 4 * 0.25 -> 3. Differing among selected -> reload-unsafe.
+    with pytest.raises(ValueError, match="differing retained expert counts"):
         prune_experts(
             model,
             config,
@@ -838,3 +858,71 @@ def test_apply_keep_indices_rejects_out_of_range_and_duplicates():
     config = qwen_config(num_experts=4, top_k=2)
     with pytest.raises(ValueError, match=r"\[0, 4\)"):
         apply_keep_indices(model, config, {0: np.array([0, 4])})
+
+
+@requires_mlx
+def test_prune_switch_glu_save_model_writes_nonempty_weights(tmp_path):
+    """Integration: pruned SwitchGLU parameters survive mlx_lm save_model."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.switch_layers import SwitchGLU
+    from mlx_lm.utils import save_model
+    from reap.model_adapters import Lfm2MoeModelAdapter
+
+    class Moe(nn.Module):
+        def __init__(self, n=4, k=2):
+            super().__init__()
+            self.num_experts = n
+            self.top_k = k
+            self.num_experts_per_tok = k
+            self.norm_topk_prob = True
+            self.use_expert_bias = True
+            self.gate = nn.Linear(8, n, bias=False)
+            self.switch_mlp = SwitchGLU(8, 16, n, bias=False)
+            self.expert_bias = mx.zeros((n,))
+
+    moe = Moe()
+    mx.eval(moe.parameters())
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)]))
+    config = {
+        "model_type": "lfm2_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "use_expert_bias": True,
+        "norm_topk_prob": True,
+    }
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8], dtype=np.float32)}},
+        "reap",
+        0.5,
+        adapter=Lfm2MoeModelAdapter(),
+    )
+    assert dict(tree_flatten(moe.parameters()))
+    out = tmp_path / "saved"
+    out.mkdir()
+    save_model(out, moe, donate_model=False)
+    weight_files = list(out.glob("*.safetensors")) + list(out.glob("*.npz"))
+    assert weight_files
+    assert max(f.stat().st_size for f in weight_files) > 1000
+
+
+def test_target_experts_uniform_across_heterogeneous_layers():
+    model = _make_heterogeneous_model()
+    config = qwen_config(num_experts=4, top_k=3)
+    observer_data = {
+        0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+        1: {"reap": np.array([0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6])},
+    }
+    keep = prune_experts(
+        model,
+        config,
+        observer_data,
+        "reap",
+        0.5,
+        target_experts=2,
+    )
+    assert config["num_experts"] == 2
+    assert len(keep[0]) == 2 and len(keep[1]) == 2

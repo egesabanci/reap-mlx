@@ -18,7 +18,7 @@ from reap.model_adapters import (
     make_attention_mask,
     make_ssm_mask,
 )
-from reap.router import Lfm2MoeRouter, Qwen3MoeRouter
+from reap.router import Lfm2MoeRouter, MixtralMoeRouter, Qwen3MoeRouter
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ def observe_model(
             print_fn=print_fn,
         )
 
+    # qwen3_moe and mixtral_moe share the standard attention+mlp residual layout.
     return _observe_qwen3_model(
         model,
         calibration_sequences,
@@ -151,7 +152,7 @@ def _observe_qwen3_model(
                         accumulators[layer_idx],
                         adapter=adapter,
                         config=config,
-                        router_cls=Qwen3MoeRouter,
+                        router_cls=_router_cls_for_adapter(adapter),
                     )
                 else:
                     dense_mlp = adapter.get_dense_mlp(layer)
@@ -181,6 +182,15 @@ def _observe_qwen3_model(
             break
 
     return _report_with_layer_guard(accumulators)
+
+
+def _router_cls_for_adapter(adapter: Any) -> type:
+    name = getattr(adapter, "adapter_name", None)
+    if name == "lfm2_moe":
+        return Lfm2MoeRouter
+    if name == "mixtral_moe":
+        return MixtralMoeRouter
+    return Qwen3MoeRouter
 
 
 def _observe_lfm2_model(
@@ -496,7 +506,14 @@ def _observe_selected_moe_layer(
     moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
     shared_expert = get_shared_expert(moe)
     if shared_expert is not None:
-        moe_out = moe_out + shared_expert(moe_input)
+        shared_out = shared_expert(moe_input)
+        # Optional gated shared experts (e.g. Qwen2-MoE).
+        shared_gate = getattr(moe, "shared_expert_gate", None)
+        if callable(shared_gate):
+            mx = _require_mlx_core()
+            shared_out = mx.sigmoid(shared_gate(moe_input)) * shared_out
+        state.accumulate_shared_expert(shared_out)
+        moe_out = moe_out + shared_out
     return moe_out
 
 

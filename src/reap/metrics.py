@@ -28,6 +28,8 @@ class PruningState:
     weighted_ean_sum: np.ndarray
     weighted_expert_frequency_sum: np.ndarray
     max_activations: np.ndarray
+    shared_expert_ean_sum: float = 0.0
+    shared_expert_tokens: int = 0
 
     @classmethod
     def initialize(
@@ -56,6 +58,8 @@ class PruningState:
             weighted_ean_sum=np.zeros(num_experts, dtype=np.float64),
             weighted_expert_frequency_sum=np.zeros(num_experts, dtype=np.float64),
             max_activations=np.zeros(num_experts, dtype=np.float32),
+            shared_expert_ean_sum=0.0,
+            shared_expert_tokens=0,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -73,6 +77,8 @@ class PruningState:
             "weighted_ean_sum": self.weighted_ean_sum.copy(),
             "weighted_expert_frequency_sum": self.weighted_expert_frequency_sum.copy(),
             "max_activations": self.max_activations.copy(),
+            "shared_expert_ean_sum": float(self.shared_expert_ean_sum),
+            "shared_expert_tokens": int(self.shared_expert_tokens),
         }
 
     def restore(self, snapshot: dict[str, Any]) -> None:
@@ -96,6 +102,22 @@ class PruningState:
         self.max_activations = np.asarray(
             snapshot["max_activations"], dtype=np.float32
         ).copy()
+        self.shared_expert_ean_sum = float(snapshot.get("shared_expert_ean_sum", 0.0))
+        self.shared_expert_tokens = int(snapshot.get("shared_expert_tokens", 0))
+
+    def accumulate_shared_expert(self, shared_outputs: Any) -> None:
+        """Record shared-expert activation energy (not used for expert ranking)."""
+        outputs = np.asarray(shared_outputs, dtype=np.float64)
+        if outputs.size == 0:
+            return
+        # Mean L2 norm over token positions.
+        if outputs.ndim >= 2:
+            token_norms = np.linalg.norm(outputs.reshape(-1, outputs.shape[-1]), axis=-1)
+            self.shared_expert_ean_sum += float(token_norms.sum())
+            self.shared_expert_tokens += int(token_norms.size)
+        else:
+            self.shared_expert_ean_sum += float(np.linalg.norm(outputs))
+            self.shared_expert_tokens += 1
 
     def accumulate(
         self,
@@ -228,6 +250,7 @@ class PruningState:
             _FLOAT_EPS,
         )
 
+        shared_den = max(int(self.shared_expert_tokens), 1)
         report = {
             "total_tokens": int(self.total_tokens),
             "total_slots": int(self.total_slots),
@@ -244,6 +267,10 @@ class PruningState:
             ),
             "reap": (self.weighted_ean_sum / count_denominator).astype(np.float32),
             "max_activations": self.max_activations.copy(),
+            # Shared experts are never pruned; these are diagnostic only.
+            "shared_expert_ean_sum": float(self.shared_expert_ean_sum),
+            "shared_expert_ean_mean": float(self.shared_expert_ean_sum / shared_den),
+            "shared_expert_tokens": int(self.shared_expert_tokens),
         }
         if self.pairwise_expert_frequency is not None:
             report["pairwise_expert_frequency"] = (

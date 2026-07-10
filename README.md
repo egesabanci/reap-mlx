@@ -134,7 +134,8 @@ The pruning pipeline is intentionally linear and inspectable.
 | Adapter | Model family | Status |
 | --- | --- | --- |
 | `lfm2_moe` | Liquid LFM2.5 MoE MLX-LM models | Validated with `LiquidAI/LFM2.5-8B-A1B-MLX-4bit` |
-| `qwen3_moe` | Qwen3-MoE MLX-LM-style models | Adapter and unit coverage present |
+| `qwen3_moe` | Qwen2/3-MoE, OLMoE, DeepSeek MoE (`mlp.switch_mlp`) | Adapter + unit coverage |
+| `mixtral_moe` | Mixtral / PhiMoE (`block_sparse_moe.switch_mlp`) | Adapter + unit coverage |
 
 Adding a model family should usually mean adding or extending an adapter in
 `src/reap/model_adapters.py`, router logic in `src/reap/router.py`, and pruning
@@ -142,11 +143,11 @@ coverage in `tests/test_mlx_model_adapters.py`, `tests/test_mlx_router.py`, and
 `tests/test_mlx_prune.py`.
 
 All MoE layers must end with the **same** retained expert count because mlx-lm
-stores a single global `num_experts`. Selective flags (`--skip-layer-indices`,
-`--per-layer-ratios`) are validated **before** calibration; on homogeneous MoEs,
-skipping layers with `compression_ratio > 0` always diverges counts and raises.
-Use uniform ratios, prune all layers, or (for research) heterogeneous native
-expert counts tuned to the same retained width.
+stores a single global `num_experts`. Selective flags are validated before
+calibration. Layers skipped from the primary `--prune-method` are still
+**width-matched** via `expert_frequency` so save/reload stays valid. Use
+`--target-experts N` to retain a fixed expert count on heterogeneous native
+layouts.
 
 ## Pruning Methods
 
@@ -293,12 +294,13 @@ Check formatting hygiene before committing:
 git diff --check
 ```
 
-## Third-party trees
+## Evaluation
+
+- Optional **calibration NLL** after reload: `--eval-calibration-nll`
+- Longer recipe and third-party harness notes: [docs/eval.md](docs/eval.md)
 
 The `third-party/` directory holds reference evaluation stacks (EvalPlus,
-LiveCodeBench, HELM, etc.). They are **not** wired into `reap.entrypoint` or CI.
-Use them manually against a saved pruned artifact if you need task metrics beyond
-the built-in reload + generation smoke checks.
+LiveCodeBench, HELM, etc.). They are not run by CI; see `docs/eval.md`.
 
 ## License
 

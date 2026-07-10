@@ -72,10 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "MoE layer indices to skip during pruning (default: none). "
-            "NOTE: mlx-lm reloads require a uniform expert count across all "
-            "MoE layers, so skipping layers that would keep a different count "
-            "than the pruned layers is not save/reload-safe and will raise."
+            "MoE layer indices to skip the primary --prune-method ranking. "
+            "Those layers are still width-matched to the same retained expert "
+            "count using expert_frequency so mlx-lm save/reload stays valid."
         ),
     )
     parser.add_argument(
@@ -95,10 +94,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Per-layer compression ratios as 'index:ratio' pairs, e.g. "
             "--per-layer-ratios 0:0.5 1:0.25. Layers not listed use "
-            "--compression-ratio. NOTE: mlx-lm reloads require a uniform "
-            "expert count across all MoE layers, so ratios that produce "
-            "differing retained counts across layers are not save/reload-safe "
-            "and will raise."
+            "--compression-ratio. Selected layers must retain a uniform "
+            "expert count for mlx-lm reload."
+        ),
+    )
+    parser.add_argument(
+        "--target-experts",
+        type=int,
+        default=None,
+        help=(
+            "Retain exactly this many experts in every MoE layer "
+            "(overrides --compression-ratio for retained count planning). "
+            "Useful for heterogeneous native expert counts."
         ),
     )
     parser.add_argument(
@@ -113,9 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Minimum non-empty calibration sequences required (default: "
-            "same as --max-samples). Use with --allow-partial-calibration "
-            "to accept fewer sequences when the dataset is small."
+            "Minimum non-empty calibration sequences required. "
+            "Defaults to --max-samples when unset. Pass "
+            "--allow-partial-calibration to accept fewer."
         ),
     )
     parser.add_argument(
@@ -174,6 +181,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help="Maximum tokens for the generation smoke test.",
+    )
+    parser.add_argument(
+        "--eval-calibration-nll",
+        action="store_true",
+        help=(
+            "After reload, compute mean next-token NLL on calibration "
+            "sequences (quick quality signal). See docs/eval.md."
+        ),
+    )
+    parser.add_argument(
+        "--eval-calibration-sequences",
+        type=int,
+        default=8,
+        help="Max calibration sequences for --eval-calibration-nll.",
     )
     return parser
 
@@ -258,7 +279,22 @@ def main(
     metrics.record_run_config(args)
     metrics.sample_memory("start")
     current_phase = "model_load"
+    # Fresh full runs: drop stale metrics so a prior success is not confused
+    # with a failed restart. Checkpoints are kept for resume.
+    if not args.resume_from_checkpoint:
+        metrics_path = Path(args.metrics_file)
+        stale_metrics = (
+            metrics_path
+            if metrics_path.is_absolute()
+            else Path(args.output_dir) / metrics_path
+        )
+        try:
+            if stale_metrics.is_file():
+                stale_metrics.unlink()
+        except OSError as exc:
+            logger.warning("Could not clear stale metrics %s: %s", stale_metrics, exc)
 
+    calibration_sequences: list[Any] = []
     try:
         _emit(print_fn, "load: loading MLX-LM model")
         with metrics.phase("model_load"):
@@ -270,7 +306,8 @@ def main(
         if adapter is None:
             raise ValueError(
                 "Could not determine the MoE architecture adapter for this model. "
-                "REAP pruning currently supports Qwen3-MoE and LFM2-MoE architectures. "
+                "REAP pruning currently supports Qwen3-MoE, LFM2-MoE, and "
+                "Mixtral-style block_sparse_moe architectures. "
                 f"Model type: {config.get('model_type', 'unknown')}."
             )
         moe_layer_indices = adapter.identify_moe_layers(model)
@@ -334,6 +371,7 @@ def main(
                 skip_layer_indices=args.skip_layer_indices,
                 prune_layer_indices=args.prune_layer_indices,
                 per_layer_ratios=per_layer_ratios,
+                target_experts=args.target_experts,
             )
 
             current_phase = "calibration"
@@ -350,30 +388,22 @@ def main(
                 )
             if not calibration_sequences:
                 raise RuntimeError("No non-empty calibration sequences were loaded.")
-            # Default floor is 1 (already enforced). Explicit
-            # --min-calibration-samples raises unless partial calibration is allowed.
-            if args.min_calibration_samples is not None:
-                min_samples = int(args.min_calibration_samples)
-                if (
-                    not args.allow_partial_calibration
-                    and len(calibration_sequences) < min_samples
-                ):
-                    raise RuntimeError(
-                        f"Loaded {len(calibration_sequences)} calibration sequences "
-                        f"but --min-calibration-samples requires {min_samples}. "
-                        "Pass --allow-partial-calibration to continue with fewer "
-                        "sequences, or reduce --min-calibration-samples."
-                    )
-            elif (
+            min_samples = (
+                int(args.min_calibration_samples)
+                if args.min_calibration_samples is not None
+                else int(args.max_samples)
+            )
+            if (
                 not args.allow_partial_calibration
-                and len(calibration_sequences) < args.max_samples
+                and len(calibration_sequences) < min_samples
             ):
-                logger.warning(
-                    "Loaded %d calibration sequences (requested max_samples=%d). "
-                    "Set --min-calibration-samples to enforce a hard floor, or "
-                    "--allow-partial-calibration to silence this concern.",
-                    len(calibration_sequences),
-                    args.max_samples,
+                raise RuntimeError(
+                    f"Loaded {len(calibration_sequences)} calibration sequences "
+                    f"but requires {min_samples} "
+                    f"(--min-calibration-samples / default --max-samples). "
+                    "Pass --allow-partial-calibration to continue with fewer "
+                    "sequences, or reduce --max-samples / "
+                    "--min-calibration-samples."
                 )
             metrics.record_calibration(calibration_sequences)
             metrics.sample_memory("after_calibration")
@@ -427,6 +457,7 @@ def main(
                     skip_layer_indices=args.skip_layer_indices,
                     prune_layer_indices=args.prune_layer_indices,
                     per_layer_ratios=per_layer_ratios,
+                    target_experts=args.target_experts,
                 )
             metrics.record_pruning(
                 keep_by_layer,
@@ -489,6 +520,31 @@ def main(
             )
         metrics.record_save_reload(result, adapter=adapter)
         metrics.sample_memory("after_save_reload_smoke")
+
+        if args.eval_calibration_nll and calibration_sequences:
+            current_phase = "eval_calibration_nll"
+            _emit(print_fn, "eval: calibration mean NLL on reloaded model")
+            from reap.eval_nll import calibration_mean_nll
+
+            with metrics.phase("eval_calibration_nll"):
+                nll_payload = calibration_mean_nll(
+                    result.reloaded_model,
+                    calibration_sequences,
+                    max_sequences=args.eval_calibration_sequences,
+                    max_seq_length=args.max_seq_length,
+                )
+            metrics.data["quality"] = nll_payload
+            _emit(
+                print_fn,
+                f"eval: nll status={nll_payload.get('status')} "
+                f"mean_nll={nll_payload.get('mean_nll')}",
+            )
+        elif args.eval_calibration_nll and not calibration_sequences:
+            metrics.data["quality"] = {
+                "status": "skipped",
+                "error": "no calibration sequences available (resume path)",
+            }
+
         metrics.write(status="success")
         _emit(print_fn, "reload/smoke: validation complete")
         _emit(print_fn, f"done: saved MLX pruned model to {result.output_dir}")
@@ -539,6 +595,12 @@ def _validate_args(args: argparse.Namespace) -> None:
     _validate_positive_int(args.smoke_max_tokens, "smoke_max_tokens")
     if args.min_calibration_samples is not None:
         _validate_positive_int(args.min_calibration_samples, "min_calibration_samples")
+    if args.target_experts is not None:
+        _validate_positive_int(args.target_experts, "target_experts")
+    if args.eval_calibration_sequences is not None:
+        _validate_positive_int(
+            args.eval_calibration_sequences, "eval_calibration_sequences"
+        )
 
     ratio = float(args.compression_ratio)
     if not math.isfinite(ratio) or ratio < 0.0 or ratio >= 1.0:

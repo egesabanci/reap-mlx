@@ -28,11 +28,13 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 | `--dataset-config-name` | unset | Optional Hugging Face dataset config name. |
 | `--prune-method` | `reap` | Saliency key or alias used to rank experts. |
 | `--compression-ratio` | `0.25` | Fraction of experts to remove per MoE layer (floor semantics). |
-| `--skip-layer-indices` | none | MoE layers to skip (must keep uniform retained counts for save/reload). |
-| `--prune-layer-indices` | all MoE | Restrict pruning to these MoE indices. |
-| `--per-layer-ratios` | none | `index:ratio` overrides; validated for uniform retained counts before observe. |
-| `--min-calibration-samples` | unset | Optional hard floor on non-empty sequences. |
-| `--allow-partial-calibration` | off | Allow fewer than `--min-calibration-samples`. |
+| `--skip-layer-indices` | none | Skip primary ranking; still width-match via `expert_frequency`. |
+| `--prune-layer-indices` | all MoE | Restrict primary method to these MoE indices (others width-match). |
+| `--per-layer-ratios` | none | `index:ratio` overrides; selected layers must retain a uniform count. |
+| `--target-experts` | unset | Retain exactly N experts per MoE layer (overrides ratio planning). |
+| `--min-calibration-samples` | `= max-samples` | Hard floor on non-empty sequences (default equals `--max-samples`). |
+| `--allow-partial-calibration` | off | Allow fewer than the min sample floor. |
+| `--eval-calibration-nll` | off | After reload, compute mean next-token NLL on calibration data. |
 | `--resume-from-checkpoint` | unset | Re-apply keep indices and retry save only. |
 | `--strict-resume` / `--no-strict-resume` | strict on | Require checkpoint model/adapter to match. |
 | `--max-samples` | `128` | Maximum non-empty calibration samples. |

@@ -322,6 +322,88 @@ class Lfm2MoeModelAdapter:
         )
 
 
+class MixtralMoeModelAdapter:
+    """Mixtral / PhiMoE-style adapter (``layer.block_sparse_moe.switch_mlp``)."""
+
+    adapter_name = "mixtral_moe"
+
+    def layers(self, model: Any) -> Sequence[Any]:
+        return get_model_layers(model)
+
+    def identify_moe_layers(self, model: Any) -> list[int]:
+        return [
+            layer_idx
+            for layer_idx, layer in enumerate(self.layers(model))
+            if self.is_moe_layer(layer)
+        ]
+
+    def is_moe_layer(self, layer: Any) -> bool:
+        block = getattr(layer, "block_sparse_moe", None)
+        return block is not None and getattr(block, "switch_mlp", None) is not None
+
+    def get_moe(self, layer: Any) -> Any:
+        if not self.is_moe_layer(layer):
+            raise ValueError(
+                "Layer does not expose Mixtral-style block_sparse_moe.switch_mlp."
+            )
+        return layer.block_sparse_moe
+
+    def get_dense_mlp(self, layer: Any) -> Any:
+        # Dense layers in Mixtral still use the block when present; fall back to mlp.
+        block = getattr(layer, "block_sparse_moe", None)
+        if block is not None:
+            return block
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            raise ValueError("Layer does not expose block_sparse_moe or mlp.")
+        return mlp
+
+    def get_layer_config(
+        self,
+        layer: Any,
+        config: Mapping[str, Any] | None = None,
+    ) -> MoeLayerConfig:
+        moe = self.get_moe(layer)
+        num_experts = _positive_int(
+            _live_or_config_value(
+                moe,
+                ("num_experts", "num_local_experts"),
+                config,
+                ("num_local_experts", "num_experts"),
+            ),
+            "num_experts",
+        )
+        top_k = _positive_int(
+            _live_or_config_value(
+                moe,
+                ("top_k", "num_experts_per_tok"),
+                config,
+                ("num_experts_per_tok", "top_k"),
+            ),
+            "top_k",
+        )
+        return MoeLayerConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            norm_topk_prob=False,
+            adapter_name=self.adapter_name,
+        )
+
+
+_QWEN_FAMILY_TYPES = frozenset(
+    {
+        "qwen2_moe",
+        "qwen3_moe",
+        "qwen3_vl_moe",
+        "olmoe",
+        "deepseek",
+        "deepseek_v2",
+        "deepseek_v3",
+    }
+)
+_MIXTRAL_FAMILY_TYPES = frozenset({"mixtral", "phimoe", "phi_moe"})
+
+
 def infer_model_adapter(
     model: Any | None = None,
     config: Mapping[str, Any] | None = None,
@@ -329,13 +411,11 @@ def infer_model_adapter(
     """Infer the MLX architecture adapter from config or model layout.
 
     Returns ``None`` when no supported MoE architecture can be detected.
+    When a model object is provided, layout inspection wins so dense models
+    with a MoE-looking ``model_type`` are not mis-classified.
     """
-    model_type = _config_value(config, "model_type")
+    model_type = str(_config_value(config, "model_type") or "")
     architectures = _config_value(config, "architectures", default=()) or ()
-    if model_type == "lfm2_moe" or any(
-        str(architecture).startswith("Lfm2") for architecture in architectures
-    ):
-        return Lfm2MoeModelAdapter()
 
     if model is not None:
         try:
@@ -343,7 +423,6 @@ def infer_model_adapter(
         except ValueError:
             layers = ()
 
-        # Check for LFM2 MoE layers (feed_forward.switch_mlp)
         if any(
             getattr(getattr(layer, "feed_forward", None), "switch_mlp", None)
             is not None
@@ -351,7 +430,13 @@ def infer_model_adapter(
         ):
             return Lfm2MoeModelAdapter()
 
-        # Check for Qwen3 MoE layers (mlp.switch_mlp)
+        if any(
+            getattr(getattr(layer, "block_sparse_moe", None), "switch_mlp", None)
+            is not None
+            for layer in layers
+        ):
+            return MixtralMoeModelAdapter()
+
         if any(
             getattr(getattr(layer, "mlp", None), "switch_mlp", None)
             is not None
@@ -359,11 +444,29 @@ def infer_model_adapter(
         ):
             return Qwen3MoeModelAdapter()
 
+        # Live model has no supported MoE layout.
+        return None
+
+    # Config-only inference (no model object).
+    if model_type == "lfm2_moe" or any(
+        str(architecture).startswith("Lfm2") for architecture in architectures
+    ):
+        return Lfm2MoeModelAdapter()
+    if model_type in _MIXTRAL_FAMILY_TYPES or any(
+        "Mixtral" in str(a) or "PhiMoE" in str(a) for a in architectures
+    ):
+        return MixtralMoeModelAdapter()
+    if model_type in _QWEN_FAMILY_TYPES or any(
+        "Qwen" in str(a) and "Moe" in str(a) for a in architectures
+    ) or any(str(a).startswith("Olmoe") for a in architectures):
+        return Qwen3MoeModelAdapter()
+
     return None
 
 
 __all__ = [
     "Lfm2MoeModelAdapter",
+    "MixtralMoeModelAdapter",
     "MoeLayerConfig",
     "Qwen3MoeModelAdapter",
     "get_model_layers",
