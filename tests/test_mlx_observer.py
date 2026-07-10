@@ -487,7 +487,7 @@ def test_observe_model_rejects_invalid_eval_frequency():
 
 @requires_mlx
 def test_observe_model_eval_fallback_is_user_visible_and_resets_per_sequence():
-    """eval_frequency fallback must print a user-visible message and reset per sequence."""
+    """MemoryError on eval_fn falls back to eval_frequency=1 and resets per sequence."""
     import mlx.core as mx
 
     layers = [
@@ -501,10 +501,10 @@ def test_observe_model_eval_fallback_is_user_visible_and_resets_per_sequence():
     state = {"failed": False}
 
     def flaky_eval(h):
-        # Fail exactly once (first eval), then succeed forever after.
+        # Fail exactly once (first eval) with MemoryError, then succeed.
         if not state["failed"]:
             state["failed"] = True
-            raise RuntimeError("transient eval failure")
+            raise MemoryError("transient memory pressure")
         eval_calls.append(h.shape)
 
     messages = []
@@ -519,11 +519,30 @@ def test_observe_model_eval_fallback_is_user_visible_and_resets_per_sequence():
     )
 
     # The fallback was surfaced to the user via print_fn.
-    assert any("eval_fn failed" in m for m in messages)
-    # Per-sequence reset: seq 2 re-uses eval_frequency=2 (only layer 1 and the
-    # final layer eval), and flaky_eval no longer raises, so we get the seq-2
-    # evals in addition to the seq-1 retry+final.
+    assert any("MemoryError" in m for m in messages)
+    # Per-sequence reset: seq 2 re-uses eval_frequency=2 after the first
+    # sequence recovered from MemoryError fallback.
     assert len(eval_calls) >= 2
+
+
+@requires_mlx
+def test_observe_model_eval_runtime_error_is_not_masked_as_memory_fallback():
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, TinyMoeMlp(mx, top_k=1))])
+
+    def bad_eval(h):
+        raise RuntimeError("real graph bug")
+
+    with pytest.raises(RuntimeError, match="real graph bug"):
+        observe_model(
+            model,
+            [[0, 1]],
+            {"num_experts": 3, "num_experts_per_tok": 1},
+            eval_frequency=1,
+            mask_fn=lambda h, cache=None: None,
+            eval_fn=bad_eval,
+        )
 
 
 @requires_mlx

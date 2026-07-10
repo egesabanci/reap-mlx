@@ -58,6 +58,45 @@ class PruningState:
             max_activations=np.zeros(num_experts, dtype=np.float32),
         )
 
+    def snapshot(self) -> dict[str, Any]:
+        """Return a deep copy of accumulator fields for mid-sequence rollback."""
+        return {
+            "total_tokens": int(self.total_tokens),
+            "total_slots": int(self.total_slots),
+            "expert_frequency": self.expert_frequency.copy(),
+            "pairwise_expert_frequency": (
+                None
+                if self.pairwise_expert_frequency is None
+                else self.pairwise_expert_frequency.copy()
+            ),
+            "ean_sum": self.ean_sum.copy(),
+            "weighted_ean_sum": self.weighted_ean_sum.copy(),
+            "weighted_expert_frequency_sum": self.weighted_expert_frequency_sum.copy(),
+            "max_activations": self.max_activations.copy(),
+        }
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Restore accumulator fields from :meth:`snapshot`."""
+        self.total_tokens = int(snapshot["total_tokens"])
+        self.total_slots = int(snapshot["total_slots"])
+        self.expert_frequency = np.asarray(
+            snapshot["expert_frequency"], dtype=np.int64
+        ).copy()
+        pairwise = snapshot.get("pairwise_expert_frequency")
+        self.pairwise_expert_frequency = (
+            None if pairwise is None else np.asarray(pairwise, dtype=np.int64).copy()
+        )
+        self.ean_sum = np.asarray(snapshot["ean_sum"], dtype=np.float64).copy()
+        self.weighted_ean_sum = np.asarray(
+            snapshot["weighted_ean_sum"], dtype=np.float64
+        ).copy()
+        self.weighted_expert_frequency_sum = np.asarray(
+            snapshot["weighted_expert_frequency_sum"], dtype=np.float64
+        ).copy()
+        self.max_activations = np.asarray(
+            snapshot["max_activations"], dtype=np.float32
+        ).copy()
+
     def accumulate(
         self,
         routing: Any | None = None,

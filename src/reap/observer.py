@@ -100,7 +100,13 @@ def _observe_qwen3_model(
         config=config,
     )
 
+    completed_sequences = 0
     for seq_idx, sequence in enumerate(calibration_sequences):
+        # Snapshot before the sequence so a mid-sequence MemoryError cannot leave
+        # earlier MoE layers with extra tokens relative to later layers.
+        snapshots = {
+            layer_idx: state.snapshot() for layer_idx, state in accumulators.items()
+        }
         try:
             # Reset to the requested cadence for each sequence so a transient
             # eval failure in one sequence does not permanently downgrade the
@@ -152,46 +158,26 @@ def _observe_qwen3_model(
                     h = h + dense_mlp(moe_input)
 
                 if _should_eval_layer(layer_idx, len(layers), eval_frequency):
-                    try:
-                        eval_fn(h)
-                    except (RuntimeError, MemoryError) as eval_err:
-                        logger.warning(
-                            "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
-                            "Falling back to eval_frequency=1 for remaining layers.",
-                            layer_idx, len(layers), eval_frequency, eval_err,
-                        )
-                        # Surface the fallback to the user (logging may be quiet
-                        # without --verbose) so the performance regression is visible.
-                        if print_fn is not None:
-                            print_fn(
-                                f"[reap-mlx] observe: eval_fn failed at layer "
-                                f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
-                                "falling back to eval_frequency=1 for this sequence.",
-                            )
-                        eval_frequency = 1
-                        try:
-                            eval_fn(h)
-                        except (RuntimeError, MemoryError):
-                            logger.error(
-                                "eval_fn retry also failed at layer %d. Raising.",
-                                layer_idx,
-                            )
-                            raise
+                    eval_frequency = _run_eval_boundary(
+                        eval_fn,
+                        h,
+                        layer_idx=layer_idx,
+                        layer_count=len(layers),
+                        eval_frequency=eval_frequency,
+                        print_fn=print_fn,
+                    )
                 if debug_memory:
                     _log_memory(mx, layer_idx)
+            completed_sequences += 1
         except MemoryError:
-            logger.warning(
-                "MemoryError processing sequence %d/%d. "
-                "Skipping remaining sequences (%d processed). "
-                "Observer data collected so far is retained.",
-                seq_idx + 1, len(calibration_sequences), seq_idx,
+            for layer_idx, snap in snapshots.items():
+                accumulators[layer_idx].restore(snap)
+            _emit_oom_salvage(
+                print_fn,
+                seq_idx=seq_idx,
+                total_sequences=len(calibration_sequences),
+                completed_sequences=completed_sequences,
             )
-            if print_fn is not None:
-                print_fn(
-                    f"[reap-mlx] observe: out of memory at sequence "
-                    f"{seq_idx + 1}/{len(calibration_sequences)}; "
-                    f"salvaging {seq_idx} processed sequence(s)."
-                )
             break
 
     return _report_with_layer_guard(accumulators)
@@ -222,7 +208,13 @@ def _observe_lfm2_model(
         config=config,
     )
 
+    completed_sequences = 0
     for seq_idx, sequence in enumerate(calibration_sequences):
+        # Snapshot before the sequence so a mid-sequence MemoryError cannot leave
+        # earlier MoE layers with extra tokens relative to later layers.
+        snapshots = {
+            layer_idx: state.snapshot() for layer_idx, state in accumulators.items()
+        }
         try:
             # Reset to the requested cadence for each sequence so a transient
             # eval failure in one sequence does not permanently downgrade the
@@ -255,48 +247,27 @@ def _observe_lfm2_model(
                     h = h_mid + dense_mlp(ffn_input)
 
                 if _should_eval_layer(layer_idx, len(layers), eval_frequency):
-                    try:
-                        eval_fn(h)
-                    except (RuntimeError, MemoryError) as eval_err:
-                        logger.warning(
-                            "eval_fn failed at layer %d/%d (eval_frequency=%d): %s. "
-                            "Falling back to eval_frequency=1 for remaining layers.",
-                            layer_idx, len(layers), eval_frequency, eval_err,
-                        )
-                        # Surface the fallback to the user (logging may be quiet
-                        # without --verbose) so the performance regression is visible.
-                        if print_fn is not None:
-                            print_fn(
-                                f"[reap-mlx] observe: eval_fn failed at layer "
-                                f"{layer_idx}/{len(layers)} ({type(eval_err).__name__}); "
-                                "falling back to eval_frequency=1 for this sequence.",
-                            )
-                        eval_frequency = 1
-                        try:
-                            eval_fn(h)
-                        except (RuntimeError, MemoryError):
-                            logger.error(
-                                "eval_fn retry also failed at layer %d. Raising.",
-                                layer_idx,
-                            )
-                            raise
+                    eval_frequency = _run_eval_boundary(
+                        eval_fn,
+                        h,
+                        layer_idx=layer_idx,
+                        layer_count=len(layers),
+                        eval_frequency=eval_frequency,
+                        print_fn=print_fn,
+                    )
                 if debug_memory:
                     _log_memory(mx, layer_idx)
+            completed_sequences += 1
         except MemoryError:
-            logger.warning(
-                "MemoryError processing sequence %d/%d. "
-                "Skipping remaining sequences (%d processed). "
-                "Observer data collected so far is retained.",
-                seq_idx + 1, len(calibration_sequences), seq_idx,
+            for layer_idx, snap in snapshots.items():
+                accumulators[layer_idx].restore(snap)
+            _emit_oom_salvage(
+                print_fn,
+                seq_idx=seq_idx,
+                total_sequences=len(calibration_sequences),
+                completed_sequences=completed_sequences,
             )
-            if print_fn is not None:
-                print_fn(
-                    f"[reap-mlx] observe: out of memory at sequence "
-                    f"{seq_idx + 1}/{len(calibration_sequences)}; "
-                    f"salvaging {seq_idx} processed sequence(s)."
-                )
             break
-
 
     return _report_with_layer_guard(accumulators)
 
@@ -509,17 +480,17 @@ def _observe_selected_moe_layer(
     saliency_scores = routing.saliency_scores
     if saliency_scores is None:
         saliency_scores = routing.scores
-    # Force evaluation of the arrays that PruningState.accumulate will
-    # convert via np.asarray. Without this, np.asarray triggers an implicit
-    # eval mid-loop -- an uncontrolled synchronization point that defeats
-    # the eval_frequency cadence and can read stale graph state.
-    saliency_scores = saliency_scores.astype(mx.float32)
-    selected_outputs = selected_outputs.astype(mx.float32)
-    mx.eval(routing.indices, saliency_scores, selected_outputs)
+    # Metrics path: force float32 + explicit eval so np.asarray is stable and
+    # does not introduce uncontrolled sync points mid-layer-loop.
+    # Residual path: keep original selected_outputs / scores dtypes so the
+    # replay matches mlx-lm forward numerics for later layers.
+    scores_for_metrics = saliency_scores.astype(mx.float32)
+    outputs_for_metrics = selected_outputs.astype(mx.float32)
+    mx.eval(routing.indices, scores_for_metrics, outputs_for_metrics)
     state.accumulate(
         indices=routing.indices,
-        scores=saliency_scores,
-        selected_outputs=selected_outputs,
+        scores=scores_for_metrics,
+        selected_outputs=outputs_for_metrics,
     )
 
     moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
@@ -527,6 +498,74 @@ def _observe_selected_moe_layer(
     if shared_expert is not None:
         moe_out = moe_out + shared_expert(moe_input)
     return moe_out
+
+
+def _run_eval_boundary(
+    eval_fn: Callable[[Any], Any],
+    h: Any,
+    *,
+    layer_idx: int,
+    layer_count: int,
+    eval_frequency: int,
+    print_fn: Callable[[str], Any] | None,
+) -> int:
+    """Evaluate the graph at a layer boundary.
+
+    Only ``MemoryError`` triggers a fallback to ``eval_frequency=1``. Other
+    ``RuntimeError`` subclasses are re-raised so real graph bugs are not
+    masked as memory pressure.
+    """
+    try:
+        eval_fn(h)
+        return eval_frequency
+    except MemoryError as eval_err:
+        logger.warning(
+            "eval_fn MemoryError at layer %d/%d (eval_frequency=%d): %s. "
+            "Falling back to eval_frequency=1 for remaining layers.",
+            layer_idx,
+            layer_count,
+            eval_frequency,
+            eval_err,
+        )
+        if print_fn is not None:
+            print_fn(
+                f"[reap-mlx] observe: eval_fn MemoryError at layer "
+                f"{layer_idx}/{layer_count}; "
+                "falling back to eval_frequency=1 for this sequence.",
+            )
+        try:
+            eval_fn(h)
+        except MemoryError:
+            logger.error(
+                "eval_fn retry also failed at layer %d. Raising.",
+                layer_idx,
+            )
+            raise
+        return 1
+
+
+def _emit_oom_salvage(
+    print_fn: Callable[[str], Any] | None,
+    *,
+    seq_idx: int,
+    total_sequences: int,
+    completed_sequences: int,
+) -> None:
+    logger.warning(
+        "MemoryError processing sequence %d/%d. "
+        "Discarding partial progress for this sequence and stopping. "
+        "Completed sequences retained: %d.",
+        seq_idx + 1,
+        total_sequences,
+        completed_sequences,
+    )
+    if print_fn is not None:
+        print_fn(
+            f"[reap-mlx] observe: out of memory at sequence "
+            f"{seq_idx + 1}/{total_sequences}; "
+            f"salvaging {completed_sequences} fully completed sequence(s) "
+            "(partial sequence rolled back)."
+        )
 
 
 def _call_required(layer: Any, attr: str, h: Any) -> Any:
