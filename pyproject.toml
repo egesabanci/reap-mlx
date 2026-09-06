@@ -15,7 +15,7 @@ dependencies = [
     # moves and re-evaluates a newer pyarrow major.
     "pyarrow<26",
     "huggingface-hub>=1.0.0,<2.0.0",
-    "mlx>=0.31.0,<0.32.0",
+    "mlx>=0.31.0,<0.33.0",
     "mlx-lm>=0.31.1,<0.32.0",
     "numpy>=1.26",
     "safetensors>=0.5",
