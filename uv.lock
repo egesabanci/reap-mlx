@@ -875,10 +875,10 @@ dev = [
 requires-dist = [
     { name = "datasets", specifier = ">=3.6.0,<6.0.0" },
     { name = "huggingface-hub", specifier = ">=1.0.0,<2.0.0" },
-    { name = "mlx", specifier = ">=0.31.0,<0.32.0" },
+    { name = "mlx", specifier = ">=0.31.0,<0.33.0" },
     { name = "mlx-lm", specifier = ">=0.31.1,<0.32.0" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pyarrow", specifier = "<24" },
+    { name = "pyarrow", specifier = "<26" },
     { name = "safetensors", specifier = ">=0.5" },
     { name = "transformers", specifier = ">=5.0.0,<6.0.0" },
 ]
