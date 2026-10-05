@@ -16,7 +16,7 @@ dependencies = [
     "pyarrow<26",
     "huggingface-hub>=1.0.0,<2.0.0",
     "mlx>=0.31.0,<0.33.0",
-    "mlx-lm>=0.31.1,<0.32.0",
+    "mlx-lm>=0.31.1,<0.33.0",
     "numpy>=1.26",
     "safetensors>=0.5",
     "transformers>=5.0.0,<6.0.0",
