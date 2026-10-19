@@ -130,7 +130,9 @@ def test_help_works_without_heavy_runtime_imports():
         ),
     ],
 )
-def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message, capsys):
+def test_invalid_arguments_fail_before_pipeline_functions(
+    extra_args, message, capsys, tmp_path
+):
     def fail_load_model(model_name):
         raise AssertionError("load_model_fn must not be called for invalid args")
 
@@ -141,7 +143,7 @@ def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message, c
         "dataset",
         "--allow-partial-calibration",
         "--output-dir",
-        "out",
+        str(tmp_path / "out"),
         *extra_args,
     ]
 
@@ -725,7 +727,7 @@ def test_no_smoke_passes_no_smoke_function_to_save(tmp_path):
     assert save_kwargs["smoke_max_tokens"] == 16
 
 
-def test_keyboard_interrupt_returns_130_without_success_message():
+def test_keyboard_interrupt_returns_130_without_success_message(tmp_path):
     output = []
 
     def interrupt(model_name):
@@ -740,7 +742,7 @@ def test_keyboard_interrupt_returns_130_without_success_message():
             "dataset",
             "--allow-partial-calibration",
             "--output-dir",
-            "out",
+            str(tmp_path),
         ],
         load_model_fn=interrupt,
         print_fn=output.append,
@@ -749,6 +751,8 @@ def test_keyboard_interrupt_returns_130_without_success_message():
     assert code == 130
     assert any("interrupted:" in line for line in output)
     assert not any("done:" in line for line in output)
+    payload = json.loads((tmp_path / "validation-metrics.json").read_text())
+    assert payload["status"] == "interrupted"
 
 
 def test_main_writes_failed_metrics_when_pipeline_phase_raises(tmp_path):
