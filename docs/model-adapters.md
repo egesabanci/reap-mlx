@@ -95,7 +95,12 @@ LFM2 layers can be attention or conv/SSM operator layers. The observer uses:
 - `layer.is_attention_layer` when present to choose between the two.
 
 The LFM2 config update currently delegates to the Qwen3 update logic and
-preserves unrelated keys such as `use_expert_bias`.
+preserves unrelated keys such as `use_expert_bias` and `routed_scaling_factor`.
+
+mlx-lm 0.32 changed LFM2-MoE routing (sigmoid gates, with `expert_bias` used
+only to choose the top-k); the router replays whichever routing the loaded
+block implements (see
+[observation and metrics](observation-and-metrics.md#lfm2-router-semantics)).
 
 ## Mixtral / PhiMoE Adapter
 
@@ -112,8 +117,11 @@ layer.block_sparse_moe
     down_proj
 ```
 
-Routing is top-k on raw gate logits followed by a softmax over the selected
-logits, matching mlx-lm.
+Mixtral routing is top-k on raw gate logits followed by a softmax over the
+selected logits, matching mlx-lm. PhiMoE routes the same way under mlx-lm 0.31,
+and with sparsemixer under mlx-lm 0.32; the router replays whichever routing
+the loaded block implements (see
+[observation and metrics](observation-and-metrics.md#mixtral-and-phimoe-router-semantics)).
 
 mlx-lm builds these architectures from `num_local_experts`, so the adapter
 updates config through `update_mixtral_moe_config`:

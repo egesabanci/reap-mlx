@@ -134,12 +134,16 @@ The pruning pipeline is intentionally linear and inspectable.
 | Adapter | Model family | Status |
 | --- | --- | --- |
 | `lfm2_moe` | Liquid LFM2.5 MoE (`lfm2_moe`) | Validated with `LiquidAI/LFM2.5-8B-A1B-MLX-4bit` |
-| `qwen3_moe` | Qwen2-MoE, Qwen3-MoE, OLMoE (`qwen2_moe`, `qwen3_moe`, `olmoe`) | Tiny-model end-to-end coverage (bf16 + 4-bit) |
-| `mixtral_moe` | Mixtral, PhiMoE (`mixtral`, `phimoe`) | Tiny-model end-to-end coverage (bf16 + 4-bit) |
+| `qwen3_moe` | Qwen2-MoE, Qwen3-MoE, OLMoE (`qwen2_moe`, `qwen3_moe`, `olmoe`) | Tiny-model end-to-end coverage (bf16, 4-bit, nvfp4) |
+| `mixtral_moe` | Mixtral, PhiMoE (`mixtral`, `phimoe`) | Tiny-model end-to-end coverage (bf16, 4-bit, nvfp4) |
 
 Only these model types are accepted. Architectures that reuse a supported
 module layout but route differently (for example DeepSeek, GLM4-MoE, or
 MiniMax) are rejected up front instead of being pruned with the wrong routing.
+
+mlx-lm 0.32 changed the LFM2-MoE and PhiMoE routing. The routers replay
+whichever routing the installed mlx-lm implements, and the replay parity check
+stops any run whose routing they do not reproduce.
 
 Adding a model family should usually mean adding or extending an adapter in
 `src/reap/model_adapters.py`, router logic in `src/reap/router.py`, and pruning
@@ -170,11 +174,12 @@ Higher scores are kept.
 | `weighted_ean_sum` | Router-score-weighted sum of selected expert output norms. |
 | `max_activations` | Max absolute element of selected expert outputs (not L2). |
 
-For LFM2 models with `use_expert_bias=True`, residual routing still uses
-bias-adjusted scores, but REAP saliency accumulation uses **pure softmax**
-probabilities at the selected indices so ranking is not distorted by additive
-bias. The replay follows mlx-lm's LFM2-MoE routing, which differs from the
-Hugging Face reference implementation; see
+For LFM2 models, the replay follows the installed mlx-lm. Under mlx-lm 0.31
+with `use_expert_bias=True`, residual routing uses bias-adjusted scores, so REAP
+saliency accumulation uses **pure softmax** probabilities at the selected
+indices instead, which keeps the additive bias out of the ranking. mlx-lm 0.32
+uses the Hugging Face routing (sigmoid gates, with `expert_bias` only choosing
+the experts), whose weights carry no bias and feed saliency directly; see
 [observation and metrics](docs/observation-and-metrics.md#lfm2-router-semantics).
 
 `--compression-ratio` must be in `[0, 1)`. For each MoE layer, REAP MLX prunes
