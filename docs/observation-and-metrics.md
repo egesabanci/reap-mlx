@@ -119,8 +119,10 @@ RouterResult(
 The leading dimensions match the input hidden states without the hidden
 dimension.
 
-`indices` and `scores` are in `argpartition` partition order. The top-k experts
-are present, but they are not guaranteed to be sorted by descending score.
+`indices` and `scores` keep the order of the mirrored mlx-lm router:
+`argpartition` partition order for most architectures, and descending-logit
+order for PhiMoE's sparsemixer (mlx-lm 0.32). The top-k experts are present,
+but they are not guaranteed to be sorted by descending score.
 
 ## Qwen3 Router Semantics
 
@@ -144,21 +146,29 @@ Live `top_k` on the module is preferred over config top-k.
 
 ## LFM2 Router Semantics
 
-LFM2 routing:
+The replay deliberately mirrors mlx-lm, which is the runtime that executes the
+pruned model. mlx-lm 0.32 changed its LFM2-MoE routing to match the Hugging Face
+reference implementation. Only the 0.32 block stores `routed_scaling_factor`,
+so the router uses that attribute to pick the routing to replay.
 
-1. Accepts hidden states shaped `[tokens, hidden]` or `[batch, seq, hidden]`.
-2. Computes gate logits with `moe.gate`.
-3. Casts logits to `mx.float32`.
-4. Applies `mx.softmax(logits, axis=-1)`.
-5. Adds `expert_bias` before top-k selection when `use_expert_bias` is enabled.
-6. Selects top-k experts through `mx.argpartition`.
-7. Gathers selected scores.
-8. Optionally renormalizes selected scores with the shared epsilon denominator.
-9. Casts scores back to the hidden-state dtype.
+Both versions:
+
+1. Accept hidden states shaped `[tokens, hidden]` or `[batch, seq, hidden]`.
+2. Compute gate logits with `moe.gate`.
+3. Select top-k experts through `mx.argpartition`.
+4. Cast scores back to the hidden-state dtype.
 
 When `use_expert_bias` is true, `moe.expert_bias` is required.
 
-LFM2 returns two score tensors:
+### mlx-lm 0.31
+
+1. Casts logits to `mx.float32` and applies `mx.softmax(logits, axis=-1)`.
+2. Adds `expert_bias` to the probabilities before top-k selection when
+   `use_expert_bias` is enabled.
+3. Gathers the selected biased scores and optionally renormalizes them with
+   the shared epsilon denominator (`1e-20`).
+
+It returns two score tensors:
 
 - `scores`: bias-adjusted values used to weight expert outputs in the residual
   (matches mlx-lm forward).
@@ -169,14 +179,44 @@ LFM2 returns two score tensors:
 This keeps REAP ranking aligned with routing probability rather than additive
 expert bias, while the residual path still matches the live model.
 
-Upstream note: the replay deliberately mirrors mlx-lm, which is the runtime
-that executes the pruned model. mlx-lm's LFM2-MoE block (0.31.x) applies a
-softmax, adds `expert_bias` to the probabilities, and weights experts with the
-biased scores. The Hugging Face reference implementation instead uses sigmoid
-scores, applies `expert_bias` only to the top-k selection, and multiplies by
-`routed_scaling_factor` (1.0 for released LFM2-MoE checkpoints). If mlx-lm
-changes its LFM2 routing, the replay parity check fails fast instead of
-silently measuring saliency on the old routes.
+### mlx-lm 0.32
+
+1. Applies `mx.sigmoid(logits)` in the gate dtype.
+2. Adds `expert_bias` (in `float32`) only to the scores that choose the top-k
+   experts, when `use_expert_bias` is enabled.
+3. Gathers the unbiased sigmoid scores, optionally renormalizes them with a
+   `1e-6` epsilon, and multiplies them by `routed_scaling_factor`.
+
+These weights carry no bias, so `saliency_scores` is `None` and REAP
+accumulates the routing weights directly. `routed_scaling_factor` scales every
+expert of a layer equally, so it does not change the ranking.
+
+If a later mlx-lm changes this routing again, the replay parity check fails
+fast instead of silently measuring saliency on the old routes.
+
+## Mixtral and PhiMoE Router Semantics
+
+Mixtral, and PhiMoE under mlx-lm 0.31:
+
+1. Computes gate logits with `moe.gate`.
+2. Selects top-k experts on the raw logits through
+   `mx.argpartition(-logits, kth=k-1)[..., :k]`.
+3. Applies `mx.softmax(..., precise=True)` over the selected logits only.
+
+mlx-lm 0.32 routes PhiMoE with the inference path of Hugging Face's
+`sparsemixer`. Only that block stores `jitter_eps` (the config's
+`router_jitter_noise`), so the router uses that attribute to pick this
+routing. For each top-k slot in turn, it:
+
+1. Picks the expert with the highest remaining logit.
+2. Masks the experts already picked, and every expert whose logit is more than
+   `2 * jitter_eps` below the picked one, relative to
+   `max(|logit|, picked logit)`.
+3. Weights the picked expert by a precise softmax over the experts left in
+   that band.
+
+Indices come out in descending-logit order, and one token's weights need not
+sum to one.
 
 ## Selected Expert Outputs
 

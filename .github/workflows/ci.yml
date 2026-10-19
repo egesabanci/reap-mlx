@@ -75,3 +75,33 @@ jobs:
 
       - name: Run tests
         run: uv run python -m pytest -q tests/test_mlx_*.py
+
+  # The lockfile follows the newest mlx-lm, but pyproject.toml also allows
+  # older releases that route LFM2-MoE and PhiMoE differently (see
+  # src/reap/router.py). This job swaps in the lower bounds from
+  # pyproject.toml; keep the pins below in step with them.
+  tests-oldest-mlx-lm:
+    name: tests (oldest mlx-lm)
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv
+
+      - name: Sync dependencies
+        run: uv sync --group dev --locked
+
+      - name: Install the oldest supported mlx and mlx-lm
+        run: uv pip install "mlx==0.31.0" "mlx-lm==0.31.1"
+
+      - name: Run tests
+        run: uv run --no-sync python -m pytest -q tests/test_mlx_*.py

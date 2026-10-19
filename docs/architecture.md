@@ -92,7 +92,8 @@ module supports regular attributes and MLX-LM modules exposing `.get(field)`.
 
 Sliceable fields include:
 
-- switch projection `weight`, `scales`, `biases`, `bias`;
+- switch projection `weight`, `scales`, `biases`, `bias`, `global_scale`
+  (per-expert nvfp4 global scales from mlx-lm 0.32);
 - router gate `weight`, `scales`, `biases`, `bias`, `e_score_correction_bias`
   (quantized gates carry `scales`/`biases`);
 - `expert_bias` on the MoE block when enabled or present (LFM2).

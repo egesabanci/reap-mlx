@@ -12,6 +12,7 @@ import copy
 import functools
 import importlib
 import importlib.util
+import inspect
 import json
 import random
 
@@ -101,6 +102,8 @@ FAMILY_CONFIGS = {
         "original_max_position_embeddings": 256,
         "num_local_experts": NUM_EXPERTS,
         "num_experts_per_tok": 2,
+        # Widens mlx-lm 0.32's sparsemixer band so weights mix several experts.
+        "router_jitter_noise": 0.3,
         "rope_scaling": {
             "short_factor": [1.0] * 8,
             "long_factor": [1.0] * 8,
@@ -123,6 +126,8 @@ FAMILY_CONFIGS = {
         "num_key_value_heads": 2,
         "max_position_embeddings": 512,
         "use_expert_bias": True,
+        # Scales mlx-lm 0.32's sigmoid routing weights; mlx-lm 0.31 ignores it.
+        "routed_scaling_factor": 1.5,
         "num_dense_layers": 1,
         "norm_eps": 1e-5,
         "conv_bias": False,
@@ -132,12 +137,33 @@ FAMILY_CONFIGS = {
 }
 FAMILIES = sorted(FAMILY_CONFIGS)
 
+# mlx-lm 0.32 can give every switch-layer expert its own nvfp4 global scale.
+NVFP4_GLOBAL_SCALE = {
+    "group_size": 16,
+    "bits": 4,
+    "mode": "nvfp4",
+    "global_scale": True,
+}
+QUANTIZATIONS = pytest.mark.parametrize(
+    "quantize",
+    [False, True, NVFP4_GLOBAL_SCALE],
+    ids=["bf16", "4bit", "nvfp4-global-scale"],
+)
 
-def _build_model(family: str, *, quantize: bool):
-    """Return a deterministic tiny bfloat16 model and its config."""
+
+def _build_model(family: str, *, quantize: bool | dict):
+    """Return a deterministic tiny bfloat16 model and its config.
+
+    ``quantize`` is True for 4-bit affine, or a dict of quantize_model options.
+    """
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_lm.utils import quantize_model
+
+    options = {"group_size": 64, "bits": 4} if quantize is True else quantize
+    supported = inspect.signature(quantize_model).parameters
+    if options and not set(options) <= set(supported):
+        pytest.skip(f"The installed mlx-lm cannot quantize with {options}.")
 
     mx.random.seed(0)
     config = copy.deepcopy(FAMILY_CONFIGS[family])
@@ -153,8 +179,8 @@ def _build_model(family: str, *, quantize: bool):
             if getattr(moe, "use_expert_bias", False):
                 moe.expert_bias = mx.random.uniform(-0.05, 0.05, (NUM_EXPERTS,))
     model.set_dtype(mx.bfloat16)
-    if quantize:
-        model, config = quantize_model(model, config, group_size=64, bits=4)
+    if options:
+        model, config = quantize_model(model, config, **options)
     mx.eval(model.parameters())
     return model, config
 
@@ -176,7 +202,7 @@ def _write_tokenizer(path) -> None:
     ).save_pretrained(path)
 
 
-def _write_source_model(path, family: str, *, quantize: bool):
+def _write_source_model(path, family: str, *, quantize: bool | dict):
     from mlx_lm.utils import save_config, save_model
 
     model, config = _build_model(family, quantize=quantize)
@@ -194,7 +220,7 @@ def _calibration_records(*_args, **_kwargs):
     ]
 
 
-@pytest.mark.parametrize("quantize", [False, True], ids=["bf16", "4bit"])
+@QUANTIZATIONS
 @pytest.mark.parametrize("family", FAMILIES)
 def test_cli_prunes_saves_and_reloads_tiny_model(tmp_path, family, quantize):
     source = _write_source_model(tmp_path / "source", family, quantize=quantize)
@@ -302,7 +328,7 @@ def test_observer_statistics_do_not_depend_on_eval_frequency(family):
             np.testing.assert_array_equal(report[key], every_third[layer_idx][key])
 
 
-@pytest.mark.parametrize("quantize", [False, True], ids=["bf16", "4bit"])
+@QUANTIZATIONS
 @pytest.mark.parametrize("family", FAMILIES)
 def test_observer_replay_is_bit_identical_to_live_layers(family, quantize):
     import mlx.core as mx

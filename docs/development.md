@@ -25,6 +25,13 @@ Run the focused test suite:
 uv run python -m pytest -q tests/test_mlx_*.py
 ```
 
+The routers mirror each mlx-lm release's routing, so router or observer changes
+should also pass against the other supported mlx-lm line, for example:
+
+```bash
+uv run --with "mlx-lm==0.32.2" python -m pytest -q tests/test_mlx_*.py
+```
+
 Run CLI help:
 
 ```bash
@@ -45,7 +52,9 @@ git diff --check
 ```
 
 CI runs the lockfile check, lint, tests, and CLI smoke on Python 3.12 (the
-required `tests` check), plus the test suite on Python 3.13.
+required `tests` check), plus the test suite on Python 3.13 and against the
+oldest mlx and mlx-lm that `pyproject.toml` allows (`mlx==0.31.0`,
+`mlx-lm==0.31.1`).
 
 ## Import-Safety Tests
 
@@ -70,7 +79,7 @@ function that executes the runtime behavior.
 | `test_mlx_cli.py` | CLI argument validation, orchestration, progress, failure metrics. |
 | `test_mlx_data.py` | Calibration loading, text extraction, tokenizer handling. |
 | `test_mlx_model_adapters.py` | Adapter inference, layer config, config updates. |
-| `test_mlx_router.py` | Qwen3 and LFM2 router semantics. |
+| `test_mlx_router.py` | Qwen, LFM2, and Mixtral/PhiMoE router semantics for mlx-lm 0.31 and 0.32. |
 | `test_mlx_metrics.py` | `PruningState` accumulation and reports. |
 | `test_mlx_observer.py` | Layer replay, masks, selected metrics, LFM2 operators. |
 | `test_mlx_prune.py` | Expert ranking, slicing, metadata/config updates, failures. |
@@ -78,7 +87,7 @@ function that executes the runtime behavior.
 | `test_mlx_validation_metrics.py` | Telemetry JSON, timings, throughput, failure payload. |
 | `test_mlx_checkpoint.py` | Checkpoint schema, round trips, atomic writes. |
 | `test_mlx_eval_nll.py` | Calibration NLL across fp32/fp16/bf16 logits. |
-| `test_mlx_e2e.py` | Tiny random mlx-lm models per family (bf16 + 4-bit): CLI prune/save/reload and bit-exact replay parity. |
+| `test_mlx_e2e.py` | Tiny random mlx-lm models per family (bf16, 4-bit, and on mlx-lm 0.32 nvfp4 with per-expert global scales): CLI prune/save/reload and bit-exact replay parity. |
 
 Some tests require MLX or MLX-LM and skip when those packages are unavailable.
 
@@ -100,7 +109,8 @@ The pruning method must rank higher values as more important.
 For a new model family:
 
 1. Implement adapter layout methods and `MoeLayerConfig` extraction.
-2. Add router behavior matching the architecture's MLX-LM routing semantics.
+2. Add router behavior matching the architecture's MLX-LM routing semantics in
+   every supported mlx-lm release.
 3. Decide whether existing slicing rules cover the family.
 4. Extend save/reload validation for any new expert-stacked fields.
 5. Add fixture-style unit tests that do not require real model downloads, and

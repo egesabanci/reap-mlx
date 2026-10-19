@@ -104,6 +104,8 @@ For switch projections, any present fields are sliced:
 - `scales`
 - `biases`
 - `bias`
+- `global_scale` (mlx-lm 0.32 nvfp4 layers quantized with one global scale per
+  expert)
 
 For the router gate, any present fields are sliced:
 
