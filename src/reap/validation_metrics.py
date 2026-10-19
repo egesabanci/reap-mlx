@@ -135,6 +135,7 @@ class RunMetrics:
                 "revision": getattr(args, "revision", None),
                 "dataset_name": getattr(args, "dataset_name", None),
                 "dataset_config_name": getattr(args, "dataset_config_name", None),
+                "dataset_streaming": bool(getattr(args, "dataset_streaming", False)),
                 "split": getattr(args, "split", None),
                 "seed": getattr(args, "seed", None),
                 "max_samples": getattr(args, "max_samples", None),

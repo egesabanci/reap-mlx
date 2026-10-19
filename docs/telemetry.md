@@ -61,6 +61,7 @@ Run config records user-facing CLI inputs:
 - `model_name`, `revision`
 - `dataset_name`
 - `dataset_config_name`
+- `dataset_streaming`
 - `split`
 - `seed`
 - `max_samples`

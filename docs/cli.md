@@ -27,6 +27,7 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 | `--revision` | unset | Hugging Face branch, tag, or commit for `--model-name`; the resolved commit is recorded in telemetry. |
 | `--split` | `train` | Dataset split passed to `load_dataset`. |
 | `--dataset-config-name` | unset | Optional Hugging Face dataset config name. |
+| `--dataset-streaming` | off | Stream records from the requested split instead of preparing the whole dataset. |
 | `--prune-method` | `reap` | Saliency key or alias used to rank experts. |
 | `--compression-ratio` | `0.25` | Fraction of experts to remove per MoE layer (floor semantics). |
 | `--skip-layer-indices` | none | Skip primary ranking; still width-match via `expert_frequency`. |

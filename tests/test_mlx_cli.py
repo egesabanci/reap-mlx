@@ -336,6 +336,7 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         "max_seq_length": 16,
         "seed": 9,
         "pack": False,
+        "streaming": False,
     }
     assert events[2][4]["eval_frequency"] == 1
     assert "print_fn" in events[2][4]
@@ -567,6 +568,7 @@ def test_pack_calibration_flag_is_forwarded_to_the_loader(tmp_path):
             "--output-dir",
             str(tmp_path),
             "--pack-calibration",
+            "--dataset-streaming",
         ],
         load_model_fn=lambda model_name: (*_moe_model_and_config(),),
         load_calibration_sequences_fn=fake_load_calibration_sequences,
@@ -580,10 +582,12 @@ def test_pack_calibration_flag_is_forwarded_to_the_loader(tmp_path):
 
     assert code == 0
     assert loader_kwargs["pack"] is True
+    assert loader_kwargs["streaming"] is True
     payload = json.loads(
         (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
     )
     assert payload["run_config"]["pack_calibration"] is True
+    assert payload["run_config"]["dataset_streaming"] is True
 
 
 def test_skip_replay_check_disables_observer_parity_verification(tmp_path):

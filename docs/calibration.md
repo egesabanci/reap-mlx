@@ -56,6 +56,12 @@ load_dataset(dataset_name, name=dataset_config_name, split=split)
 If the returned dataset object exposes `.shuffle(seed=...)`, calibration uses
 that method before sampling.
 
+A regular `load_dataset` call downloads and prepares the whole dataset (every
+split) before sampling. For large corpora pass `streaming=True` (CLI:
+`--dataset-streaming`): records are then read lazily from the requested split,
+and shuffling uses the datasets streaming buffer (a seeded shuffle of a
+1000-record window) instead of a full permutation.
+
 ## Text Extraction Priority
 
 `extract_text(record, tokenizer=tokenizer)` supports common dataset shapes.

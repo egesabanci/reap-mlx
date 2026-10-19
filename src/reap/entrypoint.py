@@ -72,6 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--split", default="train")
     parser.add_argument("--dataset-config-name")
+    parser.add_argument(
+        "--dataset-streaming",
+        action="store_true",
+        help=(
+            "Stream calibration records from the requested split instead of "
+            "downloading and preparing the whole dataset (useful for large "
+            "corpora). Shuffling then uses the datasets streaming buffer."
+        ),
+    )
     parser.add_argument("--prune-method", default="reap")
     parser.add_argument(
         "--compression-ratio",
@@ -436,6 +445,7 @@ def main(
                     max_seq_length=args.max_seq_length,
                     seed=args.seed,
                     pack=args.pack_calibration,
+                    streaming=args.dataset_streaming,
                 )
             calibration_sequences = list(loaded_sequences[: args.max_samples])
             if args.eval_calibration_nll:

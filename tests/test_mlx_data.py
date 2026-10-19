@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import logging
 import os
 import subprocess
@@ -10,6 +12,7 @@ import textwrap
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from reap.data import (
     extract_text,
@@ -148,6 +151,54 @@ def test_load_calibration_sequences_forwards_dataset_options_and_truncates():
     assert sequences[0]["input_ids"].dtype == np.int32
     np.testing.assert_array_equal(sequences[0]["input_ids"], [5, 4])
     np.testing.assert_array_equal(sequences[1]["input_ids"], [5, 7])
+
+
+def test_streaming_is_forwarded_to_load_dataset():
+    calls = []
+
+    def fake_load_dataset(dataset_name, **kwargs):
+        calls.append(kwargs)
+        return [{"text": "alpha beta"}]
+
+    load_calibration_sequences(
+        WhitespaceTokenizer(),
+        "example/dataset",
+        max_samples=1,
+        max_seq_length=4,
+        streaming=True,
+        load_dataset_fn=fake_load_dataset,
+    )
+
+    assert calls == [{"split": "train", "streaming": True}]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("datasets") is None,
+    reason="datasets is not installed in this environment.",
+)
+def test_streaming_reads_a_real_dataset_lazily_and_shuffles(tmp_path, monkeypatch):
+    import datasets
+
+    # Keep the datasets lock files out of the user's global cache.
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path / "cache")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    records = [{"text": f"w{i} w{i}"} for i in range(50)]
+    (data_dir / "train.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records),
+        encoding="utf-8",
+    )
+
+    sequences = load_calibration_sequences(
+        WhitespaceTokenizer(),
+        str(data_dir),
+        max_samples=5,
+        max_seq_length=4,
+        seed=3,
+        streaming=True,
+    )
+
+    assert len(sequences) == 5
 
 
 def test_extract_text_supports_instruction_input_output_records():

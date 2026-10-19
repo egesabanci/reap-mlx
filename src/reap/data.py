@@ -26,6 +26,7 @@ def load_calibration_sequences(
     seed: int = 42,
     load_dataset_fn: Callable[..., Iterable[Any]] | None = None,
     pack: bool = False,
+    streaming: bool = False,
 ) -> list[dict[str, np.ndarray]]:
     """Load unpadded batch-size-1 calibration token sequences.
 
@@ -34,6 +35,10 @@ def load_calibration_sequences(
     to the remaining room), like the REAP reference implementation; then
     ``max_samples`` counts packed sequences. The last sequence may be shorter
     when the dataset runs out.
+
+    With ``streaming``, records are read lazily from the requested split
+    instead of downloading and preparing the whole dataset; shuffling then
+    happens within the dataset library's streaming buffer.
     """
     max_samples = _positive_int(max_samples, "max_samples")
     max_seq_length = _positive_int(max_seq_length, "max_seq_length")
@@ -42,6 +47,8 @@ def load_calibration_sequences(
     load_kwargs: dict[str, Any] = {"split": split}
     if dataset_config_name is not None:
         load_kwargs["name"] = dataset_config_name
+    if streaming:
+        load_kwargs["streaming"] = True
     dataset = load_dataset_fn(dataset_name, **load_kwargs)
     dataset = _maybe_shuffle(dataset, seed)
 
