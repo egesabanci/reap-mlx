@@ -14,6 +14,11 @@ uv run python -m reap.entrypoint \
 
 The NLL signal is a quick regression check, not a substitute for task benchmarks.
 
+Logits are converted to float32 before the log-softmax, so bfloat16/float16
+checkpoints (most MLX conversions) get a precise value. If no sequence can be
+evaluated, the `quality` block reports `status: "skipped"` together with the
+last error that occurred.
+
 ## Third-party eval stacks
 
 The `third-party/` directory holds reference harnesses (EvalPlus, LiveCodeBench,

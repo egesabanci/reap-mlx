@@ -217,6 +217,7 @@ def test_cli_prunes_saves_and_reloads_tiny_model(tmp_path, family, quantize):
             str(output),
             "--smoke-max-tokens",
             "2",
+            "--eval-calibration-nll",
         ],
         load_calibration_sequences_fn=functools.partial(
             load_calibration_sequences,
@@ -229,6 +230,7 @@ def test_cli_prunes_saves_and_reloads_tiny_model(tmp_path, family, quantize):
     metrics = json.loads((output / "validation-metrics.json").read_text())
     assert metrics["status"] == "success"
     assert metrics["smoke"]["completed"] is True
+    assert metrics["quality"]["status"] == "ok"
     saved_config = json.loads((output / "config.json").read_text())
     assert config_num_experts(saved_config) == NUM_EXPERTS - NUM_EXPERTS // 4
     assert metrics["save_reload"]["reloaded_config_expert_count"] == 6

@@ -45,6 +45,7 @@ def calibration_mean_nll(
     total_nll = 0.0
     total_tokens = 0
     used = 0
+    last_error: str | None = None
 
     for sequence in sequences[:max_sequences]:
         input_ids = (
@@ -59,8 +60,10 @@ def calibration_mean_nll(
             outputs = model(tokens)
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
-            logits = outputs
-            # logits: [1, seq, vocab]; targets are next tokens
+            # logits: [1, seq, vocab]; targets are next tokens. Work in float32:
+            # NumPy cannot read bfloat16 buffers, and a bf16 log-softmax over a
+            # large vocabulary loses most of the NLL precision anyway.
+            logits = outputs.astype(mx.float32)
             if logits.ndim != 3 or logits.shape[1] < 2:
                 continue
             log_probs = nn.log_softmax(logits[:, :-1, :], axis=-1)
@@ -78,17 +81,22 @@ def calibration_mean_nll(
             total_tokens += int(values.size)
             used += 1
         except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
             logger.warning(
-                "calibration NLL failed on a sequence (%s: %s); continuing",
-                type(exc).__name__,
-                exc,
+                "calibration NLL failed on a sequence (%s); continuing",
+                last_error,
             )
             continue
 
     if total_tokens < 1:
+        reason = (
+            f"last error: {last_error}"
+            if last_error is not None
+            else "no sequence produced [1, seq, vocab] logits with seq >= 2"
+        )
         return {
             "status": "skipped",
-            "error": "no tokens evaluated (model may not expose logits via model(x))",
+            "error": f"no tokens evaluated ({reason})",
             "mean_nll": None,
             "token_count": 0,
             "sequence_count": used,
