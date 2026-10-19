@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from reap.metrics import PruningState
@@ -190,12 +191,15 @@ def _observe_layers(
             tokens = _batch_tokens(mx, sequence)
             h = embed_tokens(tokens)
             sequence_masks = layout.sequence_masks(h)
+            # Per-layer statistics stay lazy until the next eval boundary, so
+            # --eval-frequency N really means one graph sync per N layers.
+            pending: list[_PendingLayerStats] = []
 
             for layer_idx, layer in enumerate(layers):
                 h, moe_input = layout.mix(layer, h, sequence_masks)
 
                 if layer_idx in moe_layer_indices:
-                    moe_out = _observe_selected_moe_layer(
+                    moe_out, stats = _observe_selected_moe_layer(
                         layer,
                         moe_input,
                         accumulators[layer_idx],
@@ -203,6 +207,7 @@ def _observe_layers(
                         config=config,
                         router_cls=router_cls,
                     )
+                    pending.append(stats)
                     if verify_replay and seq_idx == 0:
                         error = _replay_parity_error(
                             adapter.get_moe(layer), moe_input, moe_out
@@ -224,6 +229,8 @@ def _observe_layers(
                         eval_frequency=eval_frequency,
                         print_fn=print_fn,
                     )
+                    _flush_layer_stats(mx, pending)
+                    pending = []
                 if debug_memory:
                     _log_memory(mx, layer_idx)
             completed_sequences += 1
@@ -497,6 +504,52 @@ def _run_lfm2_operator(layer: Any, h: Any, mask: Any | None) -> Any:
     return h + operator_output
 
 
+@dataclass
+class _PendingLayerStats:
+    """One MoE layer's selected-route statistics, waiting for an eval boundary.
+
+    All arrays are float32/uint32 reductions shaped like the routed indices
+    (``[..., top_k]``, or ``[..., ]`` per token for the shared expert), so
+    evaluating them moves only a few values per token to NumPy.
+    """
+
+    state: PruningState
+    indices: Any
+    scores: Any
+    output_norms: Any
+    output_maxes: Any
+    shared_output_norms: Any | None = None
+
+    def arrays(self) -> list[Any]:
+        arrays = [self.indices, self.scores, self.output_norms, self.output_maxes]
+        if self.shared_output_norms is not None:
+            arrays.append(self.shared_output_norms)
+        return arrays
+
+    def accumulate(self) -> None:
+        self.state.accumulate(
+            indices=self.indices,
+            scores=self.scores,
+            selected_output_norms=self.output_norms,
+            selected_output_maxes=self.output_maxes,
+        )
+        if self.shared_output_norms is not None:
+            self.state.accumulate_shared_expert_norms(self.shared_output_norms)
+
+
+def _flush_layer_stats(mx: Any, pending: list[_PendingLayerStats]) -> None:
+    """Evaluate queued layer statistics in one call and accumulate them."""
+    if not pending:
+        return
+    mx.eval(*(array for stats in pending for array in stats.arrays()))
+    for stats in pending:
+        stats.accumulate()
+
+
+def _token_l2_norms(mx: Any, values: Any) -> Any:
+    return mx.sqrt(mx.sum(values * values, axis=-1))
+
+
 def _observe_selected_moe_layer(
     layer: Any,
     moe_input: Any,
@@ -505,7 +558,8 @@ def _observe_selected_moe_layer(
     adapter: Any,
     config: Mapping[str, Any],
     router_cls: type,
-) -> Any:
+) -> tuple[Any, _PendingLayerStats]:
+    """Replay one MoE layer; return its output and its pending statistics."""
     mx = _require_mlx_core()
     moe = adapter.get_moe(layer)
     routing = router_cls(moe, config)(moe_input)
@@ -526,17 +580,17 @@ def _observe_selected_moe_layer(
     saliency_scores = routing.saliency_scores
     if saliency_scores is None:
         saliency_scores = routing.scores
-    # Metrics path: force float32 + explicit eval so np.asarray is stable and
-    # does not introduce uncontrolled sync points mid-layer-loop.
-    # Residual path: keep original selected_outputs / scores dtypes so the
-    # replay matches mlx-lm forward numerics for later layers.
-    scores_for_metrics = saliency_scores.astype(mx.float32)
+    # Metrics path: reduce on device in float32 (NumPy cannot read bfloat16)
+    # down to per-route norms and maxes. Residual path: keep the original
+    # selected_outputs / scores dtypes so the replay matches mlx-lm forward
+    # numerics for later layers.
     outputs_for_metrics = selected_outputs.astype(mx.float32)
-    mx.eval(routing.indices, scores_for_metrics, outputs_for_metrics)
-    state.accumulate(
+    stats = _PendingLayerStats(
+        state=state,
         indices=routing.indices,
-        scores=scores_for_metrics,
-        selected_outputs=outputs_for_metrics,
+        scores=saliency_scores.astype(mx.float32),
+        output_norms=_token_l2_norms(mx, outputs_for_metrics),
+        output_maxes=mx.max(mx.abs(outputs_for_metrics), axis=-1),
     )
 
     moe_out = (selected_outputs * routing.scores[..., None]).sum(axis=-2)
@@ -547,11 +601,11 @@ def _observe_selected_moe_layer(
         shared_gate = getattr(moe, "shared_expert_gate", None)
         if callable(shared_gate):
             shared_out = mx.sigmoid(shared_gate(moe_input)) * shared_out
-        # NumPy cannot read bfloat16 buffers, so hand the metrics path a
-        # float32 copy; the residual keeps the model dtype.
-        state.accumulate_shared_expert(shared_out.astype(mx.float32))
+        stats.shared_output_norms = _token_l2_norms(
+            mx, shared_out.astype(mx.float32)
+        )
         moe_out = moe_out + shared_out
-    return moe_out
+    return moe_out, stats
 
 
 def _run_eval_boundary(

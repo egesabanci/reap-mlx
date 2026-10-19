@@ -112,12 +112,17 @@ class PruningState:
             return
         # Mean L2 norm over token positions.
         if outputs.ndim >= 2:
-            token_norms = np.linalg.norm(outputs.reshape(-1, outputs.shape[-1]), axis=-1)
-            self.shared_expert_ean_sum += float(token_norms.sum())
-            self.shared_expert_tokens += int(token_norms.size)
+            self.accumulate_shared_expert_norms(
+                np.linalg.norm(outputs.reshape(-1, outputs.shape[-1]), axis=-1)
+            )
         else:
-            self.shared_expert_ean_sum += float(np.linalg.norm(outputs))
-            self.shared_expert_tokens += 1
+            self.accumulate_shared_expert_norms([np.linalg.norm(outputs)])
+
+    def accumulate_shared_expert_norms(self, token_norms: Any) -> None:
+        """Record precomputed per-token shared-expert output L2 norms."""
+        norms = np.asarray(token_norms, dtype=np.float64).reshape(-1)
+        self.shared_expert_ean_sum += float(norms.sum())
+        self.shared_expert_tokens += int(norms.size)
 
     def accumulate(
         self,

@@ -17,6 +17,8 @@ observe_model(
     eval_frequency=1,
     eval_fn=None,
     mask_fn=None,
+    print_fn=None,
+    verify_replay=True,
 ) -> dict[int, dict[str, Any]]
 ```
 
@@ -30,6 +32,12 @@ layers and sequences.
 `eval_frequency` controls that boundary. Values greater than 1 evaluate every N
 layers and also flush the final layer of each sequence when needed. Higher
 values reduce GPU synchronization barriers but increase peak memory.
+
+Selected-expert statistics do not add synchronization points of their own:
+each MoE layer reduces its routed outputs on device to per-route float32 norms
+and maxes (plus per-token shared-expert norms), and those small arrays are
+evaluated and accumulated at the next eval boundary. The accumulated
+statistics are identical for every `eval_frequency`.
 
 Out-of-memory errors are recognised in both forms they take: `MemoryError`
 and the `RuntimeError` MLX raises for allocation failures (for example

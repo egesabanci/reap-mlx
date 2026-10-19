@@ -276,6 +276,33 @@ def test_cli_packs_calibration_into_full_length_sequences(tmp_path):
     assert metrics["run_config"]["actual_token_counts"] == [32, 32]
 
 
+@pytest.mark.parametrize("family", ["qwen2_moe", "lfm2_moe"])
+def test_observer_statistics_do_not_depend_on_eval_frequency(family):
+    model, config = _build_model(family, quantize=True)
+    rng = np.random.default_rng(3)
+    sequences = [
+        {"input_ids": rng.integers(3, 200, size=length).astype(np.int32)}
+        for length in (21, 40)
+    ]
+
+    every_layer, every_third = (
+        observe_model(model, sequences, config, eval_frequency=frequency)
+        for frequency in (1, 3)
+    )
+
+    assert every_layer.keys() == every_third.keys()
+    for layer_idx, report in every_layer.items():
+        for key in (
+            "expert_frequency",
+            "ean_sum",
+            "weighted_ean_sum",
+            "reap",
+            "max_activations",
+            "shared_expert_ean_sum",
+        ):
+            np.testing.assert_array_equal(report[key], every_third[layer_idx][key])
+
+
 @pytest.mark.parametrize("quantize", [False, True], ids=["bf16", "4bit"])
 @pytest.mark.parametrize("family", FAMILIES)
 def test_observer_replay_is_bit_identical_to_live_layers(family, quantize):
