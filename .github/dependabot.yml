@@ -13,9 +13,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    # Keep the lower bounds: raise upper bounds as the pip updates did, and
-    # bump uv.lock alone for releases the ranges already allow.
-    versioning-strategy: widen
+    # Keep the lower bounds: bump uv.lock alone for releases the ranges
+    # already allow, otherwise raise only the upper bound, as the pip updates
+    # did. (uv does not accept "widen"; "auto" raises lower bounds unless
+    # Dependabot detects a published library.)
+    versioning-strategy: increase-if-necessary
     groups:
       # mlx-lm releases need a matching mlx (mlx-lm 0.32 needs mlx>=0.32.2),
       # and uv keeps mlx-lm where it is while mlx stays locked, so the two
