@@ -789,6 +789,63 @@ def test_apply_keep_indices_reproduces_prune_result_on_fresh_model():
     assert fresh_config["num_experts"] == 2
 
 
+def test_prune_experts_reports_the_plan_before_slicing_any_weight():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    seen = []
+
+    def on_plan(keep_by_layer):
+        seen.append(
+            {
+                "keep": {idx: keep.tolist() for idx, keep in keep_by_layer.items()},
+                "widths": [
+                    layer.mlp.switch_mlp.gate_proj.weight.shape[0]
+                    for layer in model.model.layers
+                ],
+            }
+        )
+
+    keep_by_layer = prune_experts(
+        model,
+        config,
+        {
+            0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+            1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+        },
+        "reap",
+        0.5,
+        on_plan=on_plan,
+    )
+
+    assert seen == [{"keep": {0: [1, 3], 1: [1, 3]}, "widths": [4, 4]}]
+    assert {idx: keep.tolist() for idx, keep in keep_by_layer.items()} == {
+        0: [1, 3],
+        1: [1, 3],
+    }
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 2
+
+
+def test_prune_experts_validates_every_layer_before_mutating():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+
+    with pytest.raises(ValueError, match="expected 4"):
+        prune_experts(
+            model,
+            config,
+            {
+                0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+                1: {"reap": np.array([0.3, 0.7, 0.4])},
+            },
+            "reap",
+            0.5,
+        )
+
+    assert model.model.layers[0].mlp.num_experts == 4
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 4
+    assert config["num_experts"] == 4
+
+
 def test_apply_keep_indices_rejects_missing_moe_layers_before_mutating():
     model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
     config = qwen_config(num_experts=4, top_k=3)

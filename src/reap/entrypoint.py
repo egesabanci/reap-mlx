@@ -495,6 +495,26 @@ def main(
             current_phase = "prune"
             _emit(print_fn, "prune: mutating selected experts")
             config_before_prune = copy.deepcopy(config)
+            checkpoint_path = Path(args.output_dir) / "reap-checkpoint.json"
+            checkpoint_written = False
+
+            def persist_prune_plan(planned_keep_by_layer: Mapping[int, Any]) -> None:
+                # Persist the prune decision before any weight is sliced, so a
+                # failed prune or save can be resumed without re-running the
+                # expensive observation. A failed write aborts before mutation.
+                nonlocal checkpoint_written
+                _write_prune_checkpoint(
+                    checkpoint_path,
+                    planned_keep_by_layer,
+                    args=args,
+                    adapter_name=adapter.adapter_name,
+                    config_before_prune=config_before_prune,
+                    per_layer_ratios=per_layer_ratios,
+                    observer_data=observer_data,
+                )
+                checkpoint_written = True
+                _emit(print_fn, f"checkpoint: wrote prune decision to {checkpoint_path}")
+
             with metrics.phase("prune"):
                 keep_by_layer = prune_experts_fn(
                     model,
@@ -506,7 +526,12 @@ def main(
                     prune_layer_indices=args.prune_layer_indices,
                     per_layer_ratios=per_layer_ratios,
                     target_experts=args.target_experts,
+                    on_plan=persist_prune_plan,
                 )
+            if not checkpoint_written:
+                # Injected prune functions may not call on_plan; still leave a
+                # resume checkpoint behind.
+                persist_prune_plan(keep_by_layer)
             metrics.record_pruning(
                 keep_by_layer,
                 config_before=config_before_prune,
@@ -514,38 +539,6 @@ def main(
                 observer_data=observer_data,
             )
             metrics.sample_memory("after_prune")
-
-            # Persist the prune decision so a failed save can be resumed without
-            # re-running the expensive observe + prune phases. Fail closed so
-            # users always have a recovery artifact after a successful prune.
-            checkpoint_path = Path(args.output_dir) / "reap-checkpoint.json"
-            resolved_method = resolve_prune_method(args.prune_method)
-            write_checkpoint(
-                checkpoint_path,
-                keep_by_layer=keep_by_layer,
-                config_before_prune=config_before_prune,
-                model_name=args.model_name,
-                prune_method=args.prune_method,
-                compression_ratio=args.compression_ratio,
-                adapter_name=adapter.adapter_name,
-                dataset_name=args.dataset_name,
-                seed=args.seed,
-                max_samples=args.max_samples,
-                max_seq_length=args.max_seq_length,
-                skip_layer_indices=args.skip_layer_indices,
-                prune_layer_indices=args.prune_layer_indices,
-                per_layer_ratios=per_layer_ratios,
-                saliency_by_layer={
-                    int(idx): layer.get(resolved_method)
-                    for idx, layer in observer_data.items()
-                    if resolved_method in layer
-                },
-                observer_token_totals={
-                    int(idx): int(layer.get("total_tokens", 0))
-                    for idx, layer in observer_data.items()
-                },
-            )
-            _emit(print_fn, f"checkpoint: wrote prune decision to {checkpoint_path}")
             for layer_idx in sorted(keep_by_layer):
                 _emit(
                     print_fn,
@@ -672,6 +665,44 @@ def _validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(
                     f"per_layer_ratios[{layer_idx}] must be in [0, 1), got {layer_ratio}."
                 )
+
+
+def _write_prune_checkpoint(
+    checkpoint_path: Path,
+    keep_by_layer: Mapping[int, Any],
+    *,
+    args: argparse.Namespace,
+    adapter_name: str,
+    config_before_prune: Mapping[str, Any],
+    per_layer_ratios: dict[int, float] | None,
+    observer_data: Mapping[int, Mapping[str, Any]],
+) -> None:
+    resolved_method = resolve_prune_method(args.prune_method)
+    write_checkpoint(
+        checkpoint_path,
+        keep_by_layer=keep_by_layer,
+        config_before_prune=config_before_prune,
+        model_name=args.model_name,
+        prune_method=args.prune_method,
+        compression_ratio=args.compression_ratio,
+        adapter_name=adapter_name,
+        dataset_name=args.dataset_name,
+        seed=args.seed,
+        max_samples=args.max_samples,
+        max_seq_length=args.max_seq_length,
+        skip_layer_indices=args.skip_layer_indices,
+        prune_layer_indices=args.prune_layer_indices,
+        per_layer_ratios=per_layer_ratios,
+        saliency_by_layer={
+            int(idx): layer.get(resolved_method)
+            for idx, layer in observer_data.items()
+            if resolved_method in layer
+        },
+        observer_token_totals={
+            int(idx): int(layer.get("total_tokens", 0))
+            for idx, layer in observer_data.items()
+        },
+    )
 
 
 def _validate_output_dir(args: argparse.Namespace) -> None:

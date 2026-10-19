@@ -149,7 +149,12 @@ value.
 
 ## Validation Failures
 
-Pruning raises before mutation or during mutation for:
+`prune_experts` ranks and validates every MoE layer before slicing any weight.
+An optional `on_plan(keep_by_layer)` callback runs at that point; the CLI uses
+it to write `reap-checkpoint.json` (atomically, through a temporary file)
+before the model is mutated.
+
+Pruning raises for:
 
 - unsupported adapter names;
 - invalid compression ratios;
@@ -161,5 +166,7 @@ Pruning raises before mutation or during mutation for:
 - sliceable fields whose first dimension does not match `num_experts`;
 - LFM2 expert bias enabled but missing.
 
-Because pruning mutates in place, callers should treat failures during pruning
-as invalidating the live model object and config mapping for save purposes.
+Validation failures leave the model and config untouched. A failure while
+slicing (after validation) can still leave the live model partially pruned, so
+callers should then treat the model object and config mapping as invalid for
+save purposes and resume from the checkpoint instead.

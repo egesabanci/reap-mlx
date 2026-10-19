@@ -8,7 +8,7 @@ module import time.
 from __future__ import annotations
 import logging
 
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from typing import Any
 
 import numpy as np
@@ -229,6 +229,7 @@ def prune_experts(
     prune_layer_indices: list[int] | None = None,
     per_layer_ratios: dict[int, float] | None = None,
     target_experts: int | None = None,
+    on_plan: Callable[[dict[int, np.ndarray]], Any] | None = None,
 ) -> dict[int, np.ndarray]:
     """Prune adapter-discovered MLX MoE experts in place.
 
@@ -239,6 +240,11 @@ def prune_experts(
     are still width-matched to the same retained expert count via
     ``expert_frequency`` so mlx-lm save/reload remains valid.
 
+    Every layer is ranked and validated before any weight is sliced. When
+    ``on_plan`` is given it is called with the keep indices at that point, so
+    callers can persist the decision first (the CLI writes its resume
+    checkpoint there).
+
     Returns a mapping from layer index to ascending retained expert indices.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
@@ -247,6 +253,7 @@ def prune_experts(
 
     layers = adapter.layers(model)
     keep_by_layer: dict[int, np.ndarray] = {}
+    planned_layers: list[tuple[int, Any, Any]] = []
     config_num_experts: int | None = None
     config_top_k: int | None = None
 
@@ -322,15 +329,8 @@ def prune_experts(
             layer_idx=layer_idx,
         )
         keep_indices = compute_keep_indices(saliency, retained_count)
-
-        _prune_switch_moe_layer(
-            moe,
-            keep_indices,
-            num_experts=layer_config.num_experts,
-            old_top_k=layer_config.top_k,
-            layer_idx=layer_idx,
-        )
         keep_by_layer[layer_idx] = keep_indices
+        planned_layers.append((layer_idx, moe, layer_config))
         if retained_count >= layer_config.num_experts:
             if primary:
                 logger.warning(
@@ -347,6 +347,18 @@ def prune_experts(
             config_top_k = new_top_k
         else:
             config_top_k = min(config_top_k or new_top_k, new_top_k)
+
+    if on_plan is not None:
+        on_plan({idx: keep.copy() for idx, keep in keep_by_layer.items()})
+
+    for layer_idx, moe, layer_config in planned_layers:
+        _prune_switch_moe_layer(
+            moe,
+            keep_by_layer[layer_idx],
+            num_experts=layer_config.num_experts,
+            old_top_k=layer_config.top_k,
+            layer_idx=layer_idx,
+        )
 
     if config_num_experts is not None:
         update_moe_config(

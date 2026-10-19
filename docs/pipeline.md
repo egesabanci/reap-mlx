@@ -11,8 +11,9 @@ model_load
   -> prune_plan_validation   # layer filters / ratios / uniform counts
   -> calibration
   -> observe                 # refuse zero-token / all-zero saliency
-  -> prune
-  -> checkpoint write        # hard fail if checkpoint cannot be written
+  -> prune                   # rank + validate every layer
+     -> checkpoint write     # before any weight is sliced; hard fail if it cannot be written
+     -> slice experts
   -> save_reload_smoke
   -> metrics write
 ```

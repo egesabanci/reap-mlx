@@ -12,6 +12,7 @@ runtime packages.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -20,6 +21,24 @@ from typing import Any, Mapping
 # v2: adds dataset/seed/layer filters/saliency summaries for auditability
 _CHECKPOINT_VERSION = 2
 _SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, 2})
+
+
+def atomic_write_text(path: str | Path, text: str) -> Path:
+    """Write ``text`` to ``path`` through a temporary file and an atomic rename.
+
+    A crash or interrupt mid-write leaves the previous file intact instead of
+    a truncated JSON document.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def _jsonable(value: Any) -> Any:
@@ -118,13 +137,7 @@ def write_checkpoint(
         "keep_by_layer": serialised_keep,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-    return path
+    return atomic_write_text(path, json.dumps(payload, indent=2, allow_nan=False))
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
@@ -163,4 +176,4 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-__all__ = ["write_checkpoint", "load_checkpoint"]
+__all__ = ["atomic_write_text", "write_checkpoint", "load_checkpoint"]

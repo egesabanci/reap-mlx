@@ -22,6 +22,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from reap.checkpoint import atomic_write_text
 from reap.model_adapters import config_num_experts, infer_model_adapter
 from reap.prune import resolve_prune_method
 from reap.save import artifact_summary
@@ -392,7 +393,6 @@ class RunMetrics:
         self._derive_throughput()
 
         path = self.path
-        path.parent.mkdir(parents=True, exist_ok=True)
         # _json_safe should already replace non-finite floats with None, but
         # guard against any residual NaN/Inf that slipped through (e.g. via
         # custom objects) so a metrics write can never crash the failure
@@ -410,8 +410,7 @@ class RunMetrics:
             text = json.dumps(
                 payload, indent=2, sort_keys=True, allow_nan=True
             )
-        path.write_text(text + "\n", encoding="utf-8")
-        return path
+        return atomic_write_text(path, text + "\n")
 
     def failure_payload(self, phase: str, exc: BaseException) -> dict[str, Any]:
         """Build a JSON-safe failure record for ``exc``."""

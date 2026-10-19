@@ -910,6 +910,37 @@ def test_main_resume_skips_observe_and_prune_and_applies_checkpoint(tmp_path):
     assert apply_calls == [{0: [1, 3]}]
 
 
+def test_checkpoint_is_written_before_pruning_mutates_the_model(tmp_path):
+    import numpy as np
+
+    def prune_then_fail(*args, on_plan=None, **kwargs):
+        on_plan({0: np.array([0, 2])})
+        raise RuntimeError("slicing failed")
+
+    with pytest.raises(RuntimeError, match="slicing failed"):
+        main(
+            [
+                "--model-name",
+                "model",
+                "--dataset-name",
+                "dataset",
+                "--allow-partial-calibration",
+                "--output-dir",
+                str(tmp_path),
+            ],
+            load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+            load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+            observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0, 0.5, 0.2]}},
+            prune_experts_fn=prune_then_fail,
+            print_fn=lambda message: None,
+        )
+
+    checkpoint = json.loads((tmp_path / "reap-checkpoint.json").read_text())
+    assert checkpoint["keep_by_layer"] == {"0": [0, 2]}
+    payload = json.loads((tmp_path / "validation-metrics.json").read_text())
+    assert payload["failure"]["phase"] == "prune"
+
+
 def _write_resume_checkpoint(tmp_path, *, model_name="model", config_before_prune=None):
     import numpy as np
     from reap.checkpoint import write_checkpoint
