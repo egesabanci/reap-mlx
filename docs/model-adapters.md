@@ -39,7 +39,7 @@ Config conventions supported by adapters:
 
 | Concept | Live attrs | Config keys |
 | --- | --- | --- |
-| Expert count | `num_experts` | `num_experts` |
+| Expert count | `num_experts` | `num_experts` (Qwen/OLMoE/LFM2), `num_local_experts` (Mixtral/PhiMoE) |
 | Top-k | `top_k`, `num_experts_per_tok` | `num_experts_per_tok`, `top_k` |
 | Top-k normalization | `norm_topk_prob` | `norm_topk_prob` |
 | LFM2 expert bias | `use_expert_bias` | `use_expert_bias` |
@@ -96,6 +96,36 @@ LFM2 layers can be attention or conv/SSM operator layers. The observer uses:
 
 The LFM2 config update currently delegates to the Qwen3 update logic and
 preserves unrelated keys such as `use_expert_bias`.
+
+## Mixtral / PhiMoE Adapter
+
+Adapter name: `mixtral_moe`
+
+Expected layer shape:
+
+```txt
+layer.block_sparse_moe
+  gate
+  switch_mlp
+    gate_proj
+    up_proj
+    down_proj
+```
+
+Routing is top-k on raw gate logits followed by a softmax over the selected
+logits, matching mlx-lm.
+
+mlx-lm builds these architectures from `num_local_experts`, so the adapter
+updates config through `update_mixtral_moe_config`:
+
+- set `config["num_local_experts"]`;
+- set `config["num_experts_per_tok"]`;
+- update `config["num_experts"]` / `config["top_k"]` only when those keys
+  already exist;
+- clamp top-k to at most the retained expert count.
+
+`update_moe_config(config, adapter_name=...)` dispatches to the right updater,
+and `config_num_experts(config)` reads whichever expert-count key a config uses.
 
 ## Adapter Inference
 

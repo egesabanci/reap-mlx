@@ -327,6 +327,35 @@ def test_prune_experts_slices_quantized_qwen_gate_scales_and_biases():
     np.testing.assert_array_equal(moe.gate.biases, gate_biases[keep])
 
 
+def make_mixtral_model(num_experts: int = 4, top_k: int = 2):
+    moe = TinyMoe(num_experts=num_experts, top_k=top_k)
+    return SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(block_sparse_moe=moe)]),
+    )
+
+
+def test_prune_experts_updates_mixtral_num_local_experts():
+    model = make_mixtral_model(num_experts=4, top_k=2)
+    config = {
+        "model_type": "mixtral",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+    }
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+        "reap",
+        0.5,
+    )
+
+    assert config["num_local_experts"] == 2
+    assert config["num_experts_per_tok"] == 2
+    assert "num_experts" not in config
+    assert model.model.layers[0].block_sparse_moe.num_experts == 2
+
+
 def test_prune_experts_accepts_weighted_frequency_alias():
     model = make_model(num_experts=3, top_k=2)
     config = qwen_config(num_experts=3, top_k=2)
@@ -929,6 +958,43 @@ def test_prune_experts_keeps_quantized_qwen3_gate_runnable():
     y = moe(mx.random.normal((1, 5, 64)))
     mx.eval(y)
     assert y.shape == (1, 5, 64)
+
+
+@requires_mlx
+def test_pruned_mixtral_checkpoint_reloads_with_mlx_lm(tmp_path):
+    """mlx-lm rebuilds Mixtral from num_local_experts; the saved config must match."""
+    import mlx.core as mx
+    from mlx_lm.models import mixtral
+    from mlx_lm.utils import load_model, save_config, save_model
+
+    config = {
+        "model_type": "mixtral",
+        "vocab_size": 32,
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+    }
+    model = mixtral.Model(mixtral.ModelArgs.from_dict(config))
+    mx.eval(model.parameters())
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.arange(8, dtype=np.float32)}},
+        "reap",
+        0.25,
+    )
+    save_model(tmp_path, model, donate_model=False)
+    save_config(dict(config), tmp_path / "config.json")
+
+    reloaded, reloaded_config = load_model(tmp_path)
+
+    assert reloaded_config["num_local_experts"] == 6
+    assert reloaded.layers[0].block_sparse_moe.gate.weight.shape[0] == 6
 
 
 def test_apply_keep_indices_rejects_out_of_range_and_duplicates():

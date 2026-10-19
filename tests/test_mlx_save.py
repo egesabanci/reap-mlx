@@ -448,6 +448,52 @@ def test_save_pruned_model_rejects_reload_config_mismatch(tmp_path):
         )
 
 
+def make_mixtral_reloaded_model(num_experts: int):
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(block_sparse_moe=TinyMoe(num_experts))],
+        ),
+    )
+
+
+def test_save_pruned_model_reads_mixtral_num_local_experts(tmp_path):
+    reloaded_model = make_mixtral_reloaded_model(2)
+    config = {
+        "model_type": "mixtral",
+        "num_local_experts": 2,
+        "num_experts_per_tok": 2,
+    }
+
+    result = save_pruned_model(
+        make_mixtral_reloaded_model(2),
+        object(),
+        config,
+        tmp_path / "saved",
+        "source-model",
+        save_fn=fake_save_factory([]),
+        load_fn=fake_load_factory(reloaded_model, object(), dict(config)),
+    )
+
+    assert result.expected_expert_count == 2
+
+
+def test_save_pruned_model_rejects_mixtral_reload_count_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="Reloaded config expert count mismatch"):
+        save_pruned_model(
+            make_mixtral_reloaded_model(2),
+            object(),
+            {"model_type": "mixtral", "num_local_experts": 2},
+            tmp_path / "saved",
+            "source-model",
+            save_fn=fake_save_factory([]),
+            load_fn=fake_load_factory(
+                make_mixtral_reloaded_model(2),
+                object(),
+                {"model_type": "mixtral", "num_local_experts": 8},
+            ),
+        )
+
+
 def test_save_pruned_model_rejects_reloaded_shape_mismatch(tmp_path):
     with pytest.raises(ValueError, match="first dimension mismatch"):
         save_pruned_model(

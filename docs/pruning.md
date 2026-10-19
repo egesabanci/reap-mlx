@@ -132,9 +132,12 @@ min(old_top_k, retained_count)
 
 ## Config Updates
 
-After all MoE layers are pruned, config is updated with:
+After all MoE layers are pruned, config is updated through the adapter's
+updater (`update_moe_config`):
 
-- `config["num_experts"] = retained_count`
+- `config["num_experts"] = retained_count` (`qwen3_moe`, `lfm2_moe`)
+- `config["num_local_experts"] = retained_count` (`mixtral_moe`; mlx-lm
+  rebuilds Mixtral/PhiMoE from this key)
 - `config["num_experts_per_tok"] = min(top_k, retained_count)`
 - `config["top_k"]` only if that key already exists
 

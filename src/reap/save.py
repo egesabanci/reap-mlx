@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from reap.model_adapters import infer_model_adapter
+from reap.model_adapters import config_num_experts, infer_model_adapter
 
 
 _WEIGHT_PATTERNS = ("*.safetensors", "*.npz")
@@ -260,11 +260,11 @@ def _expected_expert_count(
 ) -> int:
     value = expected_expert_count
     if value is None:
-        value = config.get("num_experts")
+        value = config_num_experts(config)
     if value is None:
         raise ValueError(
-            "expected_expert_count is required when config['num_experts'] "
-            "is missing."
+            "expected_expert_count is required when the config has neither "
+            "'num_experts' nor 'num_local_experts'."
         )
     value = int(value)
     if value < 1:
@@ -423,10 +423,11 @@ def _validate_reloaded_config(
     reloaded_config: Mapping[str, Any],
     expected_expert_count: int,
 ) -> None:
-    actual = reloaded_config.get("num_experts")
+    actual = config_num_experts(reloaded_config)
     if actual is None:
-        raise ValueError("Reloaded config is missing 'num_experts'.")
-    actual = int(actual)
+        raise ValueError(
+            "Reloaded config is missing 'num_experts' / 'num_local_experts'."
+        )
     if actual != expected_expert_count:
         raise ValueError(
             "Reloaded config expert count mismatch: "

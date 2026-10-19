@@ -16,11 +16,14 @@ from reap.model_adapters import (
     Lfm2MoeModelAdapter,
     MoeLayerConfig,
     Qwen3MoeModelAdapter,
+    config_num_experts,
     get_model_layers,
     get_shared_expert,
     infer_model_adapter,
     make_attention_mask,
     update_lfm2_moe_config,
+    update_mixtral_moe_config,
+    update_moe_config,
     update_qwen3_moe_config,
 )
 
@@ -361,6 +364,60 @@ def test_update_lfm2_moe_config_preserves_expert_bias_flag_and_clamps_top_k():
         "num_experts_per_tok": 2,
         "use_expert_bias": True,
     }
+
+
+def test_update_mixtral_moe_config_writes_num_local_experts():
+    config = {
+        "model_type": "mixtral",
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+    }
+
+    update_mixtral_moe_config(config, num_experts=6, top_k=2)
+
+    assert config == {
+        "model_type": "mixtral",
+        "num_local_experts": 6,
+        "num_experts_per_tok": 2,
+    }
+
+
+def test_update_mixtral_moe_config_keeps_existing_generic_keys_in_sync():
+    config = {
+        "num_local_experts": 8,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "top_k": 2,
+    }
+
+    update_mixtral_moe_config(config, num_experts=1, top_k=2)
+
+    assert config == {
+        "num_local_experts": 1,
+        "num_experts": 1,
+        "num_experts_per_tok": 1,
+        "top_k": 1,
+    }
+
+
+def test_update_moe_config_dispatches_by_adapter_name():
+    qwen = {"num_experts": 8, "num_experts_per_tok": 2}
+    mixtral = {"num_local_experts": 8, "num_experts_per_tok": 2}
+
+    update_moe_config(qwen, adapter_name="qwen3_moe", num_experts=4, top_k=2)
+    update_moe_config(mixtral, adapter_name="mixtral_moe", num_experts=4, top_k=2)
+
+    assert qwen == {"num_experts": 4, "num_experts_per_tok": 2}
+    assert mixtral == {"num_local_experts": 4, "num_experts_per_tok": 2}
+    with pytest.raises(ValueError, match="No config updater"):
+        update_moe_config({}, adapter_name="unknown", num_experts=4, top_k=2)
+
+
+def test_config_num_experts_reads_generic_and_mixtral_keys():
+    assert config_num_experts({"num_experts": 8}) == 8
+    assert config_num_experts({"num_local_experts": 6}) == 6
+    assert config_num_experts({}) is None
+    assert config_num_experts(None) is None
 
 
 def test_make_attention_mask_requires_mlx_lm_when_missing():

@@ -22,7 +22,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from reap.model_adapters import infer_model_adapter
+from reap.model_adapters import config_num_experts, infer_model_adapter
 from reap.prune import resolve_prune_method
 from reap.save import artifact_summary
 
@@ -192,7 +192,7 @@ class RunMetrics:
                 "expert_count_before": _layer_config_value(
                     before_layer_config,
                     "num_experts",
-                    config.get("num_experts"),
+                    config_num_experts(config),
                 ),
                 "top_k_before": _layer_config_value(
                     before_layer_config,
@@ -313,8 +313,8 @@ class RunMetrics:
         self.data["pruning"] = {
             "layer_count": len(keep_by_layer),
             "total_experts_removed": total_removed,
-            "expert_count_before": config_before.get("num_experts"),
-            "expert_count_after": config_after.get("num_experts"),
+            "expert_count_before": config_num_experts(config_before),
+            "expert_count_after": config_num_experts(config_after),
             "top_k_before": top_k_before,
             "top_k_after": top_k_after,
             "top_k_was_clamped": (
@@ -324,7 +324,7 @@ class RunMetrics:
             ),
             "per_layer": per_layer,
         }
-        self.data["model"]["expert_count_after"] = config_after.get("num_experts")
+        self.data["model"]["expert_count_after"] = config_num_experts(config_after)
         self.data["model"]["top_k_after"] = top_k_after
 
     def record_save_reload(
@@ -346,7 +346,7 @@ class RunMetrics:
         self.data["save_reload"] = {
             "output_dir": str(output_dir),
             "expected_expert_count": getattr(result, "expected_expert_count", None),
-            "reloaded_config_expert_count": reloaded_config.get("num_experts"),
+            "reloaded_config_expert_count": config_num_experts(reloaded_config),
             "reloaded_adapter_moe_layer_count": len(reloaded_moe_layers),
             "reloaded_adapter_moe_layer_indices": reloaded_moe_layers,
             "artifacts": artifact_result,
@@ -653,7 +653,7 @@ def _original_expert_count(
             return len(frequency)
         except TypeError:
             pass
-    return int(config_before.get("num_experts") or 0)
+    return int(config_num_experts(config_before) or 0)
 
 
 def _numeric_list(value: Any) -> list[float]:

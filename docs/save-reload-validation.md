@@ -122,14 +122,15 @@ In that fallback path, `config.json` is read directly.
 Expected expert count comes from:
 
 1. explicit `expected_expert_count`, when provided;
-2. `config["num_experts"]`.
+2. `config["num_experts"]`, or `config["num_local_experts"]` for
+   Mixtral/PhiMoE configs.
 
 The value must be positive. If both are missing, validation raises.
 
 ## Reloaded Config Validation
 
-Reloaded config must include `num_experts`, and it must match the expected
-expert count.
+Reloaded config must include `num_experts` (or `num_local_experts`), and it
+must match the expected expert count.
 
 This catches save paths that failed to write the pruned config.
 

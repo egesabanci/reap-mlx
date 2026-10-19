@@ -13,11 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from reap.model_adapters import (
-    infer_model_adapter,
-    update_lfm2_moe_config,
-    update_qwen3_moe_config,
-)
+from reap.model_adapters import infer_model_adapter, update_moe_config
 
 logger = logging.getLogger(__name__)
 
@@ -349,13 +345,9 @@ def prune_experts(
             config_top_k = min(config_top_k or new_top_k, new_top_k)
 
     if config_num_experts is not None:
-        update_config = (
-            update_lfm2_moe_config
-            if adapter.adapter_name == "lfm2_moe"
-            else update_qwen3_moe_config
-        )
-        update_config(
+        update_moe_config(
             config,
+            adapter_name=adapter.adapter_name,
             num_experts=config_num_experts,
             top_k=config_top_k or config_num_experts,
         )
@@ -445,13 +437,9 @@ def apply_keep_indices(
         result[layer_idx] = keep_indices
 
     if config_num_experts is not None:
-        update_config = (
-            update_lfm2_moe_config
-            if adapter.adapter_name == "lfm2_moe"
-            else update_qwen3_moe_config
-        )
-        update_config(
+        update_moe_config(
             config,
+            adapter_name=adapter.adapter_name,
             num_experts=config_num_experts,
             top_k=config_top_k or config_num_experts,
         )

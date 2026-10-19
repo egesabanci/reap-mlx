@@ -42,8 +42,9 @@ REAP MLX currently guarantees:
 - observation replays model layers and collects selected-expert statistics only;
 - pruning mutates live MLX-LM-style modules by slicing expert-stacked arrays on
   dimension 0;
-- `num_experts` and `num_experts_per_tok` are updated after pruning, with top-k
-  clamped to the retained expert count;
+- `num_experts` (`num_local_experts` for Mixtral/PhiMoE) and
+  `num_experts_per_tok` are updated after pruning, with top-k clamped to the
+  retained expert count;
 - saved artifacts are reloaded and validated before a run is considered
   successful;
 - every run writes structured telemetry, including failure telemetry when the

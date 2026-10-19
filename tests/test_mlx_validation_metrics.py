@@ -358,6 +358,23 @@ def test_record_pruning_records_zero_removed_noop(tmp_path):
     assert p["per_layer"]["0"]["removed_expert_count"] == 0
 
 
+def test_record_pruning_reads_mixtral_expert_counts(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    metrics.record_pruning(
+        {0: [0, 2]},
+        config_before={"num_local_experts": 4, "num_experts_per_tok": 2},
+        config_after={"num_local_experts": 2, "num_experts_per_tok": 2},
+        observer_data={},
+    )
+
+    p = metrics.data["pruning"]
+    assert p["expert_count_before"] == 4
+    assert p["expert_count_after"] == 2
+    assert p["per_layer"]["0"]["original_expert_count"] == 4
+    assert p["per_layer"]["0"]["removed_expert_count"] == 2
+    assert metrics.data["model"]["expert_count_after"] == 2
+
+
 def test_derive_throughput_returns_none_when_no_phase_data(tmp_path):
     """No recorded phases, save_reload, or smoke must not divide by zero."""
     metrics = RunMetrics(tmp_path)
