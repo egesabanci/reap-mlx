@@ -669,6 +669,93 @@ def test_observe_model_rejects_minimax_despite_mixtral_layout():
         observe_model(model, [np.arange(1, 6, dtype=np.int32)], config)
 
 
+class DriftedMoeMlp(TinyMoeMlp):
+    """Callable MoE block whose own forward disagrees with the replay."""
+
+    def __init__(self, mx):
+        super().__init__(mx, top_k=1)
+        self.mx = mx
+
+    def __call__(self, hidden_states):
+        return self.mx.zeros_like(hidden_states) + 100.0
+
+
+@requires_mlx
+def test_observe_model_fails_fast_when_replay_drifts_from_live_moe_block():
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, DriftedMoeMlp(mx))])
+
+    with pytest.raises(ValueError, match="Replay parity check failed for MoE layer 0"):
+        observe_model(
+            model,
+            [[0], [1]],
+            {"num_experts": 3, "num_experts_per_tok": 1},
+        )
+
+
+@requires_mlx
+def test_observe_model_replay_check_can_be_disabled():
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, DriftedMoeMlp(mx))])
+
+    observer_data = observe_model(
+        model,
+        [[0]],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+        verify_replay=False,
+    )
+
+    assert observer_data[0]["total_tokens"] == 1
+    assert "replay_parity_error" not in observer_data[0]
+
+
+@requires_mlx
+def test_observe_model_detects_upstream_routing_change_on_real_block(monkeypatch):
+    """Simulate an mlx-lm release that switches Qwen3-MoE gating to sigmoid."""
+    import mlx.core as mx
+    from mlx_lm.models import qwen3_moe
+
+    def sigmoid_gating_call(self, x):
+        gates = mx.sigmoid(self.gate(x))
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        y = self.switch_mlp(x, inds)
+        return (y * scores[..., None]).sum(axis=-2)
+
+    config = {
+        "model_type": "qwen3_moe",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [],
+        "moe_intermediate_size": 64,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": False,
+        "max_position_embeddings": 64,
+        "norm_topk_prob": True,
+    }
+    model = qwen3_moe.Model(qwen3_moe.ModelArgs.from_dict(config))
+    mx.eval(model.parameters())
+    tokens = np.arange(1, 17, dtype=np.int32)
+    assert observe_model(model, [tokens], config)[0]["replay_parity_error"] == 0.0
+
+    monkeypatch.setattr(qwen3_moe.Qwen3MoeSparseMoeBlock, "__call__", sigmoid_gating_call)
+
+    with pytest.raises(ValueError, match="Replay parity check failed"):
+        observe_model(model, [tokens], config)
+
+
 @requires_mlx
 def test_observe_model_rejects_empty_calibration_sequence():
     import mlx.core as mx

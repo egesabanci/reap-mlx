@@ -146,6 +146,9 @@ class RunMetrics:
                 "output_dir": str(getattr(args, "output_dir", self.output_dir)),
                 "metrics_file": str(getattr(args, "metrics_file", self.metrics_file)),
                 "smoke_enabled": not bool(getattr(args, "no_smoke", False)),
+                "replay_check_enabled": not bool(
+                    getattr(args, "skip_replay_check", False)
+                ),
             }
         )
         self.data["model"]["model_name"] = model_name
@@ -268,6 +271,7 @@ class RunMetrics:
                     if finite_saliency
                     else None
                 ),
+                "replay_parity_error": layer_data.get("replay_parity_error"),
             }
 
         self.data["observer"] = {

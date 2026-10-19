@@ -173,6 +173,22 @@ The observer computes the MoE output as:
 If a shared expert exists, its output is added to the hidden-state flow. Shared
 expert output is not included in selected-expert saliency accumulation.
 
+## Replay Parity Check
+
+The replay only produces correct saliency if the routers reproduce the live
+model's routing exactly. On the first calibration sequence, every MoE layer's
+replayed output is therefore also compared with the live MoE block's own
+forward pass (`moe(moe_input)`). The error is the largest per-token L2
+difference divided by the mean per-token L2 norm of the live output. Supported
+architectures replay bit-exactly (error `0.0`); if the error exceeds
+`REPLAY_PARITY_TOLERANCE` (`1e-2`), observation raises before the remaining
+sequences are processed. That typically means the installed mlx-lm changed how
+the architecture routes.
+
+The measured error is reported per layer as `replay_parity_error`. Pass
+`verify_replay=False` (CLI: `--skip-replay-check`) to disable the check. MoE
+blocks that are not callable (test fixtures) are not compared.
+
 ## PruningState
 
 `PruningState` is a NumPy accumulator for one MoE layer.

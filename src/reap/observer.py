@@ -24,6 +24,13 @@ from reap.router import Lfm2MoeRouter, MixtralMoeRouter, Qwen3MoeRouter
 
 logger = logging.getLogger(__name__)
 
+# On the first calibration sequence every replayed MoE output is also compared
+# with the live MoE block's own forward pass. Supported architectures replay
+# bit-exactly; routing drift (for example an mlx-lm release that changes the
+# gating) sends whole tokens to other experts and shows up as errors of order
+# 0.1-1, far above this tolerance.
+REPLAY_PARITY_TOLERANCE = 1e-2
+
 
 def observe_model(
     model: Any,
@@ -36,8 +43,15 @@ def observe_model(
     eval_fn: Callable[[Any], Any] | None = None,
     mask_fn: Callable[..., Any] | None = None,
     print_fn: Callable[[str], Any] | None = None,
+    verify_replay: bool = True,
 ) -> dict[int, dict[str, Any]]:
-    """Collect pruning-compatible observer data with explicit MLX layer replay."""
+    """Collect pruning-compatible observer data with explicit MLX layer replay.
+
+    With ``verify_replay`` the first sequence is also run through each live
+    MoE block, and observation fails if the replay drifts from it by more than
+    ``REPLAY_PARITY_TOLERANCE``. Each layer report then carries the measured
+    ``replay_parity_error``.
+    """
     mx = _require_mlx_core()
     config = {} if config is None else config
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
@@ -61,6 +75,7 @@ def observe_model(
         eval_frequency=eval_frequency,
         eval_fn=eval_fn,
         print_fn=print_fn,
+        verify_replay=verify_replay,
     )
 
 
@@ -133,6 +148,7 @@ def _observe_layers(
     eval_frequency: int,
     eval_fn: Callable[[Any], Any],
     print_fn: Callable[[str], Any] | None,
+    verify_replay: bool,
 ) -> dict[int, dict[str, Any]]:
     requested_eval_frequency = eval_frequency
     mx = _require_mlx_core()
@@ -140,6 +156,7 @@ def _observe_layers(
     moe_layer_indices = set(adapter.identify_moe_layers(model))
     embed_tokens = _get_embed_tokens(model)
     router_cls = _router_cls_for_adapter(adapter)
+    parity_errors: dict[int, float] = {}
 
     accumulators = _initialize_accumulators(
         layers,
@@ -168,7 +185,7 @@ def _observe_layers(
                 h, moe_input = layout.mix(layer, h, sequence_masks)
 
                 if layer_idx in moe_layer_indices:
-                    h = h + _observe_selected_moe_layer(
+                    moe_out = _observe_selected_moe_layer(
                         layer,
                         moe_input,
                         accumulators[layer_idx],
@@ -176,6 +193,14 @@ def _observe_layers(
                         config=config,
                         router_cls=router_cls,
                     )
+                    if verify_replay and seq_idx == 0:
+                        error = _replay_parity_error(
+                            adapter.get_moe(layer), moe_input, moe_out
+                        )
+                        if error is not None:
+                            _check_replay_parity(error, layer_idx=layer_idx, config=config)
+                            parity_errors[layer_idx] = error
+                    h = h + moe_out
                 else:
                     dense_mlp = adapter.get_dense_mlp(layer)
                     h = h + dense_mlp(moe_input)
@@ -203,7 +228,50 @@ def _observe_layers(
             )
             break
 
-    return _report_with_layer_guard(accumulators)
+    observer_data = _report_with_layer_guard(accumulators)
+    for layer_idx, error in parity_errors.items():
+        observer_data[layer_idx]["replay_parity_error"] = error
+    return observer_data
+
+
+def _replay_parity_error(moe: Any, moe_input: Any, replay_output: Any) -> float | None:
+    """Return how far the replayed MoE output is from the live block's output.
+
+    The error is the largest per-token L2 difference divided by the mean
+    per-token L2 norm of the live output. Returns None when the MoE block is
+    not callable (fixture objects), since there is nothing to compare against.
+    """
+    if not callable(moe):
+        return None
+    mx = _require_mlx_core()
+    reference = moe(moe_input).astype(mx.float32)
+    hidden_size = reference.shape[-1]
+    reference = reference.reshape(-1, hidden_size)
+    delta = replay_output.astype(mx.float32).reshape(-1, hidden_size) - reference
+    token_error = mx.sqrt(mx.sum(delta * delta, axis=-1))
+    token_norm = mx.sqrt(mx.sum(reference * reference, axis=-1))
+    error = mx.max(token_error) / mx.maximum(mx.mean(token_norm), 1e-12)
+    return float(error.item())
+
+
+def _check_replay_parity(
+    error: float,
+    *,
+    layer_idx: int,
+    config: Mapping[str, Any],
+) -> None:
+    if error <= REPLAY_PARITY_TOLERANCE:
+        return
+    raise ValueError(
+        f"Replay parity check failed for MoE layer {layer_idx} "
+        f"(model_type={config.get('model_type')!r}): the replayed MoE output "
+        f"differs from the model's own forward pass by {error:.3g} (tolerance "
+        f"{REPLAY_PARITY_TOLERANCE:g}, relative to the mean token norm). The "
+        "installed mlx-lm probably routes this architecture differently from "
+        "reap-mlx, so expert saliency would be measured on the wrong routes. "
+        "Pass --skip-replay-check (observe_model(verify_replay=False)) to "
+        "override."
+    )
 
 
 def _router_cls_for_adapter(adapter: Any) -> type:

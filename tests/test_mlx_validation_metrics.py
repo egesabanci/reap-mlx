@@ -315,6 +315,19 @@ def test_record_observer_counts_non_finite_saliency(tmp_path):
     assert obs["per_layer"]["1"]["saliency_finite_count"] == 0
 
 
+def test_record_observer_reports_replay_parity_error(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    observer_data = {
+        0: {"total_tokens": 2, "reap": [0.5, 2.0], "replay_parity_error": 0.0},
+        1: {"total_tokens": 2, "reap": [0.5, 2.0]},
+    }
+    metrics.record_observer(observer_data, "reap")
+
+    per_layer = metrics.data["observer"]["per_layer"]
+    assert per_layer["0"]["replay_parity_error"] == 0.0
+    assert per_layer["1"]["replay_parity_error"] is None
+
+
 def test_record_observer_empty_observer_data(tmp_path):
     metrics = RunMetrics(tmp_path)
     metrics.record_observer({}, "reap")

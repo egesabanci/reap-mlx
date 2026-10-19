@@ -394,11 +394,49 @@ def test_main_passes_configured_eval_frequency_to_observer(tmp_path):
     assert code == 0
     assert observe_kwargs["eval_frequency"] == 4
     assert "print_fn" in observe_kwargs
+    assert observe_kwargs["verify_replay"] is True
 
     payload = json.loads(
         (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
     )
     assert payload["run_config"]["eval_frequency"] == 4
+
+
+def test_skip_replay_check_disables_observer_parity_verification(tmp_path):
+    observe_kwargs = {}
+
+    def fake_observe_model(model_arg, sequences, config_arg, **kwargs):
+        del model_arg, sequences, config_arg
+        observe_kwargs.update(kwargs)
+        return {0: {"reap": [1.0]}}
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--allow-partial-calibration",
+            "--output-dir",
+            str(tmp_path),
+            "--skip-replay-check",
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=fake_observe_model,
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert observe_kwargs["verify_replay"] is False
+    payload = json.loads(
+        (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["run_config"]["replay_check_enabled"] is False
 
 
 def test_main_configures_default_generation_smoke_from_cli(tmp_path, monkeypatch):

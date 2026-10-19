@@ -261,8 +261,13 @@ def test_observer_replay_is_bit_identical_to_live_layers(family, quantize):
         mx.eval(hidden_states)
         replayed.append(hidden_states)
 
-    observe_model(model, [{"input_ids": token_ids}], config, eval_fn=capture)
+    observer_data = observe_model(
+        model, [{"input_ids": token_ids}], config, eval_fn=capture
+    )
 
     assert len(replayed) == len(expected)
     for layer_idx, (got, want) in enumerate(zip(replayed, expected)):
         assert mx.array_equal(got, want).item(), f"layer {layer_idx} diverged"
+    assert observer_data
+    for layer_idx, layer_data in observer_data.items():
+        assert layer_data["replay_parity_error"] == 0.0, layer_idx

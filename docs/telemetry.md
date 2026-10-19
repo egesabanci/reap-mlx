@@ -72,6 +72,7 @@ Run config records user-facing CLI inputs:
 - `output_dir`
 - `metrics_file`
 - `smoke_enabled`
+- `replay_check_enabled`
 
 After calibration, it also records actual sample and token counts:
 
@@ -170,6 +171,8 @@ Per layer:
 - `saliency_min`
 - `saliency_max`
 - `saliency_mean`
+- `replay_parity_error` (first-sequence replay error against the live MoE
+  block; `null` when the check was skipped)
 
 Non-finite saliency values are counted and JSON-safe output replaces non-finite
 floating values with `null` where needed.

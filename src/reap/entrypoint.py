@@ -163,6 +163,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Higher values reduce GPU syncs but increase peak memory."
         ),
     )
+    parser.add_argument(
+        "--skip-replay-check",
+        action="store_true",
+        help=(
+            "Skip the first-sequence check that the observer's layer replay "
+            "matches the model's own MoE forward pass. Only use this if the "
+            "check fails for a reason you have verified is benign."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
@@ -417,6 +426,7 @@ def main(
                     config,
                     eval_frequency=args.eval_frequency,
                     print_fn=print_fn,
+                    verify_replay=not args.skip_replay_check,
                 )
             metrics.record_observer(observer_data, args.prune_method)
             if not observer_data:
