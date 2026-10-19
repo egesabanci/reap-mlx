@@ -129,13 +129,26 @@ and `config_num_experts(config)` reads whichever expert-count key a config uses.
 
 ## Adapter Inference
 
-`infer_model_adapter(model, config)` selects LFM2 when:
+`infer_model_adapter(model, config)` only accepts model types whose routing the
+adapters and routers reproduce exactly (`SUPPORTED_MODEL_TYPES`):
 
-- `config["model_type"] == "lfm2_moe"`;
-- any configured architecture starts with `"Lfm2"`;
-- the model layout includes any `layer.feed_forward.switch_mlp`.
+| Adapter | Model types | Layout |
+| --- | --- | --- |
+| `qwen3_moe` | `qwen2_moe`, `qwen3_moe`, `olmoe` | `layer.mlp.switch_mlp` |
+| `mixtral_moe` | `mixtral`, `phimoe` | `layer.block_sparse_moe.switch_mlp` |
+| `lfm2_moe` | `lfm2_moe` | `layer.feed_forward.switch_mlp` |
 
-Otherwise it returns the Qwen3 adapter.
+With a model object, the layout picks the adapter (checked in the order
+`feed_forward`, `block_sparse_moe`, `mlp`), and a config `model_type`, when
+present, must be one of that adapter's model types. Layout alone is not enough:
+other mlx-lm architectures reuse these layouts with different routing, for
+example MiniMax (`block_sparse_moe` with sigmoid scores and a correction bias)
+or DeepSeek/GLM4-MoE (`mlp` with grouped sigmoid gates). Replaying them with a
+supported router would silently compute saliency on the wrong routes, so they
+are rejected with a message that lists the supported model types.
+
+Without a model object, the config `model_type` decides; when it is missing,
+exact architecture class names (for example `Qwen3MoeForCausalLM`) are used.
 
 ## Shared Experts
 
@@ -159,13 +172,16 @@ To add a new MoE family:
    - `get_moe(layer)`
    - `get_dense_mlp(layer)`
    - `get_layer_config(layer, config)`
-2. Add or extend router logic for the architecture's selected-route semantics.
+2. Add or extend router logic for the architecture's selected-route semantics,
+   then add the model type to `SUPPORTED_MODEL_TYPES` (and its architecture
+   class name to the config-only lookup).
 3. Add pruning support if the expert-stacked field layout differs from Qwen3 or
    LFM2.
 4. Update save/reload shape validation if new expert-stacked fields must be
    validated.
 5. Add fixture-style tests for adapter inference, routing, pruning, observer
-   replay, and reload validation.
+   replay, and reload validation, and add the family to
+   `tests/test_mlx_e2e.py` (tiny random model, bf16 and 4-bit).
 
 Keep any new runtime imports lazy and add import-safety coverage.
 

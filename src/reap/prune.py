@@ -13,7 +13,11 @@ from typing import Any
 
 import numpy as np
 
-from reap.model_adapters import infer_model_adapter, update_moe_config
+from reap.model_adapters import (
+    infer_model_adapter,
+    unsupported_architecture_message,
+    update_moe_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +197,7 @@ def validate_layer_prune_plan(
     the primary selection (frequency fallback at prune time), not left full-size.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
-    _validate_adapter(adapter)
+    _validate_adapter(adapter, config)
     _validate_compression_ratio(compression_ratio)
     layers = adapter.layers(model)
     all_moe_indices = list(adapter.identify_moe_layers(model))
@@ -238,7 +242,7 @@ def prune_experts(
     Returns a mapping from layer index to ascending retained expert indices.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
-    _validate_adapter(adapter)
+    _validate_adapter(adapter, config)
     _validate_compression_ratio(compression_ratio)
 
     layers = adapter.layers(model)
@@ -385,7 +389,7 @@ def apply_keep_indices(
     scalar ``num_experts`` in config.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
-    _validate_adapter(adapter)
+    _validate_adapter(adapter, config)
     layers = adapter.layers(model)
     config_num_experts: int | None = None
     config_top_k: int | None = None
@@ -554,14 +558,9 @@ def slice_first_dim(
     return sliced_any
 
 
-def _validate_adapter(adapter: Any) -> None:
+def _validate_adapter(adapter: Any, config: Mapping[str, Any] | None = None) -> None:
     if adapter is None:
-        raise ValueError(
-            "Cannot detect a supported MoE architecture. REAP currently "
-            "supports Qwen3-MoE and LFM2-MoE models. Ensure the model config "
-            "exposes a recognized model_type/architectures, or pass an "
-            "explicit adapter.",
-        )
+        raise ValueError(unsupported_architecture_message(config))
     adapter_name = getattr(adapter, "adapter_name", None)
     if adapter_name not in {"qwen3_moe", "lfm2_moe", "mixtral_moe"}:
         raise ValueError(

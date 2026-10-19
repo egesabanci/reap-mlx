@@ -54,8 +54,12 @@ REAP MLX currently guarantees:
 
 | Adapter | Model family | MoE module location | Notes |
 | --- | --- | --- | --- |
-| `lfm2_moe` | Liquid LFM2.5 MoE MLX-LM models | `layer.feed_forward` | Supports attention and conv/SSM operators plus optional `expert_bias`. |
-| `qwen3_moe` | Qwen3-MoE MLX-LM-style models | `layer.mlp` | Default adapter when LFM2 cannot be inferred. |
+| `lfm2_moe` | Liquid LFM2.5 MoE MLX-LM models (`lfm2_moe`) | `layer.feed_forward` | Supports attention and conv/SSM operators plus optional `expert_bias`. |
+| `qwen3_moe` | Qwen2-MoE, Qwen3-MoE, OLMoE (`qwen2_moe`, `qwen3_moe`, `olmoe`) | `layer.mlp` | Optional (gated) shared expert. |
+| `mixtral_moe` | Mixtral, PhiMoE (`mixtral`, `phimoe`) | `layer.block_sparse_moe` | Config uses `num_local_experts`. |
+
+Other model types are rejected even when their module layout matches, because
+their routing differs (see [Model Adapters](model-adapters.md)).
 
 The implementation assumes a uniform post-pruning expert count across MoE
 layers because the saved config uses a single global `num_experts` value.

@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from reap.model_adapters import config_num_experts, infer_model_adapter
+from reap.model_adapters import (
+    config_num_experts,
+    infer_model_adapter,
+    unsupported_architecture_message,
+)
 
 
 _WEIGHT_PATTERNS = ("*.safetensors", "*.npz")
@@ -95,12 +99,7 @@ def save_pruned_model(
         # Neither the original nor the reloaded model exposed a supported MoE
         # architecture. Fail with a clear message instead of a confusing
         # AttributeError deep in _validate_reloaded_model_shapes.
-        raise ValueError(
-            "Cannot detect a supported MoE architecture. REAP currently "
-            "supports Qwen3-MoE and LFM2-MoE models. Ensure the model config "
-            "exposes a recognized model_type/architectures, or pass an "
-            "explicit adapter.",
-        )
+        raise ValueError(unsupported_architecture_message(config))
     validation_started = time.perf_counter()
     _validate_reloaded_config(reloaded_config, expected_count)
     _validate_reloaded_model_shapes(

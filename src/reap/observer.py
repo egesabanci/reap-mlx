@@ -17,6 +17,7 @@ from reap.model_adapters import (
     infer_model_adapter,
     make_attention_mask,
     make_ssm_mask,
+    unsupported_architecture_message,
 )
 from reap.router import Lfm2MoeRouter, MixtralMoeRouter, Qwen3MoeRouter
 
@@ -41,11 +42,7 @@ def observe_model(
     config = {} if config is None else config
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
     if adapter is None:
-        raise ValueError(
-            "Could not determine the MoE architecture adapter for this model. "
-            "observe_model requires an MoE model (Qwen3-MoE or LFM2-MoE) with at "
-            "least one MoE layer."
-        )
+        raise ValueError(unsupported_architecture_message(config))
     eval_frequency = _validate_eval_frequency(eval_frequency)
     eval_fn = mx.eval if eval_fn is None else eval_fn
 

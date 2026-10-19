@@ -13,7 +13,7 @@ from typing import Any
 
 from reap.checkpoint import load_checkpoint, write_checkpoint
 from reap.data import load_calibration_sequences
-from reap.model_adapters import infer_model_adapter
+from reap.model_adapters import infer_model_adapter, unsupported_architecture_message
 from reap.observer import observe_model
 from reap.prune import (
     apply_keep_indices,
@@ -309,12 +309,7 @@ def main(
         adapter = _infer_adapter_safely(model, config)
         metrics.record_model_metadata(model, config, adapter=adapter)
         if adapter is None:
-            raise ValueError(
-                "Could not determine the MoE architecture adapter for this model. "
-                "REAP pruning currently supports Qwen3-MoE, LFM2-MoE, and "
-                "Mixtral-style block_sparse_moe architectures. "
-                f"Model type: {config.get('model_type', 'unknown')}."
-            )
+            raise ValueError(unsupported_architecture_message(config))
         moe_layer_indices = adapter.identify_moe_layers(model)
         if not moe_layer_indices:
             raise ValueError(
@@ -723,8 +718,7 @@ def _infer_adapter_safely(model: Any, config: Mapping[str, Any]) -> Any | None:
     except Exception as exc:
         logger.debug("could not infer MLX model adapter", exc_info=True)
         raise ValueError(
-            "Could not determine the MoE architecture adapter for this model. "
-            "REAP pruning currently supports Qwen3-MoE and LFM2-MoE architectures. "
+            f"{unsupported_architecture_message(config)} "
             f"Underlying error: {exc.__class__.__name__}: {exc}"
         ) from exc
 

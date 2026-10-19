@@ -133,9 +133,13 @@ The pruning pipeline is intentionally linear and inspectable.
 
 | Adapter | Model family | Status |
 | --- | --- | --- |
-| `lfm2_moe` | Liquid LFM2.5 MoE MLX-LM models | Validated with `LiquidAI/LFM2.5-8B-A1B-MLX-4bit` |
-| `qwen3_moe` | Qwen2/3-MoE, OLMoE, DeepSeek MoE (`mlp.switch_mlp`) | Adapter + unit coverage |
-| `mixtral_moe` | Mixtral / PhiMoE (`block_sparse_moe.switch_mlp`) | Adapter + unit coverage |
+| `lfm2_moe` | Liquid LFM2.5 MoE (`lfm2_moe`) | Validated with `LiquidAI/LFM2.5-8B-A1B-MLX-4bit` |
+| `qwen3_moe` | Qwen2-MoE, Qwen3-MoE, OLMoE (`qwen2_moe`, `qwen3_moe`, `olmoe`) | Tiny-model end-to-end coverage (bf16 + 4-bit) |
+| `mixtral_moe` | Mixtral, PhiMoE (`mixtral`, `phimoe`) | Tiny-model end-to-end coverage (bf16 + 4-bit) |
+
+Only these model types are accepted. Architectures that reuse a supported
+module layout but route differently (for example DeepSeek, GLM4-MoE, or
+MiniMax) are rejected up front instead of being pruned with the wrong routing.
 
 Adding a model family should usually mean adding or extending an adapter in
 `src/reap/model_adapters.py`, router logic in `src/reap/router.py`, and pruning

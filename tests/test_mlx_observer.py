@@ -639,6 +639,37 @@ def test_observe_model_runs_real_qwen2_moe_shared_expert_in_bfloat16():
 
 
 @requires_mlx
+def test_observe_model_rejects_minimax_despite_mixtral_layout():
+    """MiniMax reuses block_sparse_moe.switch_mlp but routes with sigmoid +
+    correction bias; replaying it with the Mixtral router silently diverges."""
+    import mlx.core as mx
+    from mlx_lm.models import minimax
+
+    config = {
+        "model_type": "minimax",
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 64,
+        "num_experts_per_tok": 2,
+        "num_local_experts": 4,
+        "shared_intermediate_size": 0,
+        "num_hidden_layers": 1,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "rotary_dim": 16,
+        "vocab_size": 32,
+        "head_dim": 16,
+    }
+    model = minimax.Model(minimax.ModelArgs.from_dict(config))
+    mx.eval(model.parameters())
+
+    with pytest.raises(ValueError, match="model_type='minimax'"):
+        observe_model(model, [np.arange(1, 6, dtype=np.int32)], config)
+
+
+@requires_mlx
 def test_observe_model_rejects_empty_calibration_sequence():
     import mlx.core as mx
 
@@ -766,7 +797,7 @@ def test_observe_model_raises_for_all_dense_non_moe_model():
     ]
     model = TinyModel(mx, layers)
 
-    with pytest.raises(ValueError, match="MoE architecture adapter"):
+    with pytest.raises(ValueError, match="Cannot detect a supported MoE architecture"):
         observe_model(
             model,
             [[0]],

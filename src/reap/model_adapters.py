@@ -452,77 +452,99 @@ class MixtralMoeModelAdapter:
         )
 
 
-_QWEN_FAMILY_TYPES = frozenset(
-    {
-        "qwen2_moe",
-        "qwen3_moe",
-        "qwen3_vl_moe",
-        "olmoe",
-        "deepseek",
-        "deepseek_v2",
-        "deepseek_v3",
-    }
+_ADAPTER_CLASSES = {
+    "qwen3_moe": Qwen3MoeModelAdapter,
+    "mixtral_moe": MixtralMoeModelAdapter,
+    "lfm2_moe": Lfm2MoeModelAdapter,
+}
+
+# Model types whose routing the adapters and routers reproduce exactly (see
+# tests/test_mlx_e2e.py). Other mlx-lm architectures reuse these module
+# layouts with different routing (MiniMax: block_sparse_moe.switch_mlp with
+# sigmoid scores and a correction bias), so layout alone must not pick an
+# adapter.
+SUPPORTED_MODEL_TYPES: dict[str, frozenset[str]] = {
+    "qwen3_moe": frozenset({"qwen2_moe", "qwen3_moe", "olmoe"}),
+    "mixtral_moe": frozenset({"mixtral", "phimoe"}),
+    "lfm2_moe": frozenset({"lfm2_moe"}),
+}
+
+# Architecture class names used when a config has no model_type.
+_ARCHITECTURE_ADAPTERS = {
+    "Qwen2MoeForCausalLM": "qwen3_moe",
+    "Qwen3MoeForCausalLM": "qwen3_moe",
+    "OlmoeForCausalLM": "qwen3_moe",
+    "MixtralForCausalLM": "mixtral_moe",
+    "PhiMoEForCausalLM": "mixtral_moe",
+    "Lfm2MoeForCausalLM": "lfm2_moe",
+}
+
+_SUPPORTED_ARCHITECTURES_TEXT = (
+    "Qwen2-MoE, Qwen3-MoE, OLMoE (model_type qwen2_moe, qwen3_moe, olmoe); "
+    "Mixtral, PhiMoE (mixtral, phimoe); LFM2-MoE (lfm2_moe)"
 )
-_MIXTRAL_FAMILY_TYPES = frozenset({"mixtral", "phimoe", "phi_moe"})
+
+
+def unsupported_architecture_message(config: Mapping[str, Any] | None = None) -> str:
+    """Explain that no adapter applies and list the supported model types."""
+    model_type = _config_value(config, "model_type", default="unknown")
+    return (
+        "Cannot detect a supported MoE architecture "
+        f"(model_type={model_type!r}). Supported: "
+        f"{_SUPPORTED_ARCHITECTURES_TEXT}."
+    )
+
+
+def _infer_adapter_from_layout(model: Any) -> Any | None:
+    try:
+        layers = get_model_layers(model)
+    except ValueError:
+        return None
+    for attr, adapter_cls in (
+        ("feed_forward", Lfm2MoeModelAdapter),
+        ("block_sparse_moe", MixtralMoeModelAdapter),
+        ("mlp", Qwen3MoeModelAdapter),
+    ):
+        if any(
+            getattr(getattr(layer, attr, None), "switch_mlp", None) is not None
+            for layer in layers
+        ):
+            return adapter_cls()
+    return None
 
 
 def infer_model_adapter(
     model: Any | None = None,
     config: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Infer the MLX architecture adapter from config or model layout.
+    """Infer the MLX architecture adapter from model layout and config.
 
-    Returns ``None`` when no supported MoE architecture can be detected.
-    When a model object is provided, layout inspection wins so dense models
-    with a MoE-looking ``model_type`` are not mis-classified.
+    Returns ``None`` when no supported MoE architecture can be detected. With a
+    model object, the module layout picks the adapter, so dense models with a
+    MoE-looking ``model_type`` are not mis-classified, and a config
+    ``model_type`` must also be one that adapter supports.
     """
     model_type = str(_config_value(config, "model_type") or "")
-    architectures = _config_value(config, "architectures", default=()) or ()
 
     if model is not None:
-        try:
-            layers = get_model_layers(model)
-        except ValueError:
-            layers = ()
-
-        if any(
-            getattr(getattr(layer, "feed_forward", None), "switch_mlp", None)
-            is not None
-            for layer in layers
-        ):
-            return Lfm2MoeModelAdapter()
-
-        if any(
-            getattr(getattr(layer, "block_sparse_moe", None), "switch_mlp", None)
-            is not None
-            for layer in layers
-        ):
-            return MixtralMoeModelAdapter()
-
-        if any(
-            getattr(getattr(layer, "mlp", None), "switch_mlp", None)
-            is not None
-            for layer in layers
-        ):
-            return Qwen3MoeModelAdapter()
-
-        # Live model has no supported MoE layout.
-        return None
+        adapter = _infer_adapter_from_layout(model)
+        if adapter is None:
+            return None
+        if model_type and model_type not in SUPPORTED_MODEL_TYPES[adapter.adapter_name]:
+            return None
+        return adapter
 
     # Config-only inference (no model object).
-    if model_type == "lfm2_moe" or any(
-        str(architecture).startswith("Lfm2") for architecture in architectures
-    ):
-        return Lfm2MoeModelAdapter()
-    if model_type in _MIXTRAL_FAMILY_TYPES or any(
-        "Mixtral" in str(a) or "PhiMoE" in str(a) for a in architectures
-    ):
-        return MixtralMoeModelAdapter()
-    if model_type in _QWEN_FAMILY_TYPES or any(
-        "Qwen" in str(a) and "Moe" in str(a) for a in architectures
-    ) or any(str(a).startswith("Olmoe") for a in architectures):
-        return Qwen3MoeModelAdapter()
-
+    if model_type:
+        for adapter_name, model_types in SUPPORTED_MODEL_TYPES.items():
+            if model_type in model_types:
+                return _ADAPTER_CLASSES[adapter_name]()
+        return None
+    architectures = _config_value(config, "architectures", default=()) or ()
+    for architecture in architectures:
+        adapter_name = _ARCHITECTURE_ADAPTERS.get(str(architecture))
+        if adapter_name is not None:
+            return _ADAPTER_CLASSES[adapter_name]()
     return None
 
 
@@ -531,6 +553,7 @@ __all__ = [
     "MixtralMoeModelAdapter",
     "MoeLayerConfig",
     "Qwen3MoeModelAdapter",
+    "SUPPORTED_MODEL_TYPES",
     "config_num_experts",
     "get_model_layers",
     "get_shared_expert",
@@ -539,6 +562,7 @@ __all__ = [
     "make_ssm_mask",
     "update_lfm2_moe_config",
     "update_mixtral_moe_config",
+    "unsupported_architecture_message",
     "update_moe_config",
     "update_qwen3_moe_config",
 ]

@@ -453,3 +453,70 @@ def test_infer_qwen2_moe_config_only():
 
     adapter = infer_model_adapter(None, {"model_type": "qwen2_moe"})
     assert isinstance(adapter, Qwen3MoeModelAdapter)
+
+
+@pytest.mark.parametrize(
+    ("layout_attr", "model_type"),
+    [
+        # Same module layouts as supported families, different routing.
+        ("block_sparse_moe", "minimax"),
+        ("block_sparse_moe", "granitemoe"),
+        ("mlp", "deepseek"),
+        ("mlp", "deepseek_v3"),
+        ("mlp", "glm4_moe"),
+        ("mlp", "ernie4_5_moe"),
+        ("feed_forward", "jamba"),
+    ],
+)
+def test_infer_model_adapter_rejects_unsupported_model_types_with_known_layouts(
+    layout_attr, model_type
+):
+    from types import SimpleNamespace
+
+    layer = SimpleNamespace(**{layout_attr: SimpleNamespace(switch_mlp=object())})
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    assert infer_model_adapter(model, {"model_type": model_type}) is None
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "deepseek_v2"},
+        {"model_type": "qwen3_vl_moe"},
+        {"architectures": ["Lfm2ForCausalLM"]},
+        {"architectures": ["Qwen3VLMoeForConditionalGeneration"]},
+    ],
+)
+def test_infer_model_adapter_config_only_rejects_unverified_architectures(config):
+    assert infer_model_adapter(None, config) is None
+
+
+@pytest.mark.parametrize(
+    ("model_type", "adapter_name"),
+    [
+        ("qwen2_moe", "qwen3_moe"),
+        ("qwen3_moe", "qwen3_moe"),
+        ("olmoe", "qwen3_moe"),
+        ("mixtral", "mixtral_moe"),
+        ("phimoe", "mixtral_moe"),
+        ("lfm2_moe", "lfm2_moe"),
+    ],
+)
+def test_supported_model_types_map_to_their_adapters(model_type, adapter_name):
+    from reap.model_adapters import SUPPORTED_MODEL_TYPES
+
+    assert model_type in SUPPORTED_MODEL_TYPES[adapter_name]
+    assert infer_model_adapter(None, {"model_type": model_type}).adapter_name == (
+        adapter_name
+    )
+
+
+def test_unsupported_architecture_message_lists_supported_model_types():
+    from reap.model_adapters import unsupported_architecture_message
+
+    message = unsupported_architecture_message({"model_type": "minimax"})
+
+    assert "model_type='minimax'" in message
+    for model_type in ("qwen2_moe", "qwen3_moe", "olmoe", "mixtral", "phimoe", "lfm2_moe"):
+        assert model_type in message
