@@ -21,7 +21,6 @@ from reap.save import (
     save_pruned_model,
 )
 
-
 MLX_LM_AVAILABLE = importlib.util.find_spec("mlx_lm") is not None
 
 
@@ -378,7 +377,7 @@ def test_save_pruned_model_rejects_missing_expected_expert_count(tmp_path):
         )
 
 
-def test_save_pruned_model_raises_clear_message_when_no_moe_architecture_detected(tmp_path):
+def test_save_pruned_model_raises_clear_message_without_moe_architecture(tmp_path):
     # Neither the original nor the reloaded model expose MoE structure, so
     # adapter inference returns None for both -> fail with a clear message.
     dense_model = SimpleNamespace(
@@ -387,7 +386,9 @@ def test_save_pruned_model_raises_clear_message_when_no_moe_architecture_detecte
     dense_reloaded = SimpleNamespace(
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=object())])
     )
-    with pytest.raises(ValueError, match="Cannot detect a supported MoE architecture") as excinfo:
+    with pytest.raises(
+        ValueError, match="Cannot detect a supported MoE architecture"
+    ) as excinfo:
         save_pruned_model(
             dense_model,
             object(),
@@ -444,6 +445,73 @@ def test_save_pruned_model_rejects_reload_config_mismatch(tmp_path):
                 make_reloaded_model(2),
                 object(),
                 {"num_experts": 3},
+            ),
+        )
+
+
+def test_save_pruned_model_refuses_to_overwrite_the_source_model_dir(tmp_path):
+    source = tmp_path / "local-model"
+    write_required_artifacts(source, config={"num_experts": 4})
+    original_weights = (source / "model.safetensors").read_bytes()
+    save_calls = []
+
+    with pytest.raises(ValueError, match="source model directory"):
+        save_pruned_model(
+            make_reloaded_model(2),
+            object(),
+            {"num_experts": 2},
+            source,
+            str(source),
+            save_fn=fake_save_factory(save_calls),
+            load_fn=fake_load_factory(make_reloaded_model(2), object(), {}),
+        )
+
+    assert save_calls == []
+    assert (source / "model.safetensors").read_bytes() == original_weights
+
+
+def make_mixtral_reloaded_model(num_experts: int):
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(block_sparse_moe=TinyMoe(num_experts))],
+        ),
+    )
+
+
+def test_save_pruned_model_reads_mixtral_num_local_experts(tmp_path):
+    reloaded_model = make_mixtral_reloaded_model(2)
+    config = {
+        "model_type": "mixtral",
+        "num_local_experts": 2,
+        "num_experts_per_tok": 2,
+    }
+
+    result = save_pruned_model(
+        make_mixtral_reloaded_model(2),
+        object(),
+        config,
+        tmp_path / "saved",
+        "source-model",
+        save_fn=fake_save_factory([]),
+        load_fn=fake_load_factory(reloaded_model, object(), dict(config)),
+    )
+
+    assert result.expected_expert_count == 2
+
+
+def test_save_pruned_model_rejects_mixtral_reload_count_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="Reloaded config expert count mismatch"):
+        save_pruned_model(
+            make_mixtral_reloaded_model(2),
+            object(),
+            {"model_type": "mixtral", "num_local_experts": 2},
+            tmp_path / "saved",
+            "source-model",
+            save_fn=fake_save_factory([]),
+            load_fn=fake_load_factory(
+                make_mixtral_reloaded_model(2),
+                object(),
+                {"model_type": "mixtral", "num_local_experts": 8},
             ),
         )
 
@@ -596,7 +664,9 @@ def test_generation_smoke_falls_back_to_raw_prompt_when_chat_template_fails(capl
     assert result == "hello"
     assert calls == [(model, tokenizer, "Who are you?", 4)]
     # The fallback should be logged with the exception details.
-    assert any("Chat template application failed" in rec.message for rec in caplog.records)
+    assert any(
+        "Chat template application failed" in rec.message for rec in caplog.records
+    )
 
 
 def test_generation_smoke_propagates_unexpected_chat_template_errors():
@@ -617,6 +687,66 @@ def test_generation_smoke_propagates_unexpected_chat_template_errors():
             generate_fn=lambda model, tokenizer, *, prompt, max_tokens: "hello",
         )
 
+
+
+def test_generation_smoke_runs_outside_the_main_thread():
+    import threading
+
+    class Tokenizer:
+        chat_template = None
+
+    results = []
+
+    def run():
+        results.append(
+            generation_smoke(
+                object(),
+                Tokenizer(),
+                prompt="Hi",
+                max_tokens=2,
+                generate_fn=lambda model, tokenizer, *, prompt, max_tokens: "ok",
+            )
+        )
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join(timeout=10)
+
+    assert results == ["ok"]
+
+
+class WhitespaceSmokeTokenizer:
+    def encode(self, text, add_special_tokens=True):
+        return text.split()
+
+
+@pytest.mark.parametrize(
+    ("generated", "expected_warnings"),
+    [
+        ("Paris is in France.", []),
+        ("   ", ["generated text is empty"]),
+        ("the the the the the", ["generated text repeats a single token 5 times"]),
+    ],
+)
+def test_save_pruned_model_flags_degenerate_smoke_output(
+    tmp_path, generated, expected_warnings
+):
+    result = save_pruned_model(
+        object(),
+        object(),
+        {"num_experts": 1},
+        tmp_path / "saved",
+        "source-model",
+        smoke_fn=lambda model, tokenizer, config: generated,
+        save_fn=fake_save_factory([]),
+        load_fn=fake_load_factory(
+            make_reloaded_model(1),
+            WhitespaceSmokeTokenizer(),
+            {"num_experts": 1},
+        ),
+    )
+
+    assert result.metrics["smoke"]["output_warnings"] == expected_warnings
 
 
 def test_generation_smoke_times_out_when_generate_stalls():

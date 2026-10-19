@@ -32,6 +32,7 @@ packages = ["src/reap"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "ruff>=0.14.2",
 ]
 
 [project.urls]
@@ -42,4 +43,6 @@ reap-mlx = "reap.entrypoint:main"
 
 [tool.ruff]
 line-length = 88
-select = ["SIM"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "SIM"]

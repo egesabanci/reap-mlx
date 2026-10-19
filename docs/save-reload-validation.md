@@ -68,6 +68,13 @@ The helper uses the passed config mapping. It must not rely on `model.config`.
 `output_dir` is created if needed. If it already exists as a file, saving raises
 `OSError`.
 
+Before writing, stale artifacts from a previous run (`*.safetensors`, `*.npz`,
+`config.json`, tokenizer files, `validation-metrics.json`) are deleted from
+`output_dir`. To make that cleanup safe, saving raises `ValueError` when
+`output_dir` resolves to the source model directory, and the CLI additionally
+refuses an existing `--output-dir` that holds model files but no reap-mlx run
+markers (`reap-checkpoint.json` or the metrics file).
+
 ## Required Saved Artifacts
 
 After save, the output directory must contain:
@@ -122,14 +129,15 @@ In that fallback path, `config.json` is read directly.
 Expected expert count comes from:
 
 1. explicit `expected_expert_count`, when provided;
-2. `config["num_experts"]`.
+2. `config["num_experts"]`, or `config["num_local_experts"]` for
+   Mixtral/PhiMoE configs.
 
 The value must be positive. If both are missing, validation raises.
 
 ## Reloaded Config Validation
 
-Reloaded config must include `num_experts`, and it must match the expected
-expert count.
+Reloaded config must include `num_experts` (or `num_local_experts`), and it
+must match the expected expert count.
 
 This catches save paths that failed to write the pruned config.
 
@@ -172,6 +180,13 @@ from mlx_lm import generate
 
 Smoke runs on the reloaded model and reloaded tokenizer. `--no-smoke` disables
 smoke by passing `smoke_fn=None`.
+
+Generation is bounded by a 120 second wall-clock timeout (`SIGALRM`). The alarm
+can only be installed from the main thread, so when the pipeline runs in
+another thread the timeout is skipped with a warning instead of failing.
+
+Empty output, or output that repeats a single token four or more times, is
+logged and recorded in `smoke.output_warnings`; the run is not failed for it.
 
 ## Common Failure Meanings
 

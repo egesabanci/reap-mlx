@@ -58,20 +58,33 @@ environment.
 
 Run config records user-facing CLI inputs:
 
-- `model_name`
+- `model_name`, `revision`
 - `dataset_name`
 - `dataset_config_name`
+- `dataset_streaming`
 - `split`
 - `seed`
 - `max_samples`
 - `max_seq_length`
+- `pack_calibration`
+- `min_calibration_samples`, `allow_partial_calibration`
 - `eval_frequency`
 - `prune_method`
 - `resolved_prune_method`
 - `compression_ratio`
+- `skip_layer_indices`, `prune_layer_indices`, `per_layer_ratios`,
+  `target_experts`
+- `resume_from_checkpoint`, `strict_resume`
 - `output_dir`
 - `metrics_file`
-- `smoke_enabled`
+- `smoke_enabled`, `smoke_prompt`, `smoke_max_tokens`
+- `eval_calibration_nll`, `eval_calibration_sequences`
+- `replay_check_enabled`
+
+On `--resume-from-checkpoint` the prune plan comes from the checkpoint, so its
+`prune_method`, `compression_ratio`, layer filters, `target_experts`, and
+calibration settings replace the unused CLI values, and `checkpoint` records the
+checkpoint's path, schema version, creation time, model name, and adapter.
 
 After calibration, it also records actual sample and token counts:
 
@@ -86,7 +99,8 @@ After calibration, it also records actual sample and token counts:
 
 Model telemetry includes adapter-visible metadata:
 
-- model name, revision, and source path when available;
+- model name, revision, and source path when available (for Hub models,
+  `model_revision` is the commit that was loaded, read from the local cache);
 - adapter name;
 - model type and architectures;
 - quantization metadata;
@@ -156,6 +170,8 @@ Top-level observer fields:
 
 - `observed_moe_layer_count`
 - `observed_moe_layer_indices`
+- `observed_sequences` (fully observed calibration sequences; lower than the
+  sample count when out-of-memory stopped observation early)
 - `total_input_tokens`
 - `per_layer`
 
@@ -170,6 +186,8 @@ Per layer:
 - `saliency_min`
 - `saliency_max`
 - `saliency_mean`
+- `replay_parity_error` (first-sequence replay error against the live MoE
+  block; `null` when the check was skipped)
 
 Non-finite saliency values are counted and JSON-safe output replaces non-finite
 floating values with `null` where needed.
@@ -213,9 +231,20 @@ Smoke telemetry records:
 - max tokens;
 - elapsed seconds;
 - generated token count when tokenizer encoding is available;
-- result preview.
+- result preview;
+- `output_warnings`: signs of a broken pruned model, such as empty output or a
+  single token repeated four or more times. These are warnings only; the run
+  still succeeds, because a healthy model can stop immediately on some prompts.
 
 The result preview is truncated to 500 characters.
+
+## Quality
+
+Present when `--eval-calibration-nll` is set. It holds the reloaded pruned
+model's NLL (`status`, `mean_nll`, `perplexity`, `token_count`,
+`sequence_count`), the unpruned `baseline` with the same fields,
+`delta_mean_nll`, and `evaluation_set` (`held_out` or in-sample
+`calibration`). See [Evaluating pruned models](eval.md).
 
 ## Throughput
 

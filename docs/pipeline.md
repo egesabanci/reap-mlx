@@ -11,8 +11,9 @@ model_load
   -> prune_plan_validation   # layer filters / ratios / uniform counts
   -> calibration
   -> observe                 # refuse zero-token / all-zero saliency
-  -> prune
-  -> checkpoint write        # hard fail if checkpoint cannot be written
+  -> prune                   # rank + validate every layer
+     -> checkpoint write     # before any weight is sliced; hard fail if it cannot be written
+     -> slice experts
   -> save_reload_smoke
   -> metrics write
 ```
@@ -21,11 +22,20 @@ Resume branch (`--resume-from-checkpoint`):
 
 ```txt
 model_load
-  -> checkpoint_load
-  -> apply_keep_indices
+  -> checkpoint_load         # model name, adapter, and pre-prune config must match
+  -> apply_keep_indices      # validates every layer before slicing anything
   -> save_reload_smoke
   -> metrics write
 ```
+
+On resume, the checkpoint's model name (local paths compared after resolving),
+adapter, and pre-prune config (`model_type`, `num_hidden_layers`,
+`hidden_size`, expert count) must match the loaded model. Mismatches raise
+unless `--no-strict-resume` is passed, in which case they are logged as
+warnings. `apply_keep_indices` then requires keep indices for exactly the
+model's MoE layers with a uniform retained count, and checks all of it before
+slicing, so a mismatched checkpoint leaves the model and the output directory
+untouched.
 
 | Phase | Main function | Responsibility | Output |
 | --- | --- | --- | --- |
@@ -108,7 +118,8 @@ For each adapter-visible MoE layer:
 6. Slice switch projections, router gate fields, and LFM2 expert bias when
    applicable.
 7. Update live `num_experts` and top-k attributes.
-8. Update global config `num_experts` and `num_experts_per_tok`.
+8. Update global config `num_experts` (`num_local_experts` for Mixtral/PhiMoE)
+   and `num_experts_per_tok`.
 
 The implementation requires every pruned MoE layer to retain the same expert
 count because the saved config stores a single global `num_experts`.
@@ -121,7 +132,8 @@ config. After saving, validation requires:
 - `config.json` exists;
 - at least one `*.safetensors` or `*.npz` weight artifact exists;
 - the saved model reloads successfully;
-- reloaded config `num_experts` matches the expected expert count;
+- reloaded config `num_experts` (or `num_local_experts`) matches the expected
+  expert count;
 - every adapter-visible MoE layer exposes switch projections and router gate
   weights with first dimension equal to the expected expert count;
 - LFM2 `expert_bias` first dimension is valid when present or enabled.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -123,9 +124,15 @@ def test_help_works_without_heavy_runtime_imports():
         (["--max-seq-length", "0"], "max_seq_length"),
         (["--eval-frequency", "0"], "eval_frequency"),
         (["--smoke-max-tokens", "0"], "smoke_max_tokens"),
+        (
+            ["--max-samples", "4", "--min-calibration-samples", "5"],
+            "cannot exceed --max-samples",
+        ),
     ],
 )
-def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
+def test_invalid_arguments_fail_before_pipeline_functions(
+    extra_args, message, capsys, tmp_path
+):
     def fail_load_model(model_name):
         raise AssertionError("load_model_fn must not be called for invalid args")
 
@@ -136,7 +143,7 @@ def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
         "dataset",
         "--allow-partial-calibration",
         "--output-dir",
-        "out",
+        str(tmp_path / "out"),
         *extra_args,
     ]
 
@@ -144,6 +151,87 @@ def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
         main(args, load_model_fn=fail_load_model)
 
     assert exc_info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def _fail_load_model(model_name):
+    raise AssertionError("load_model_fn must not be called for invalid args")
+
+
+def _write_fake_model_files(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text("{}", encoding="utf-8")
+    (directory / "model.safetensors").write_bytes(b"original-weights")
+
+
+def test_output_dir_equal_to_source_model_dir_is_rejected(tmp_path):
+    source = tmp_path / "local-model"
+    _write_fake_model_files(source)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--model-name",
+                str(source),
+                "--dataset-name",
+                "dataset",
+                "--output-dir",
+                f"{source}/",
+            ],
+            load_model_fn=_fail_load_model,
+        )
+
+    assert exc_info.value.code == 2
+    assert (source / "model.safetensors").read_bytes() == b"original-weights"
+
+
+def test_output_dir_with_foreign_model_files_is_rejected(tmp_path):
+    output = tmp_path / "someone-elses-model"
+    _write_fake_model_files(output)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--model-name",
+                "model",
+                "--dataset-name",
+                "dataset",
+                "--output-dir",
+                str(output),
+            ],
+            load_model_fn=_fail_load_model,
+        )
+
+    assert exc_info.value.code == 2
+    assert (output / "model.safetensors").read_bytes() == b"original-weights"
+
+
+def test_output_dir_from_a_previous_reap_run_is_reused(tmp_path):
+    output = tmp_path / "pruned"
+    _write_fake_model_files(output)
+    (output / "validation-metrics.json").write_text("{}", encoding="utf-8")
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--allow-partial-calibration",
+            "--output-dir",
+            str(output),
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=output
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
 
 
 def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_path):
@@ -178,7 +266,9 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         events.append(("observe", model_arg, sequences, config_arg, kwargs))
         return {0: {"reap": [1.0, 0.5, 0.25, 0.0]}}
 
-    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
+    def fake_prune_experts(
+        model_arg, config_arg, observer_data, method, ratio, **kwargs
+    ):
         events.append(("prune", model_arg, config_arg, observer_data, method, ratio))
         config_arg["num_experts"] = 3
         return {0: [0, 1, 2]}
@@ -254,6 +344,8 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         "max_samples": 3,
         "max_seq_length": 16,
         "seed": 9,
+        "pack": False,
+        "streaming": False,
     }
     assert events[2][4]["eval_frequency"] == 1
     assert "print_fn" in events[2][4]
@@ -314,11 +406,234 @@ def test_main_passes_configured_eval_frequency_to_observer(tmp_path):
     assert code == 0
     assert observe_kwargs["eval_frequency"] == 4
     assert "print_fn" in observe_kwargs
+    assert observe_kwargs["verify_replay"] is True
 
     payload = json.loads(
         (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
     )
     assert payload["run_config"]["eval_frequency"] == 4
+
+
+def _run_with_partial_observation(tmp_path, *extra_args):
+    output = []
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--max-samples",
+            "2",
+            "--output-dir",
+            str(tmp_path),
+            "--no-smoke",
+            *extra_args,
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [
+            {"input_ids": [1, 2]},
+            {"input_ids": [3, 4]},
+        ],
+        # Out of memory after the first of two sequences.
+        observe_model_fn=lambda *args, **kwargs: {
+            0: {"reap": [1.0, 0.5], "total_tokens": 2, "observed_sequences": 1}
+        },
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=output.append,
+    )
+    return code, output
+
+
+def test_partial_observation_must_still_meet_min_calibration_samples(tmp_path):
+    with pytest.raises(RuntimeError, match="Observation stopped after 1 of 2"):
+        _run_with_partial_observation(tmp_path)
+
+    payload = json.loads(
+        (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["status"] == "failed"
+    assert payload["observer"]["observed_sequences"] == 1
+
+
+def test_partial_observation_is_allowed_with_allow_partial_calibration(tmp_path):
+    code, output = _run_with_partial_observation(
+        tmp_path, "--allow-partial-calibration"
+    )
+
+    assert code == 0
+    assert any("only 1/2 calibration sequences" in line for line in output)
+
+
+def _run_with_eval_nll(tmp_path, monkeypatch, *, available_records):
+    import reap.eval_nll
+
+    model, tokenizer, config = _moe_model_and_config()
+    reloaded_model = object()
+    events = []
+    loader_kwargs = {}
+
+    def fake_loader(tokenizer_arg, dataset_name, **kwargs):
+        loader_kwargs.update(kwargs)
+        count = min(kwargs["max_samples"], available_records)
+        return [{"input_ids": [index, index + 1]} for index in range(count)]
+
+    def fake_observe(model_arg, sequences, config_arg, **kwargs):
+        events.append(("observe", [seq["input_ids"][0] for seq in sequences]))
+        return {0: {"reap": [1.0, 0.5]}}
+
+    def fake_prune(*args, **kwargs):
+        events.append(("prune",))
+        return {}
+
+    def fake_nll(model_arg, sequences, **kwargs):
+        which = "baseline" if model_arg is model else "pruned"
+        events.append((which, [seq["input_ids"][0] for seq in sequences]))
+        return {
+            "status": "ok",
+            "mean_nll": 2.0 if which == "baseline" else 2.5,
+            "token_count": len(sequences),
+            "sequence_count": len(sequences),
+        }
+
+    monkeypatch.setattr(reap.eval_nll, "calibration_mean_nll", fake_nll)
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--max-samples",
+            "3",
+            "--eval-calibration-nll",
+            "--eval-calibration-sequences",
+            "2",
+            "--output-dir",
+            str(tmp_path),
+            "--no-smoke",
+        ],
+        load_model_fn=lambda model_name: (model, tokenizer, config),
+        load_calibration_sequences_fn=fake_loader,
+        observe_model_fn=fake_observe,
+        prune_experts_fn=fake_prune,
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path, reloaded_model=reloaded_model
+        ),
+        print_fn=lambda message: None,
+    )
+    payload = json.loads((tmp_path / "validation-metrics.json").read_text())
+    return code, events, loader_kwargs, payload["quality"]
+
+
+def test_eval_nll_holds_out_sequences_and_measures_a_pre_prune_baseline(
+    tmp_path, monkeypatch
+):
+    code, events, loader_kwargs, quality = _run_with_eval_nll(
+        tmp_path, monkeypatch, available_records=10
+    )
+
+    assert code == 0
+    assert loader_kwargs["max_samples"] == 5
+    assert events == [
+        ("observe", [0, 1, 2]),
+        ("baseline", [3, 4]),
+        ("prune",),
+        ("pruned", [3, 4]),
+    ]
+    assert quality["evaluation_set"] == "held_out"
+    assert quality["baseline"]["mean_nll"] == 2.0
+    assert quality["mean_nll"] == 2.5
+    assert quality["delta_mean_nll"] == pytest.approx(0.5)
+
+
+def test_eval_nll_falls_back_to_observed_sequences_when_none_are_left(
+    tmp_path, monkeypatch
+):
+    code, events, _, quality = _run_with_eval_nll(
+        tmp_path, monkeypatch, available_records=3
+    )
+
+    assert code == 0
+    assert ("baseline", [0, 1]) in events
+    assert quality["evaluation_set"] == "calibration"
+
+
+def test_pack_calibration_flag_is_forwarded_to_the_loader(tmp_path):
+    loader_kwargs = {}
+
+    def fake_load_calibration_sequences(tokenizer_arg, dataset_name, **kwargs):
+        loader_kwargs.update(kwargs)
+        return [{"input_ids": [1]}]
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--allow-partial-calibration",
+            "--output-dir",
+            str(tmp_path),
+            "--pack-calibration",
+            "--dataset-streaming",
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=fake_load_calibration_sequences,
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert loader_kwargs["pack"] is True
+    assert loader_kwargs["streaming"] is True
+    payload = json.loads(
+        (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["run_config"]["pack_calibration"] is True
+    assert payload["run_config"]["dataset_streaming"] is True
+
+
+def test_skip_replay_check_disables_observer_parity_verification(tmp_path):
+    observe_kwargs = {}
+
+    def fake_observe_model(model_arg, sequences, config_arg, **kwargs):
+        del model_arg, sequences, config_arg
+        observe_kwargs.update(kwargs)
+        return {0: {"reap": [1.0]}}
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--allow-partial-calibration",
+            "--output-dir",
+            str(tmp_path),
+            "--skip-replay-check",
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=fake_observe_model,
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert observe_kwargs["verify_replay"] is False
+    payload = json.loads(
+        (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["run_config"]["replay_check_enabled"] is False
 
 
 def test_main_configures_default_generation_smoke_from_cli(tmp_path, monkeypatch):
@@ -414,7 +729,7 @@ def test_no_smoke_passes_no_smoke_function_to_save(tmp_path):
     assert save_kwargs["smoke_max_tokens"] == 16
 
 
-def test_keyboard_interrupt_returns_130_without_success_message():
+def test_keyboard_interrupt_returns_130_without_success_message(tmp_path):
     output = []
 
     def interrupt(model_name):
@@ -429,7 +744,7 @@ def test_keyboard_interrupt_returns_130_without_success_message():
             "dataset",
             "--allow-partial-calibration",
             "--output-dir",
-            "out",
+            str(tmp_path),
         ],
         load_model_fn=interrupt,
         print_fn=output.append,
@@ -438,6 +753,8 @@ def test_keyboard_interrupt_returns_130_without_success_message():
     assert code == 130
     assert any("interrupted:" in line for line in output)
     assert not any("done:" in line for line in output)
+    payload = json.loads((tmp_path / "validation-metrics.json").read_text())
+    assert payload["status"] == "interrupted"
 
 
 def test_main_writes_failed_metrics_when_pipeline_phase_raises(tmp_path):
@@ -502,7 +819,9 @@ def _multi_moe_model_and_config(num_layers: int = 2, num_experts: int = 4):
 def test_main_passes_layer_selection_flags_to_prune(tmp_path):
     prune_kwargs = {}
 
-    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
+    def fake_prune_experts(
+        model_arg, config_arg, observer_data, method, ratio, **kwargs
+    ):
         del model_arg, config_arg, observer_data, method, ratio
         prune_kwargs.update(kwargs)
         return {0: [0, 1, 2, 3]}
@@ -545,7 +864,9 @@ def test_main_passes_layer_selection_flags_to_prune(tmp_path):
 def test_main_passes_per_layer_ratios_to_prune(tmp_path):
     prune_kwargs = {}
 
-    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
+    def fake_prune_experts(
+        model_arg, config_arg, observer_data, method, ratio, **kwargs
+    ):
         del model_arg, config_arg, observer_data, method, ratio
         prune_kwargs.update(kwargs)
         return {0: [0, 1], 1: [0, 1]}
@@ -642,6 +963,7 @@ def test_main_rejects_malformed_per_layer_ratios(tmp_path):
 
 def test_main_resume_skips_observe_and_prune_and_applies_checkpoint(tmp_path):
     import numpy as np
+
     from reap.checkpoint import write_checkpoint
 
     ckpt_path = tmp_path / "reap-checkpoint.json"
@@ -699,6 +1021,186 @@ def test_main_resume_skips_observe_and_prune_and_applies_checkpoint(tmp_path):
     assert "save" in events
     # The checkpoint keep indices were forwarded to apply_keep_indices.
     assert apply_calls == [{0: [1, 3]}]
+
+
+def test_checkpoint_is_written_before_pruning_mutates_the_model(tmp_path):
+    import numpy as np
+
+    def prune_then_fail(*args, on_plan=None, **kwargs):
+        on_plan({0: np.array([0, 2])})
+        raise RuntimeError("slicing failed")
+
+    with pytest.raises(RuntimeError, match="slicing failed"):
+        main(
+            [
+                "--model-name",
+                "model",
+                "--dataset-name",
+                "dataset",
+                "--allow-partial-calibration",
+                "--output-dir",
+                str(tmp_path),
+            ],
+            load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+            load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+            observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0, 0.5, 0.2]}},
+            prune_experts_fn=prune_then_fail,
+            print_fn=lambda message: None,
+        )
+
+    checkpoint = json.loads((tmp_path / "reap-checkpoint.json").read_text())
+    assert checkpoint["keep_by_layer"] == {"0": [0, 2]}
+    payload = json.loads((tmp_path / "validation-metrics.json").read_text())
+    assert payload["failure"]["phase"] == "prune"
+
+
+def _write_resume_checkpoint(tmp_path, *, model_name="model", config_before_prune=None):
+    import numpy as np
+
+    from reap.checkpoint import write_checkpoint
+
+    return write_checkpoint(
+        tmp_path / "checkpoint" / "reap-checkpoint.json",
+        keep_by_layer={0: np.array([1, 3])},
+        config_before_prune=config_before_prune or {"num_experts": 4},
+        model_name=model_name,
+        prune_method="reap",
+        compression_ratio=0.5,
+        adapter_name="qwen3_moe",
+    )
+
+
+def _resume(tmp_path, model_name, checkpoint_path, *extra_args):
+    applied = []
+
+    def fake_apply(model_arg, config_arg, keep_by_layer, **kwargs):
+        applied.append(keep_by_layer)
+        return dict(keep_by_layer)
+
+    code = main(
+        [
+            "--model-name",
+            model_name,
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--resume-from-checkpoint",
+            str(checkpoint_path),
+            "--no-smoke",
+            *extra_args,
+        ],
+        load_model_fn=lambda name: (*_moe_model_and_config(),),
+        apply_keep_indices_fn=fake_apply,
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path / "out"
+        ),
+        print_fn=lambda message: None,
+    )
+    return code, applied
+
+
+def test_resume_records_the_checkpoint_plan_instead_of_cli_defaults(tmp_path):
+    checkpoint = _write_resume_checkpoint(tmp_path)
+
+    code, _ = _resume(tmp_path, "model", checkpoint)
+
+    assert code == 0
+    payload = json.loads((tmp_path / "out" / "validation-metrics.json").read_text())
+    assert payload["run_config"]["compression_ratio"] == 0.5
+    assert payload["run_config"]["checkpoint"]["path"] == str(checkpoint)
+    assert payload["run_config"]["resume_from_checkpoint"] == str(checkpoint)
+
+
+def test_default_loader_passes_revision_to_mlx_lm(monkeypatch):
+    import mlx_lm
+
+    from reap.entrypoint import _default_load_model
+
+    calls = []
+
+    def fake_load(model_name, return_config=False, revision=None):
+        calls.append((model_name, return_config, revision))
+        return object(), object(), {"model_type": "qwen3_moe"}
+
+    monkeypatch.setattr(mlx_lm, "load", fake_load)
+
+    _default_load_model("org/model", revision="abc123")
+
+    assert calls == [("org/model", True, "abc123")]
+
+
+def test_resolve_hub_revision_reads_the_cached_snapshot_commit(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from reap.entrypoint import _resolve_hub_revision
+
+    snapshot = tmp_path / "snapshots" / "0123abcd"
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda repo_id, revision=None, local_files_only=False: str(snapshot),
+    )
+
+    assert _resolve_hub_revision("org/model", "main") == "0123abcd"
+    # Local paths have no Hub revision.
+    assert _resolve_hub_revision(str(tmp_path), None) is None
+
+
+def test_resolve_hub_revision_falls_back_to_the_requested_revision(monkeypatch):
+    import huggingface_hub
+
+    from reap.entrypoint import _resolve_hub_revision
+
+    def not_cached(repo_id, revision=None, local_files_only=False):
+        raise FileNotFoundError(repo_id)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", not_cached)
+
+    assert _resolve_hub_revision("org/model", "v2") == "v2"
+    assert _resolve_hub_revision("org/model", None) is None
+
+
+def test_resume_accepts_another_spelling_of_the_same_local_model_path(tmp_path):
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    checkpoint = _write_resume_checkpoint(tmp_path, model_name=str(model_dir))
+
+    code, applied = _resume(tmp_path, f"{model_dir}/", checkpoint)
+
+    assert code == 0
+    assert applied
+
+
+def test_resume_rejects_a_checkpoint_made_for_a_different_layout(tmp_path):
+    checkpoint = _write_resume_checkpoint(
+        tmp_path,
+        config_before_prune={"num_experts": 8, "num_hidden_layers": 1},
+    )
+
+    with pytest.raises(ValueError, match="made for 8 experts per layer"):
+        _resume(tmp_path, "model", checkpoint)
+
+
+def test_no_strict_resume_downgrades_layout_mismatch_to_a_warning(tmp_path, caplog):
+    checkpoint = _write_resume_checkpoint(
+        tmp_path,
+        config_before_prune={"num_experts": 8},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="reap.entrypoint"):
+        code, applied = _resume(tmp_path, "model", checkpoint, "--no-strict-resume")
+
+    assert code == 0
+    assert applied
+    assert any("made for 8 experts" in record.message for record in caplog.records)
+
+
+def test_strict_resume_flag_is_accepted_explicitly(tmp_path):
+    checkpoint = _write_resume_checkpoint(tmp_path)
+
+    code, applied = _resume(tmp_path, "model", checkpoint, "--strict-resume")
+
+    assert code == 0
+    assert applied
 
 
 def test_main_resume_requires_existing_checkpoint_file(tmp_path):

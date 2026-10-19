@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import inspect
 import importlib.util
+import inspect
 import os
 import subprocess
 import sys
@@ -13,8 +13,12 @@ from pathlib import Path
 import pytest
 
 from reap import router as router_module
-from reap.router import Lfm2MoeRouter, Qwen3MoeRouter, RouterResult
-
+from reap.router import (
+    Lfm2MoeRouter,
+    MixtralMoeRouter,
+    Qwen3MoeRouter,
+    RouterResult,
+)
 
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
 
@@ -184,6 +188,119 @@ def assert_allclose(mx, actual, expected, *, atol=1e-6):
     diff = mx.max(mx.abs(actual - expected))
     mx.eval(diff)
     assert float(diff) <= atol
+
+
+class RecordingSwitchMlp:
+    """Stand-in switch_mlp that records the experts an mlx-lm block selects.
+
+    Each top-k slot returns a unit vector, so the block output's first k
+    features are exactly the routing weights the block applied, in slot order.
+    """
+
+    def __init__(self, mx):
+        self.mx = mx
+        self.indices = None
+
+    def __call__(self, x, indices):
+        self.indices = indices
+        top_k = indices.shape[-1]
+        slot_units = self.mx.eye(top_k, x.shape[-1], dtype=x.dtype)
+        return self.mx.broadcast_to(slot_units, (*indices.shape, x.shape[-1]))
+
+
+def _mlx_lm_block_with_tied_gate(mx, model_type):
+    """Build an mlx-lm MoE block whose gate logits tie at the top-2 boundary."""
+    import importlib
+
+    arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+    common = {
+        "model_type": model_type,
+        "hidden_size": 8,
+        "num_hidden_layers": 1,
+        "intermediate_size": 8,
+        "num_attention_heads": 2,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 16,
+        "num_key_value_heads": 2,
+    }
+    extra = {
+        "qwen3_moe": {
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [],
+            "moe_intermediate_size": 8,
+            "head_dim": 4,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 16,
+            "norm_topk_prob": False,
+        },
+        "qwen2_moe": {
+            "moe_intermediate_size": 8,
+            "shared_expert_intermediate_size": 8,
+        },
+        "olmoe": {},
+    }[model_type]
+    args = arch.ModelArgs.from_dict({**common, **extra})
+    block_cls = {
+        "qwen3_moe": "Qwen3MoeSparseMoeBlock",
+        "qwen2_moe": "Qwen2MoeSparseMoeBlock",
+        "olmoe": "OlmoeSparseMoeBlock",
+    }[model_type]
+    block = getattr(arch, block_cls)(args)
+    weight = mx.zeros((4, 8))
+    weight[:, 0] = mx.array([1.0, 0.5, 0.5, 0.0])
+    block.gate.weight = weight
+    block.switch_mlp = RecordingSwitchMlp(mx)
+    hidden_states = mx.zeros((1, 1, 8))
+    hidden_states[..., 0] = 1.0
+    return block, hidden_states
+
+
+@requires_mlx
+@pytest.mark.parametrize("model_type", ["qwen3_moe", "qwen2_moe", "olmoe"])
+def test_qwen_router_breaks_top_k_ties_like_mlx_lm(model_type):
+    import mlx.core as mx
+
+    block, hidden_states = _mlx_lm_block_with_tied_gate(mx, model_type)
+    mx.eval(block(hidden_states))
+    mlx_lm_selected = sorted(block.switch_mlp.indices.reshape(-1).tolist())
+
+    result = Qwen3MoeRouter(block, {"model_type": model_type})(hidden_states)
+
+    assert sorted(result.indices.reshape(-1).tolist()) == mlx_lm_selected
+
+
+@requires_mlx
+@pytest.mark.parametrize(
+    ("model_type", "block_cls"),
+    [("mixtral", "MixtralSparseMoeBlock"), ("phimoe", "PhiMoESparseMoeBlock")],
+)
+def test_mixtral_router_matches_mlx_lm_block_routes_and_weights(model_type, block_cls):
+    import importlib
+
+    import mlx.core as mx
+
+    arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+    args = arch.ModelArgs.from_dict(
+        {
+            "model_type": model_type,
+            "hidden_size": 8,
+            "intermediate_size": 8,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+        }
+    )
+    block = getattr(arch, block_cls)(args)
+    block.switch_mlp = RecordingSwitchMlp(mx)
+    hidden_states = mx.random.normal((1, 5, 8), key=mx.random.key(0))
+
+    output = block(hidden_states)
+    result = MixtralMoeRouter(block, {"model_type": model_type})(hidden_states)
+
+    assert result.indices.tolist() == block.switch_mlp.indices.tolist()
+    assert_allclose(mx, result.scores, output[..., :2])
 
 
 def test_router_normalization_epsilon_is_shared():

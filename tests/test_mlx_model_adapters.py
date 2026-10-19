@@ -16,11 +16,14 @@ from reap.model_adapters import (
     Lfm2MoeModelAdapter,
     MoeLayerConfig,
     Qwen3MoeModelAdapter,
+    config_num_experts,
     get_model_layers,
     get_shared_expert,
     infer_model_adapter,
     make_attention_mask,
     update_lfm2_moe_config,
+    update_mixtral_moe_config,
+    update_moe_config,
     update_qwen3_moe_config,
 )
 
@@ -308,7 +311,10 @@ def test_infer_model_adapter_selects_lfm2_from_config_and_layout():
     ).adapter_name == "lfm2_moe"
 
     lfm2_model = model_model_layers(
-        [layer_with_feed_forward(DenseMlp()), layer_with_feed_forward(Lfm2FeedForward())]
+        [
+            layer_with_feed_forward(DenseMlp()),
+            layer_with_feed_forward(Lfm2FeedForward()),
+        ]
     )
     qwen_model = model_model_layers([layer_with_mlp(MoeMlp())])
 
@@ -363,6 +369,60 @@ def test_update_lfm2_moe_config_preserves_expert_bias_flag_and_clamps_top_k():
     }
 
 
+def test_update_mixtral_moe_config_writes_num_local_experts():
+    config = {
+        "model_type": "mixtral",
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+    }
+
+    update_mixtral_moe_config(config, num_experts=6, top_k=2)
+
+    assert config == {
+        "model_type": "mixtral",
+        "num_local_experts": 6,
+        "num_experts_per_tok": 2,
+    }
+
+
+def test_update_mixtral_moe_config_keeps_existing_generic_keys_in_sync():
+    config = {
+        "num_local_experts": 8,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "top_k": 2,
+    }
+
+    update_mixtral_moe_config(config, num_experts=1, top_k=2)
+
+    assert config == {
+        "num_local_experts": 1,
+        "num_experts": 1,
+        "num_experts_per_tok": 1,
+        "top_k": 1,
+    }
+
+
+def test_update_moe_config_dispatches_by_adapter_name():
+    qwen = {"num_experts": 8, "num_experts_per_tok": 2}
+    mixtral = {"num_local_experts": 8, "num_experts_per_tok": 2}
+
+    update_moe_config(qwen, adapter_name="qwen3_moe", num_experts=4, top_k=2)
+    update_moe_config(mixtral, adapter_name="mixtral_moe", num_experts=4, top_k=2)
+
+    assert qwen == {"num_experts": 4, "num_experts_per_tok": 2}
+    assert mixtral == {"num_local_experts": 4, "num_experts_per_tok": 2}
+    with pytest.raises(ValueError, match="No config updater"):
+        update_moe_config({}, adapter_name="unknown", num_experts=4, top_k=2)
+
+
+def test_config_num_experts_reads_generic_and_mixtral_keys():
+    assert config_num_experts({"num_experts": 8}) == 8
+    assert config_num_experts({"num_local_experts": 6}) == 6
+    assert config_num_experts({}) is None
+    assert config_num_experts(None) is None
+
+
 def test_make_attention_mask_requires_mlx_lm_when_missing():
     if importlib.util.find_spec("mlx_lm") is not None:
         pytest.skip("MLX-LM is installed in this environment.")
@@ -373,6 +433,7 @@ def test_make_attention_mask_requires_mlx_lm_when_missing():
 
 def test_infer_mixtral_adapter_from_block_sparse_moe_layout():
     from types import SimpleNamespace
+
     from reap.model_adapters import MixtralMoeModelAdapter, infer_model_adapter
 
     layer = SimpleNamespace(
@@ -386,7 +447,9 @@ def test_infer_mixtral_adapter_from_block_sparse_moe_layout():
     adapter = infer_model_adapter(model, {"model_type": "mixtral"})
     assert isinstance(adapter, MixtralMoeModelAdapter)
     assert adapter.identify_moe_layers(model) == [0]
-    cfg = adapter.get_layer_config(layer, {"num_local_experts": 8, "num_experts_per_tok": 2})
+    cfg = adapter.get_layer_config(
+        layer, {"num_local_experts": 8, "num_experts_per_tok": 2}
+    )
     assert cfg.num_experts == 8
     assert cfg.top_k == 2
 
@@ -396,3 +459,74 @@ def test_infer_qwen2_moe_config_only():
 
     adapter = infer_model_adapter(None, {"model_type": "qwen2_moe"})
     assert isinstance(adapter, Qwen3MoeModelAdapter)
+
+
+@pytest.mark.parametrize(
+    ("layout_attr", "model_type"),
+    [
+        # Same module layouts as supported families, different routing.
+        ("block_sparse_moe", "minimax"),
+        ("block_sparse_moe", "granitemoe"),
+        ("mlp", "deepseek"),
+        ("mlp", "deepseek_v3"),
+        ("mlp", "glm4_moe"),
+        ("mlp", "ernie4_5_moe"),
+        ("feed_forward", "jamba"),
+    ],
+)
+def test_infer_model_adapter_rejects_unsupported_model_types_with_known_layouts(
+    layout_attr, model_type
+):
+    from types import SimpleNamespace
+
+    layer = SimpleNamespace(**{layout_attr: SimpleNamespace(switch_mlp=object())})
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    assert infer_model_adapter(model, {"model_type": model_type}) is None
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "deepseek_v2"},
+        {"model_type": "qwen3_vl_moe"},
+        {"architectures": ["Lfm2ForCausalLM"]},
+        {"architectures": ["Qwen3VLMoeForConditionalGeneration"]},
+    ],
+)
+def test_infer_model_adapter_config_only_rejects_unverified_architectures(config):
+    assert infer_model_adapter(None, config) is None
+
+
+@pytest.mark.parametrize(
+    ("model_type", "adapter_name"),
+    [
+        ("qwen2_moe", "qwen3_moe"),
+        ("qwen3_moe", "qwen3_moe"),
+        ("olmoe", "qwen3_moe"),
+        ("mixtral", "mixtral_moe"),
+        ("phimoe", "mixtral_moe"),
+        ("lfm2_moe", "lfm2_moe"),
+    ],
+)
+def test_supported_model_types_map_to_their_adapters(model_type, adapter_name):
+    from reap.model_adapters import SUPPORTED_MODEL_TYPES
+
+    assert model_type in SUPPORTED_MODEL_TYPES[adapter_name]
+    assert infer_model_adapter(None, {"model_type": model_type}).adapter_name == (
+        adapter_name
+    )
+
+
+def test_unsupported_architecture_message_lists_supported_model_types():
+    from reap.model_adapters import (
+        SUPPORTED_MODEL_TYPES,
+        unsupported_architecture_message,
+    )
+
+    message = unsupported_architecture_message({"model_type": "minimax"})
+
+    assert "model_type='minimax'" in message
+    for adapter_types in SUPPORTED_MODEL_TYPES.values():
+        for model_type in adapter_types:
+            assert model_type in message

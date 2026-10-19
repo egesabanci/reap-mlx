@@ -56,6 +56,12 @@ load_dataset(dataset_name, name=dataset_config_name, split=split)
 If the returned dataset object exposes `.shuffle(seed=...)`, calibration uses
 that method before sampling.
 
+A regular `load_dataset` call downloads and prepares the whole dataset (every
+split) before sampling. For large corpora pass `streaming=True` (CLI:
+`--dataset-streaming`): records are then read lazily from the requested split,
+and shuffling uses the datasets streaming buffer (a seeded shuffle of a
+1000-record window) instead of a full permutation.
+
 ## Text Extraction Priority
 
 `extract_text(record, tokenizer=tokenizer)` supports common dataset shapes.
@@ -72,11 +78,27 @@ For mapping records, it checks in this order:
 
 Non-mapping records are converted to text through normalization.
 
+Instruction-style records are rendered as a conversation through the chat
+template when the tokenizer has one, matching the REAP reference (which formats
+`theblackcat102/evol-codealpaca-v1` the same way):
+
+```python
+[
+    {"role": "user", "content": "<instruction>\n\n<input>"},
+    {"role": "assistant", "content": "<output>"},
+]
+```
+
+Without a chat template, or when there is no instruction-side text, the parts
+are joined with blank lines instead.
+
 ## Chat And Conversation Records
 
 For `messages` or `conversations`, JSON strings are parsed when possible.
 
-When the tokenizer exposes `apply_chat_template`, the loader uses it with:
+When the tokenizer has a chat template (mlx-lm's `has_chat_template`, or a
+non-empty Hugging Face `chat_template`), the loader calls `apply_chat_template`
+with:
 
 ```python
 tokenize=False
@@ -85,6 +107,14 @@ add_generation_prompt=False
 
 If the tokenizer's chat template signature does not accept
 `add_generation_prompt`, the loader retries with `tokenize=False` only.
+
+Before rendering, turns are converted to the `role`/`content` shape chat
+templates expect: ShareGPT turns such as `{"from": "human", "value": ...}`
+become `{"role": "user", "content": ...}` (`gpt`/`bot`/`model` map to
+`assistant`), and multimodal content lists are reduced to their text parts.
+If the template still rejects a record (for example strict role alternation),
+the loader logs a warning and uses the plain text rendering below for that
+record.
 
 Without a chat template, each message is rendered as:
 
@@ -123,6 +153,17 @@ Callable tokenizer output can be a mapping with `input_ids` or an object with an
 
 Token IDs are flattened when they are returned as a batch-like nested sequence,
 then truncated to `max_seq_length` and cast to Python `int`.
+
+## Packing
+
+By default every non-empty sample becomes one calibration sequence, so short
+samples produce short sequences. With `pack=True` (CLI: `--pack-calibration`)
+consecutive samples are concatenated into sequences of exactly
+`max_seq_length` tokens, as the REAP reference implementation does. A sample
+that does not fit the remaining room is truncated, `max_samples` counts packed
+sequences, and the last sequence may be shorter when the dataset runs out.
+Packing raises the number of observed tokens per sequence, which gives more
+stable saliency estimates at a higher observation cost.
 
 ## Observer Shape Rules
 

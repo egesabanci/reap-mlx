@@ -24,8 +24,10 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 
 | Option | Default | Description |
 | --- | --- | --- |
+| `--revision` | unset | Hugging Face branch, tag, or commit for `--model-name`; the resolved commit is recorded in telemetry. |
 | `--split` | `train` | Dataset split passed to `load_dataset`. |
 | `--dataset-config-name` | unset | Optional Hugging Face dataset config name. |
+| `--dataset-streaming` | off | Stream records from the requested split instead of preparing the whole dataset. |
 | `--prune-method` | `reap` | Saliency key or alias used to rank experts. |
 | `--compression-ratio` | `0.25` | Fraction of experts to remove per MoE layer (floor semantics). |
 | `--skip-layer-indices` | none | Skip primary ranking; still width-match via `expert_frequency`. |
@@ -33,14 +35,17 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 | `--per-layer-ratios` | none | `index:ratio` overrides; selected layers must retain a uniform count. |
 | `--target-experts` | unset | Retain exactly N experts per MoE layer (overrides ratio planning). |
 | `--min-calibration-samples` | `= max-samples` | Hard floor on non-empty sequences (default equals `--max-samples`). |
-| `--allow-partial-calibration` | off | Allow fewer than the min sample floor. |
-| `--eval-calibration-nll` | off | After reload, compute mean next-token NLL on calibration data. |
+| `--allow-partial-calibration` | off | Allow fewer than the min sample floor, both when loading and when out-of-memory stops observation early. |
+| `--eval-calibration-nll` | off | Compare next-token NLL of the unpruned and the reloaded pruned model on held-out calibration sequences. |
+| `--eval-calibration-sequences` | `8` | Number of extra calibration sequences held out of observation for `--eval-calibration-nll`. |
 | `--resume-from-checkpoint` | unset | Re-apply keep indices and retry save only. |
-| `--strict-resume` / `--no-strict-resume` | strict on | Require checkpoint model/adapter to match. |
+| `--strict-resume` / `--no-strict-resume` | strict on | Require the checkpoint's model, adapter, and pre-prune config to match (warn instead when off). |
 | `--max-samples` | `128` | Maximum non-empty calibration samples. |
 | `--num-calibration-sequences` | alias | Alias for `--max-samples`. |
 | `--max-seq-length` | `2048` | Maximum tokens per calibration sequence. |
+| `--pack-calibration` | off | Pack samples into full `--max-seq-length` sequences (REAP reference behaviour). |
 | `--eval-frequency` | `1` | Evaluate the MLX graph every N observation layers. |
+| `--skip-replay-check` | off | Skip the first-sequence check that the layer replay matches each live MoE block. |
 | `--seed` | `42` | Shuffle seed when the dataset supports shuffle. |
 | `--metrics-file` | `validation-metrics.json` | Metrics filename or absolute path. |
 | `--verbose` | off | Print phase progress messages. |
@@ -60,7 +65,14 @@ The CLI rejects:
 - `max_samples < 1`;
 - `max_seq_length < 1`;
 - `eval_frequency < 1`;
-- `smoke_max_tokens < 1`.
+- `smoke_max_tokens < 1`;
+- `--min-calibration-samples` larger than `--max-samples`;
+- an `--output-dir` that is the source model directory (saving there would
+  delete the original weights);
+- an existing `--output-dir` that contains model files (`config.json`,
+  `*.safetensors`, `*.npz`) but no reap-mlx run markers
+  (`reap-checkpoint.json`, `validation-metrics.json`, or the configured
+  metrics file).
 
 Invalid arguments exit through `argparse` with code 2.
 

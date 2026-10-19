@@ -72,14 +72,24 @@ This keeps highest saliency first and breaks ties by **lower expert id**
 so slicing preserves the original expert order among retained experts.
 
 `max_activations` ranks by the maximum absolute element of each selected expert
-output (not the L2 norm used by EAN metrics).
+output (not the L2 norm used by EAN metrics). The Cerebras reference uses the
+signed maximum instead, so this method can rank experts with large negative
+activations differently from the reference.
+
+The `reap` score follows the reference definition: the mean, over the tokens
+routed to an expert, of the router weight times the L2 norm of that expert's
+output. The router weights are the softmax probabilities of the selected
+experts, renormalized over the top-k when the model sets `norm_topk_prob`
+(LFM2 uses the bias-free softmax; see
+[observation and metrics](observation-and-metrics.md)).
 
 Expert weight slicing preserves MLX arrays (`mx.take`) so
 `mlx.nn.Module.parameters()` still tracks pruned tensors for save/reload.
 
-## Qwen3 Slicing
+## Expert Slicing
 
-Qwen3 pruning requires:
+All supported adapters (`qwen3_moe`, `lfm2_moe`, `mixtral_moe`) share one
+slicing path. Pruning requires:
 
 ```txt
 moe.switch_mlp.gate_proj.weight
@@ -95,34 +105,24 @@ For switch projections, any present fields are sliced:
 - `biases`
 - `bias`
 
-For the gate, any present fields are sliced:
+For the router gate, any present fields are sliced:
 
 - `weight`
+- `scales`
+- `biases`
 - `bias`
 - `e_score_correction_bias`
 
+Quantized checkpoints usually store the gate as a `QuantizedLinear`, so
+`scales` and `biases` must be sliced together with the packed `weight`;
+otherwise reload fails with a stale `gate.scales` shape.
+
+If `use_expert_bias` is enabled or `expert_bias` exists on the MoE block,
+`expert_bias` is also sliced on dimension 0. If expert bias is enabled but
+missing, pruning raises a `ValueError`.
+
 Each sliced value must expose a shape and have first dimension equal to the
 pre-pruning expert count.
-
-## LFM2 Slicing
-
-LFM2 pruning slices the same switch projection fields:
-
-- `weight`
-- `scales`
-- `biases`
-- `bias`
-
-For the LFM2 gate, any present fields are sliced:
-
-- `weight`
-- `scales`
-- `biases`
-- `bias`
-
-If `use_expert_bias` is enabled or `expert_bias` exists, `expert_bias` is also
-sliced on dimension 0. If expert bias is enabled but missing, pruning raises a
-`ValueError`.
 
 ## Runtime Metadata Updates
 
@@ -141,9 +141,12 @@ min(old_top_k, retained_count)
 
 ## Config Updates
 
-After all MoE layers are pruned, config is updated with:
+After all MoE layers are pruned, config is updated through the adapter's
+updater (`update_moe_config`):
 
-- `config["num_experts"] = retained_count`
+- `config["num_experts"] = retained_count` (`qwen3_moe`, `lfm2_moe`)
+- `config["num_local_experts"] = retained_count` (`mixtral_moe`; mlx-lm
+  rebuilds Mixtral/PhiMoE from this key)
 - `config["num_experts_per_tok"] = min(top_k, retained_count)`
 - `config["top_k"]` only if that key already exists
 
@@ -155,7 +158,12 @@ value.
 
 ## Validation Failures
 
-Pruning raises before mutation or during mutation for:
+`prune_experts` ranks and validates every MoE layer before slicing any weight.
+An optional `on_plan(keep_by_layer)` callback runs at that point; the CLI uses
+it to write `reap-checkpoint.json` (atomically, through a temporary file)
+before the model is mutated.
+
+Pruning raises for:
 
 - unsupported adapter names;
 - invalid compression ratios;
@@ -167,5 +175,7 @@ Pruning raises before mutation or during mutation for:
 - sliceable fields whose first dimension does not match `num_experts`;
 - LFM2 expert bias enabled but missing.
 
-Because pruning mutates in place, callers should treat failures during pruning
-as invalidating the live model object and config mapping for save purposes.
+Validation failures leave the model and config untouched. A failure while
+slicing (after validation) can still leave the live model partially pruned, so
+callers should then treat the model object and config mapping as invalid for
+save purposes and resume from the checkpoint instead.

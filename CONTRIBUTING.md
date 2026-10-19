@@ -45,6 +45,7 @@ Run basic repository checks:
 
 ```bash
 uv lock --check
+uv run ruff check src tests
 git diff --check
 uv run python -m reap.entrypoint --help
 ```

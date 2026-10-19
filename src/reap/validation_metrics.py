@@ -22,7 +22,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from reap.model_adapters import infer_model_adapter
+from reap.checkpoint import atomic_write_text
+from reap.model_adapters import config_num_experts, infer_model_adapter
 from reap.prune import resolve_prune_method
 from reap.save import artifact_summary
 
@@ -131,24 +132,89 @@ class RunMetrics:
         self.data["run_config"].update(
             {
                 "model_name": model_name,
+                "revision": getattr(args, "revision", None),
                 "dataset_name": getattr(args, "dataset_name", None),
                 "dataset_config_name": getattr(args, "dataset_config_name", None),
+                "dataset_streaming": bool(getattr(args, "dataset_streaming", False)),
                 "split": getattr(args, "split", None),
                 "seed": getattr(args, "seed", None),
                 "max_samples": getattr(args, "max_samples", None),
                 "max_seq_length": getattr(args, "max_seq_length", None),
+                "pack_calibration": bool(getattr(args, "pack_calibration", False)),
                 "eval_frequency": getattr(args, "eval_frequency", None),
                 "prune_method": getattr(args, "prune_method", None),
                 "resolved_prune_method": _resolve_method_or_none(
                     getattr(args, "prune_method", None)
                 ),
                 "compression_ratio": getattr(args, "compression_ratio", None),
+                "skip_layer_indices": _json_safe(
+                    getattr(args, "skip_layer_indices", None)
+                ),
+                "prune_layer_indices": _json_safe(
+                    getattr(args, "prune_layer_indices", None)
+                ),
+                "per_layer_ratios": _json_safe(getattr(args, "per_layer_ratios", None)),
+                "target_experts": getattr(args, "target_experts", None),
+                "min_calibration_samples": getattr(
+                    args, "min_calibration_samples", None
+                ),
+                "allow_partial_calibration": bool(
+                    getattr(args, "allow_partial_calibration", False)
+                ),
+                "resume_from_checkpoint": getattr(args, "resume_from_checkpoint", None),
+                "strict_resume": getattr(args, "strict_resume", None),
                 "output_dir": str(getattr(args, "output_dir", self.output_dir)),
                 "metrics_file": str(getattr(args, "metrics_file", self.metrics_file)),
                 "smoke_enabled": not bool(getattr(args, "no_smoke", False)),
+                "smoke_prompt": getattr(args, "smoke_prompt", None),
+                "smoke_max_tokens": getattr(args, "smoke_max_tokens", None),
+                "eval_calibration_nll": bool(
+                    getattr(args, "eval_calibration_nll", False)
+                ),
+                "eval_calibration_sequences": getattr(
+                    args, "eval_calibration_sequences", None
+                ),
+                "replay_check_enabled": not bool(
+                    getattr(args, "skip_replay_check", False)
+                ),
             }
         )
         self.data["model"]["model_name"] = model_name
+
+    def record_resume(
+        self,
+        checkpoint: Mapping[str, Any],
+        checkpoint_path: str | Path,
+    ) -> None:
+        """Record the checkpoint a resumed run re-applies and its prune plan.
+
+        On resume the prune decision comes from the checkpoint, so its plan
+        settings replace the (unused) CLI defaults in ``run_config``.
+        """
+        run_config = self.data["run_config"]
+        for key in (
+            "prune_method",
+            "compression_ratio",
+            "dataset_name",
+            "seed",
+            "max_samples",
+            "max_seq_length",
+            "skip_layer_indices",
+            "prune_layer_indices",
+            "per_layer_ratios",
+            "target_experts",
+        ):
+            run_config[key] = _json_safe(checkpoint.get(key))
+        run_config["resolved_prune_method"] = _resolve_method_or_none(
+            checkpoint.get("prune_method")
+        )
+        run_config["checkpoint"] = {
+            "path": str(checkpoint_path),
+            "version": checkpoint.get("version"),
+            "created_at": checkpoint.get("created_at"),
+            "model_name": checkpoint.get("model_name"),
+            "adapter_name": checkpoint.get("adapter_name"),
+        }
 
     def record_model_metadata(
         self,
@@ -184,7 +250,9 @@ class RunMetrics:
                 "quantization_config": _json_safe(config.get("quantization_config")),
                 "hidden_size": config.get("hidden_size"),
                 "num_hidden_layers": config.get("num_hidden_layers", len(layers)),
-                "layer_count": len(layers) if layers else config.get("num_hidden_layers"),
+                "layer_count": (
+                    len(layers) if layers else config.get("num_hidden_layers")
+                ),
                 "layer_types": _json_safe(config.get("layer_types")),
                 "moe_layer_indices": moe_layer_indices,
                 "dense_layer_indices": dense_layer_indices,
@@ -192,7 +260,7 @@ class RunMetrics:
                 "expert_count_before": _layer_config_value(
                     before_layer_config,
                     "num_experts",
-                    config.get("num_experts"),
+                    config_num_experts(config),
                 ),
                 "top_k_before": _layer_config_value(
                     before_layer_config,
@@ -218,7 +286,9 @@ class RunMetrics:
 
     def record_calibration(self, calibration_sequences: list[Any]) -> None:
         """Record sample and token counts for loaded calibration sequences."""
-        token_counts = [_sequence_length(sequence) for sequence in calibration_sequences]
+        token_counts = [
+            _sequence_length(sequence) for sequence in calibration_sequences
+        ]
         total_tokens = sum(token_counts)
         self.data["run_config"].update(
             {
@@ -250,7 +320,9 @@ class RunMetrics:
             frequency = _numeric_list(layer_data.get("expert_frequency", []))
             saliency = _numeric_list(layer_data.get(resolved_method, []))
             finite_saliency = [
-                value for value in saliency if isinstance(value, float) and math.isfinite(value)
+                value
+                for value in saliency
+                if isinstance(value, float) and math.isfinite(value)
             ]
             non_finite_count = len(saliency) - len(finite_saliency)
 
@@ -268,11 +340,18 @@ class RunMetrics:
                     if finite_saliency
                     else None
                 ),
+                "replay_parity_error": layer_data.get("replay_parity_error"),
             }
 
+        sequence_counts = [
+            int(layer_data["observed_sequences"])
+            for layer_data in observer_data.values()
+            if layer_data.get("observed_sequences") is not None
+        ]
         self.data["observer"] = {
             "observed_moe_layer_count": len(observer_data),
             "observed_moe_layer_indices": [int(idx) for idx in sorted(observer_data)],
+            "observed_sequences": min(sequence_counts) if sequence_counts else None,
             "total_input_tokens": total_tokens,
             "per_layer": per_layer,
         }
@@ -313,8 +392,8 @@ class RunMetrics:
         self.data["pruning"] = {
             "layer_count": len(keep_by_layer),
             "total_experts_removed": total_removed,
-            "expert_count_before": config_before.get("num_experts"),
-            "expert_count_after": config_after.get("num_experts"),
+            "expert_count_before": config_num_experts(config_before),
+            "expert_count_after": config_num_experts(config_after),
             "top_k_before": top_k_before,
             "top_k_after": top_k_after,
             "top_k_was_clamped": (
@@ -324,7 +403,7 @@ class RunMetrics:
             ),
             "per_layer": per_layer,
         }
-        self.data["model"]["expert_count_after"] = config_after.get("num_experts")
+        self.data["model"]["expert_count_after"] = config_num_experts(config_after)
         self.data["model"]["top_k_after"] = top_k_after
 
     def record_save_reload(
@@ -346,7 +425,7 @@ class RunMetrics:
         self.data["save_reload"] = {
             "output_dir": str(output_dir),
             "expected_expert_count": getattr(result, "expected_expert_count", None),
-            "reloaded_config_expert_count": reloaded_config.get("num_experts"),
+            "reloaded_config_expert_count": config_num_experts(reloaded_config),
             "reloaded_adapter_moe_layer_count": len(reloaded_moe_layers),
             "reloaded_adapter_moe_layer_indices": reloaded_moe_layers,
             "artifacts": artifact_result,
@@ -381,7 +460,6 @@ class RunMetrics:
         self._derive_throughput()
 
         path = self.path
-        path.parent.mkdir(parents=True, exist_ok=True)
         # _json_safe should already replace non-finite floats with None, but
         # guard against any residual NaN/Inf that slipped through (e.g. via
         # custom objects) so a metrics write can never crash the failure
@@ -399,8 +477,7 @@ class RunMetrics:
             text = json.dumps(
                 payload, indent=2, sort_keys=True, allow_nan=True
             )
-        path.write_text(text + "\n", encoding="utf-8")
-        return path
+        return atomic_write_text(path, text + "\n")
 
     def failure_payload(self, phase: str, exc: BaseException) -> dict[str, Any]:
         """Build a JSON-safe failure record for ``exc``."""
@@ -653,7 +730,7 @@ def _original_expert_count(
             return len(frequency)
         except TypeError:
             pass
-    return int(config_before.get("num_experts") or 0)
+    return int(config_num_experts(config_before) or 0)
 
 
 def _numeric_list(value: Any) -> list[float]:
