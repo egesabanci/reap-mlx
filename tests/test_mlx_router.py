@@ -140,11 +140,23 @@ class TinyLfm2Moe(TinyMlp):
         norm_topk_prob=None,
         use_expert_bias=False,
         expert_bias=None,
+        routed_scaling_factor=None,
     ):
         super().__init__(mx, top_k=top_k, norm_topk_prob=norm_topk_prob)
         self.use_expert_bias = use_expert_bias
         if expert_bias is not None:
             self.expert_bias = mx.array(expert_bias)
+        # Only the mlx-lm 0.32 block (sigmoid routing) has this attribute.
+        if routed_scaling_factor is not None:
+            self.routed_scaling_factor = routed_scaling_factor
+
+
+class TinyPhiMoe(TinyMlp):
+    """PhiMoE block as mlx-lm 0.32 builds it: sparsemixer with jitter_eps."""
+
+    def __init__(self, mx, *, top_k, jitter_eps):
+        super().__init__(mx, top_k=top_k)
+        self.jitter_eps = jitter_eps
 
 
 def qwen_reference(mx, mlp, hidden_states, top_k, norm_topk_prob):
@@ -290,6 +302,9 @@ def test_mixtral_router_matches_mlx_lm_block_routes_and_weights(model_type, bloc
             "intermediate_size": 8,
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
+            # A wide sparsemixer band (mlx-lm 0.32 PhiMoE) mixes several
+            # experts into each weight; other routings ignore this key.
+            "router_jitter_noise": 0.3,
         }
     )
     block = getattr(arch, block_cls)(args)
@@ -303,13 +318,107 @@ def test_mixtral_router_matches_mlx_lm_block_routes_and_weights(model_type, bloc
     assert_allclose(mx, result.scores, output[..., :2])
 
 
-def test_router_normalization_epsilon_is_shared():
+@requires_mlx
+def test_lfm2_router_matches_mlx_lm_block_routes_and_weights():
+    """Replays whichever LFM2 routing the installed mlx-lm implements."""
+    import mlx.core as mx
+    from mlx_lm.models import lfm2_moe
+
+    args = lfm2_moe.ModelArgs.from_dict(
+        {
+            "model_type": "lfm2_moe",
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_experts": 6,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": True,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 16,
+            "use_expert_bias": True,
+            "num_dense_layers": 0,
+            "norm_eps": 1e-5,
+            "conv_bias": False,
+            "conv_L_cache": 3,
+            "layer_types": ["full_attention"],
+            # mlx-lm 0.31 ignores this key; 0.32 scales the routing weights.
+            "routed_scaling_factor": 1.5,
+        }
+    )
+    block = lfm2_moe.Lfm2MoeSparseMoeBlock(args)
+    block.gate.weight = block.gate.weight * 8.0
+    block.expert_bias = mx.random.uniform(-0.2, 0.2, (6,), key=mx.random.key(1))
+    block.switch_mlp = RecordingSwitchMlp(mx)
+    hidden_states = mx.random.normal((1, 7, 8), key=mx.random.key(2))
+
+    output = block(hidden_states)
+    result = Lfm2MoeRouter(block, {"model_type": "lfm2_moe"})(hidden_states)
+
+    assert result.indices.tolist() == block.switch_mlp.indices.tolist()
+    assert_allclose(mx, result.scores, output[..., :2])
+
+
+@requires_mlx
+def test_lfm2_router_uses_sigmoid_routing_when_block_scales_weights():
+    import mlx.core as mx
+
+    moe = TinyLfm2Moe(
+        mx,
+        top_k=2,
+        norm_topk_prob=True,
+        use_expert_bias=True,
+        expert_bias=[0.0, 0.5, 0.0, 0.0],
+        routed_scaling_factor=2.0,
+    )
+    hidden_states = mx.array([[[1.0, 0.0, 0.0]]])
+
+    result = Lfm2MoeRouter(moe)(hidden_states)
+
+    # Logits [1.0, -0.4, 0.05, 0.3]: the bias lifts expert 1 into the top-2
+    # (sigmoid 0.40 + 0.5), but its weight is still the unbiased sigmoid.
+    assert sorted(result.indices.reshape(-1).tolist()) == [0, 1]
+    weights = mx.sigmoid(moe.gate(hidden_states))
+    selected = mx.take_along_axis(weights, result.indices, axis=-1)
+    expected = selected / (selected.sum(axis=-1, keepdims=True) + 1e-6) * 2.0
+    assert_allclose(mx, result.scores, expected)
+    # The weights carry no bias, so saliency uses them directly.
+    assert result.saliency_scores is None
+
+
+@requires_mlx
+def test_mixtral_router_uses_sparsemixer_when_block_has_jitter_eps():
+    import mlx.core as mx
+
+    moe = TinyPhiMoe(mx, top_k=2, jitter_eps=0.01)
+    moe.gate = lambda hidden_states: hidden_states
+    hidden_states = mx.array([[2.0, 1.99, 0.0, -1.0]])
+
+    result = MixtralMoeRouter(moe)(hidden_states)
+
+    # Expert 1 is within the 2 * jitter_eps band of expert 0, so expert 0 gets
+    # softmax([2.0, 1.99])[0]. Expert 0 is masked for the second pass, which
+    # leaves expert 1 alone in its band with weight 1. A plain top-2 softmax
+    # would split the weight about evenly instead.
+    assert result.indices.tolist() == [[0, 1]]
+    first = 1.0 / (1.0 + mx.exp(mx.array(-0.01)))
+    assert_allclose(mx, result.scores, mx.array([[first.item(), 1.0]]))
+
+
+def test_router_normalization_epsilons_match_mlx_lm():
     assert router_module._NORM_EPSILON == 1e-20
+    assert router_module._SIGMOID_NORM_EPSILON == 1e-6
     assert "_NORM_EPSILON" in inspect.getsource(Qwen3MoeRouter.__call__)
 
-    lfm2_call_source = inspect.getsource(Lfm2MoeRouter.__call__)
-    assert "_NORM_EPSILON" in lfm2_call_source
-    assert "1e-20" not in lfm2_call_source
+    softmax_source = inspect.getsource(Lfm2MoeRouter._softmax_routes)
+    assert "_NORM_EPSILON" in softmax_source
+    assert "_SIGMOID_NORM_EPSILON" not in softmax_source
+    assert "1e-20" not in softmax_source
+    sigmoid_source = inspect.getsource(Lfm2MoeRouter._sigmoid_routes)
+    assert "_SIGMOID_NORM_EPSILON" in sigmoid_source
+    assert "1e-6" not in sigmoid_source
 
 
 @requires_mlx

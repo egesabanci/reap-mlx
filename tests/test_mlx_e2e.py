@@ -101,6 +101,8 @@ FAMILY_CONFIGS = {
         "original_max_position_embeddings": 256,
         "num_local_experts": NUM_EXPERTS,
         "num_experts_per_tok": 2,
+        # Widens mlx-lm 0.32's sparsemixer band so weights mix several experts.
+        "router_jitter_noise": 0.3,
         "rope_scaling": {
             "short_factor": [1.0] * 8,
             "long_factor": [1.0] * 8,
@@ -123,6 +125,8 @@ FAMILY_CONFIGS = {
         "num_key_value_heads": 2,
         "max_position_embeddings": 512,
         "use_expert_bias": True,
+        # Scales mlx-lm 0.32's sigmoid routing weights; mlx-lm 0.31 ignores it.
+        "routed_scaling_factor": 1.5,
         "num_dense_layers": 1,
         "norm_eps": 1e-5,
         "conv_bias": False,
