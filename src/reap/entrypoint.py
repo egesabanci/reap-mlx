@@ -607,12 +607,17 @@ def main(
         current_phase = "save_reload_smoke"
         _emit(print_fn, "save: saving pruned model and validating reload")
         with metrics.phase("save_reload_smoke"):
+            # A Hub model is saved from its local snapshot: that copies files
+            # from the --revision that was loaded, and it keeps mlx-lm 0.31's
+            # save from looking the repo up again, which fails on
+            # huggingface-hub 1.33 (see _cached_hub_snapshot).
+            save_source = _cached_hub_snapshot(args.model_name, args.revision)
             result = save_pruned_model_fn(
                 model,
                 tokenizer,
                 config,
                 args.output_dir,
-                args.model_name,
+                args.model_name if save_source is None else save_source,
                 adapter=adapter,
                 smoke_fn=smoke_fn,
                 smoke_prompt=args.smoke_prompt,
@@ -884,9 +889,23 @@ def _load_mlx_lm_config(model_name: str) -> Mapping[str, Any]:
 def _resolve_hub_revision(model_name: str, revision: str | None) -> str | None:
     """Return the Hub commit a model was loaded at, else the requested revision.
 
-    Local model paths have no Hub revision. The commit is read from the local
-    Hugging Face cache that mlx-lm populated while loading, so no network
-    request is made.
+    Local model paths have no Hub revision.
+    """
+    if Path(model_name).exists():
+        return None
+    snapshot = _cached_hub_snapshot(model_name, revision)
+    return revision if snapshot is None else snapshot.name
+
+
+def _cached_hub_snapshot(model_name: str, revision: str | None) -> Path | None:
+    """Return the local snapshot directory of a Hub model mlx-lm has loaded.
+
+    Returns None for local paths and for models missing from the cache. The
+    lookup reads the Hugging Face cache that mlx-lm populated while loading, so
+    no network request is made. mlx-lm downloads only the files it needs, and
+    huggingface-hub 1.33 rejects such a partial snapshot unless the lookup is
+    limited to files that were downloaded, so it asks only for config.json,
+    which every mlx-lm model has.
     """
     if Path(model_name).exists():
         return None
@@ -897,10 +916,11 @@ def _resolve_hub_revision(model_name: str, revision: str | None) -> str | None:
             model_name,
             revision=revision,
             local_files_only=True,
+            allow_patterns=["config.json"],
         )
     except Exception:
-        return revision
-    return Path(snapshot).name
+        return None
+    return Path(snapshot)
 
 
 def _supports_keyword(fn: Callable[..., Any], keyword: str) -> bool:

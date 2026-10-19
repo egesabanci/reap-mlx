@@ -1128,6 +1128,24 @@ def test_default_loader_passes_revision_to_mlx_lm(monkeypatch):
     assert calls == [("org/model", True, "abc123")]
 
 
+def _partial_snapshot_download(snapshot):
+    """snapshot_download over a partial mlx-lm download, as huggingface-hub 1.33.
+
+    mlx-lm downloads only the files it needs, and huggingface-hub 1.33 rejects
+    such a snapshot unless the lookup is limited to files that were downloaded.
+    """
+
+    def snapshot_download(
+        repo_id, revision=None, local_files_only=False, allow_patterns=None
+    ):
+        assert local_files_only
+        if allow_patterns is None:
+            raise RuntimeError(f"The cached snapshot for {repo_id!r} is incomplete.")
+        return str(snapshot)
+
+    return snapshot_download
+
+
 def test_resolve_hub_revision_reads_the_cached_snapshot_commit(tmp_path, monkeypatch):
     import huggingface_hub
 
@@ -1135,9 +1153,7 @@ def test_resolve_hub_revision_reads_the_cached_snapshot_commit(tmp_path, monkeyp
 
     snapshot = tmp_path / "snapshots" / "0123abcd"
     monkeypatch.setattr(
-        huggingface_hub,
-        "snapshot_download",
-        lambda repo_id, revision=None, local_files_only=False: str(snapshot),
+        huggingface_hub, "snapshot_download", _partial_snapshot_download(snapshot)
     )
 
     assert _resolve_hub_revision("org/model", "main") == "0123abcd"
@@ -1150,13 +1166,58 @@ def test_resolve_hub_revision_falls_back_to_the_requested_revision(monkeypatch):
 
     from reap.entrypoint import _resolve_hub_revision
 
-    def not_cached(repo_id, revision=None, local_files_only=False):
+    def not_cached(repo_id, revision=None, local_files_only=False, allow_patterns=None):
         raise FileNotFoundError(repo_id)
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", not_cached)
 
     assert _resolve_hub_revision("org/model", "v2") == "v2"
     assert _resolve_hub_revision("org/model", None) is None
+
+
+@pytest.mark.parametrize("cached", [True, False], ids=["cached", "not-cached"])
+def test_hub_models_are_saved_from_their_cached_snapshot(tmp_path, monkeypatch, cached):
+    import huggingface_hub
+
+    snapshot = tmp_path / "hub" / "snapshots" / "0123abcd"
+    lookup = _partial_snapshot_download(snapshot)
+    if not cached:
+
+        def lookup(repo_id, **kwargs):
+            raise FileNotFoundError(repo_id)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lookup)
+    output_dir = tmp_path / "pruned"
+    save_args = []
+
+    def fake_save_pruned_model(*args, **kwargs):
+        save_args.extend(args)
+        return SimpleNamespace(output_dir=output_dir)
+
+    code = main(
+        [
+            "--model-name",
+            "org/model",
+            "--dataset-name",
+            "dataset",
+            "--allow-partial-calibration",
+            "--output-dir",
+            str(output_dir),
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=fake_save_pruned_model,
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    # Given the repo id, mlx-lm 0.31's save would look the repo up again, which
+    # fails on huggingface-hub 1.33.
+    assert save_args[4] == (snapshot if cached else "org/model")
+    payload = json.loads((output_dir / "validation-metrics.json").read_text())
+    assert payload["model"]["model_revision"] == ("0123abcd" if cached else None)
 
 
 def test_resume_accepts_another_spelling_of_the_same_local_model_path(tmp_path):
