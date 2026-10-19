@@ -326,6 +326,32 @@ def test_prune_experts_slices_quantized_qwen_gate_scales_and_biases():
     np.testing.assert_array_equal(moe.gate.biases, gate_biases[keep])
 
 
+def test_prune_experts_slices_per_expert_nvfp4_global_scales():
+    # mlx-lm 0.32 nvfp4 switch layers can store one global scale per expert.
+    model = make_model(num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    switch_mlp = model.model.layers[0].mlp.switch_mlp
+    keep = np.array([1, 3])
+    global_scales = {}
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        projection = getattr(switch_mlp, name)
+        projection.global_scale = np.arange(4, dtype=np.float32) + 8000
+        global_scales[name] = projection.global_scale.copy()
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+        "reap",
+        0.5,
+    )
+
+    for name, original in global_scales.items():
+        np.testing.assert_array_equal(
+            getattr(switch_mlp, name).global_scale, original[keep]
+        )
+
+
 def make_mixtral_model(num_experts: int = 4, top_k: int = 2):
     moe = TinyMoe(num_experts=num_experts, top_k=top_k)
     return SimpleNamespace(

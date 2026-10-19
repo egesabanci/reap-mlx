@@ -41,6 +41,8 @@ _SLICE_FIELD_NAMES = ("weight", "scales", "biases", "bias")
 # Router gates may be quantized (QuantizedLinear: weight + scales + biases);
 # every per-expert field must be sliced together or reload sees stale shapes.
 _GATE_FIELD_NAMES = (*_SLICE_FIELD_NAMES, "e_score_correction_bias")
+# mlx-lm 0.32 nvfp4 switch layers can carry one global scale per expert.
+_SWITCH_FIELD_NAMES = (*_SLICE_FIELD_NAMES, "global_scale")
 _SWITCH_PROJECTION_NAMES = ("gate_proj", "up_proj", "down_proj")
 _TOP_K_ATTRS = ("top_k", "num_experts_per_tok", "k")
 
@@ -695,6 +697,7 @@ def _prune_switch_moe_layer(
             keep_indices,
             num_experts=num_experts,
             required=True,
+            field_names=_SWITCH_FIELD_NAMES,
         )
 
     gate = getattr(moe, "gate", None)
