@@ -47,42 +47,91 @@ def observe_model(
     eval_fn = mx.eval if eval_fn is None else eval_fn
 
     if getattr(adapter, "adapter_name", None) == "lfm2_moe":
-        return _observe_lfm2_model(
-            model,
-            calibration_sequences,
-            config,
-            adapter=adapter,
-            debug_memory=debug_memory,
-            eval_frequency=eval_frequency,
-            eval_fn=eval_fn,
-            mask_fn=mask_fn,
-            print_fn=print_fn,
-        )
-
-    # qwen3_moe and mixtral_moe share the standard attention+mlp residual layout.
-    return _observe_qwen3_model(
+        layout = _Lfm2Layout(mask_fn)
+    else:
+        # qwen3_moe and mixtral_moe share the standard attention+mlp residual layout.
+        layout = _StandardLayout(mask_fn)
+    return _observe_layers(
         model,
         calibration_sequences,
         config,
         adapter=adapter,
+        layout=layout,
         debug_memory=debug_memory,
         eval_frequency=eval_frequency,
         eval_fn=eval_fn,
-        mask_fn=mask_fn,
         print_fn=print_fn,
     )
 
 
-def _observe_qwen3_model(
+class _StandardLayout:
+    """Pre-norm self-attention then MoE/MLP (Qwen family, Mixtral, PhiMoE)."""
+
+    def __init__(self, mask_fn: Callable[..., Any] | None) -> None:
+        self.mask_fn = mask_fn
+
+    def sequence_masks(self, hidden_states: Any) -> Any | None:
+        # Build the causal mask once per sequence and reuse it across layers.
+        # This assumes a static mask that depends only on sequence length, which
+        # holds for the supported decoder-only architectures. An injected
+        # mask_fn is called per layer instead.
+        if self.mask_fn is not None:
+            return None
+        return _attention_mask(
+            hidden_states,
+            sequence_length=hidden_states.shape[1],
+            mask_fn=None,
+        )
+
+    def mix(self, layer: Any, hidden_states: Any, sequence_masks: Any) -> tuple[Any, Any]:
+        """Apply the token mixer; return (residual stream, MoE/MLP input)."""
+        mask = (
+            sequence_masks
+            if self.mask_fn is None
+            else _attention_mask(
+                hidden_states,
+                sequence_length=hidden_states.shape[1],
+                mask_fn=self.mask_fn,
+            )
+        )
+        normalized = _call_required(layer, "input_layernorm", hidden_states)
+        hidden_states = hidden_states + _run_attention(layer, normalized, mask)
+        return hidden_states, _call_required(
+            layer, "post_attention_layernorm", hidden_states
+        )
+
+
+class _Lfm2Layout:
+    """LFM2: attention or short-conv operator, then the feed-forward block."""
+
+    def __init__(self, mask_fn: Callable[..., Any] | None) -> None:
+        self.mask_fn = mask_fn
+
+    def sequence_masks(self, hidden_states: Any) -> tuple[Any | None, Any | None]:
+        return _lfm2_masks(
+            hidden_states,
+            sequence_length=hidden_states.shape[1],
+            mask_fn=self.mask_fn,
+        )
+
+    def mix(self, layer: Any, hidden_states: Any, sequence_masks: Any) -> tuple[Any, Any]:
+        """Apply the token mixer; return (residual stream, MoE/MLP input)."""
+        attn_mask, conv_mask = sequence_masks
+        operator_mask = attn_mask if _is_lfm2_attention_layer(layer) else conv_mask
+        hidden_states = _run_lfm2_operator(layer, hidden_states, operator_mask)
+        return hidden_states, _call_required(layer, "ffn_norm", hidden_states)
+
+
+def _observe_layers(
     model: Any,
     calibration_sequences: list[Any],
     config: Mapping[str, Any],
     *,
     adapter: Any,
+    layout: _StandardLayout | _Lfm2Layout,
     debug_memory: bool,
     eval_frequency: int,
     eval_fn: Callable[[Any], Any],
-    mask_fn: Callable[..., Any] | None,
     print_fn: Callable[[str], Any] | None,
 ) -> dict[int, dict[str, Any]]:
     requested_eval_frequency = eval_frequency
@@ -90,6 +139,7 @@ def _observe_qwen3_model(
     layers = adapter.layers(model)
     moe_layer_indices = set(adapter.identify_moe_layers(model))
     embed_tokens = _get_embed_tokens(model)
+    router_cls = _router_cls_for_adapter(adapter)
 
     accumulators = _initialize_accumulators(
         layers,
@@ -112,35 +162,10 @@ def _observe_qwen3_model(
             eval_frequency = requested_eval_frequency
             tokens = _batch_tokens(mx, sequence)
             h = embed_tokens(tokens)
-            # Compute the attention mask once and reuse it across all layers.
-            # This assumes a static causal mask that depends only on sequence length,
-            # not on hidden-state values. Decoder-only models (Qwen3-MoE, LFM2-MoE)
-            # satisfy this; future model adapters with layer-specific or dynamic masks
-            # must compute masks per-layer instead.
-            default_mask = (
-                _attention_mask(
-                    h,
-                    sequence_length=tokens.shape[-1],
-                    mask_fn=None,
-                )
-                if mask_fn is None
-                else None
-            )
+            sequence_masks = layout.sequence_masks(h)
 
             for layer_idx, layer in enumerate(layers):
-                mask = (
-                    default_mask
-                    if mask_fn is None
-                    else _attention_mask(
-                        h,
-                        sequence_length=tokens.shape[-1],
-                        mask_fn=mask_fn,
-                    )
-                )
-                normalized = _call_required(layer, "input_layernorm", h)
-                attention_output = _run_attention(layer, normalized, mask)
-                h = h + attention_output
-                moe_input = _call_required(layer, "post_attention_layernorm", h)
+                h, moe_input = layout.mix(layer, h, sequence_masks)
 
                 if layer_idx in moe_layer_indices:
                     h = h + _observe_selected_moe_layer(
@@ -149,7 +174,7 @@ def _observe_qwen3_model(
                         accumulators[layer_idx],
                         adapter=adapter,
                         config=config,
-                        router_cls=_router_cls_for_adapter(adapter),
+                        router_cls=router_cls,
                     )
                 else:
                     dense_mlp = adapter.get_dense_mlp(layer)
@@ -188,95 +213,6 @@ def _router_cls_for_adapter(adapter: Any) -> type:
     if name == "mixtral_moe":
         return MixtralMoeRouter
     return Qwen3MoeRouter
-
-
-def _observe_lfm2_model(
-    model: Any,
-    calibration_sequences: list[Any],
-    config: Mapping[str, Any],
-    *,
-    adapter: Any,
-    debug_memory: bool,
-    eval_frequency: int,
-    eval_fn: Callable[[Any], Any],
-    mask_fn: Callable[..., Any] | None,
-    print_fn: Callable[[str], Any] | None,
-) -> dict[int, dict[str, Any]]:
-    requested_eval_frequency = eval_frequency
-    mx = _require_mlx_core()
-    layers = adapter.layers(model)
-    moe_layer_indices = set(adapter.identify_moe_layers(model))
-    embed_tokens = _get_embed_tokens(model)
-
-    accumulators = _initialize_accumulators(
-        layers,
-        moe_layer_indices,
-        adapter=adapter,
-        config=config,
-    )
-
-    completed_sequences = 0
-    for seq_idx, sequence in enumerate(calibration_sequences):
-        # Snapshot before the sequence so a mid-sequence MemoryError cannot leave
-        # earlier MoE layers with extra tokens relative to later layers.
-        snapshots = {
-            layer_idx: state.snapshot() for layer_idx, state in accumulators.items()
-        }
-        try:
-            # Reset to the requested cadence for each sequence so a transient
-            # eval failure in one sequence does not permanently downgrade the
-            # whole run to eval_frequency=1.
-            eval_frequency = requested_eval_frequency
-            tokens = _batch_tokens(mx, sequence)
-            h = embed_tokens(tokens)
-            attn_mask, conv_mask = _lfm2_masks(
-                h,
-                sequence_length=tokens.shape[-1],
-                mask_fn=mask_fn,
-            )
-
-            for layer_idx, layer in enumerate(layers):
-                operator_mask = attn_mask if _is_lfm2_attention_layer(layer) else conv_mask
-                h_mid = _run_lfm2_operator(layer, h, operator_mask)
-                ffn_input = _call_required(layer, "ffn_norm", h_mid)
-
-                if layer_idx in moe_layer_indices:
-                    h = h_mid + _observe_selected_moe_layer(
-                        layer,
-                        ffn_input,
-                        accumulators[layer_idx],
-                        adapter=adapter,
-                        config=config,
-                        router_cls=Lfm2MoeRouter,
-                    )
-                else:
-                    dense_mlp = adapter.get_dense_mlp(layer)
-                    h = h_mid + dense_mlp(ffn_input)
-
-                if _should_eval_layer(layer_idx, len(layers), eval_frequency):
-                    eval_frequency = _run_eval_boundary(
-                        eval_fn,
-                        h,
-                        layer_idx=layer_idx,
-                        layer_count=len(layers),
-                        eval_frequency=eval_frequency,
-                        print_fn=print_fn,
-                    )
-                if debug_memory:
-                    _log_memory(mx, layer_idx)
-            completed_sequences += 1
-        except MemoryError:
-            for layer_idx, snap in snapshots.items():
-                accumulators[layer_idx].restore(snap)
-            _emit_oom_salvage(
-                print_fn,
-                seq_idx=seq_idx,
-                total_sequences=len(calibration_sequences),
-                completed_sequences=completed_sequences,
-            )
-            break
-
-    return _report_with_layer_guard(accumulators)
 
 
 def _require_mlx_core():
@@ -353,6 +289,7 @@ def _report_with_layer_guard(accumulators: dict[int, PruningState]) -> dict[int,
         except ValueError as exc:
             raise ValueError(f"Layer {layer_idx}: {exc}") from exc
     return observer_data
+
 
 def _initialize_accumulators(
     layers: Any,
@@ -438,6 +375,8 @@ def _is_lfm2_attention_layer(layer: Any) -> bool:
             "is_attention_layer flag. Cannot determine operator type.",
         )
     return has_attn
+
+
 def _run_lfm2_operator(layer: Any, h: Any, mask: Any | None) -> Any:
     normalized = _call_required(layer, "operator_norm", h)
     if _is_lfm2_attention_layer(layer):
