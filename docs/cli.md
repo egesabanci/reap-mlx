@@ -60,7 +60,13 @@ The CLI rejects:
 - `max_samples < 1`;
 - `max_seq_length < 1`;
 - `eval_frequency < 1`;
-- `smoke_max_tokens < 1`.
+- `smoke_max_tokens < 1`;
+- an `--output-dir` that is the source model directory (saving there would
+  delete the original weights);
+- an existing `--output-dir` that contains model files (`config.json`,
+  `*.safetensors`, `*.npz`) but no reap-mlx run markers
+  (`reap-checkpoint.json`, `validation-metrics.json`, or the configured
+  metrics file).
 
 Invalid arguments exit through `argparse` with code 2.
 

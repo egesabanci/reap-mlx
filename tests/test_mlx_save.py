@@ -448,6 +448,27 @@ def test_save_pruned_model_rejects_reload_config_mismatch(tmp_path):
         )
 
 
+def test_save_pruned_model_refuses_to_overwrite_the_source_model_dir(tmp_path):
+    source = tmp_path / "local-model"
+    write_required_artifacts(source, config={"num_experts": 4})
+    original_weights = (source / "model.safetensors").read_bytes()
+    save_calls = []
+
+    with pytest.raises(ValueError, match="source model directory"):
+        save_pruned_model(
+            make_reloaded_model(2),
+            object(),
+            {"num_experts": 2},
+            source,
+            str(source),
+            save_fn=fake_save_factory(save_calls),
+            load_fn=fake_load_factory(make_reloaded_model(2), object(), {}),
+        )
+
+    assert save_calls == []
+    assert (source / "model.safetensors").read_bytes() == original_weights
+
+
 def make_mixtral_reloaded_model(num_experts: int):
     return SimpleNamespace(
         model=SimpleNamespace(

@@ -27,6 +27,11 @@ from reap.validation_metrics import RunMetrics
 
 logger = logging.getLogger(__name__)
 
+# Files a previous reap-mlx run leaves in its output directory.
+_REAP_OUTPUT_MARKERS = ("reap-checkpoint.json", "validation-metrics.json")
+# Files the save step deletes from the output directory before writing.
+_MODEL_ARTIFACT_PATTERNS = ("config.json", "*.safetensors", "*.npz")
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the MLX pruning CLI argument parser."""
@@ -589,6 +594,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--resume-from-checkpoint file not found: {args.resume_from_checkpoint}."
         )
+    _validate_output_dir(args)
     _validate_positive_int(args.max_samples, "max_samples")
     _validate_positive_int(args.max_seq_length, "max_seq_length")
     _validate_positive_int(args.eval_frequency, "eval_frequency")
@@ -623,6 +629,34 @@ def _validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(
                     f"per_layer_ratios[{layer_idx}] must be in [0, 1), got {layer_ratio}."
                 )
+
+
+def _validate_output_dir(args: argparse.Namespace) -> None:
+    """Refuse output directories whose model files the save step would delete."""
+    output_dir = Path(args.output_dir)
+    model_path = Path(args.model_name)
+    if (
+        model_path.exists()
+        and output_dir.exists()
+        and model_path.resolve() == output_dir.resolve()
+    ):
+        raise ValueError(
+            f"--output-dir {args.output_dir!r} is the source model directory; "
+            "saving there would delete the original weights. Choose a new "
+            "output directory."
+        )
+    if not output_dir.is_dir():
+        return
+    has_model_files = any(
+        any(output_dir.glob(pattern)) for pattern in _MODEL_ARTIFACT_PATTERNS
+    )
+    markers = (*_REAP_OUTPUT_MARKERS, Path(args.metrics_file).name)
+    if has_model_files and not any((output_dir / name).is_file() for name in markers):
+        raise ValueError(
+            f"--output-dir {args.output_dir!r} already contains model files "
+            "that were not written by reap-mlx; refusing to delete them. "
+            "Choose an empty directory or remove those files first."
+        )
 
 
 def _validate_positive_int(value: Any, name: str) -> None:

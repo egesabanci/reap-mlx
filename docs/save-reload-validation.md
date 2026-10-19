@@ -68,6 +68,13 @@ The helper uses the passed config mapping. It must not rely on `model.config`.
 `output_dir` is created if needed. If it already exists as a file, saving raises
 `OSError`.
 
+Before writing, stale artifacts from a previous run (`*.safetensors`, `*.npz`,
+`config.json`, tokenizer files, `validation-metrics.json`) are deleted from
+`output_dir`. To make that cleanup safe, saving raises `ValueError` when
+`output_dir` resolves to the source model directory, and the CLI additionally
+refuses an existing `--output-dir` that holds model files but no reap-mlx run
+markers (`reap-checkpoint.json` or the metrics file).
+
 ## Required Saved Artifacts
 
 After save, the output directory must contain:

@@ -53,6 +53,7 @@ def save_pruned_model(
 ) -> SaveReloadResult:
     """Save a pruned model, reload it, and validate the reloaded artifact."""
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    _reject_source_model_dir(Path(output_dir), original_model_name)
     output_path = _prepare_output_dir(output_dir)
     expected_count = _expected_expert_count(config, expected_expert_count)
     save_fn = _default_save_fn() if save_fn is None else save_fn
@@ -223,6 +224,22 @@ def generation_smoke(
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old_handler)
+
+
+def _reject_source_model_dir(
+    output_path: Path,
+    original_model_name: str | Path,
+) -> None:
+    source_path = Path(original_model_name)
+    if (
+        source_path.exists()
+        and output_path.exists()
+        and source_path.resolve() == output_path.resolve()
+    ):
+        raise ValueError(
+            f"Refusing to save into the source model directory {output_path}: "
+            "cleaning it would delete the original weights."
+        )
 
 
 def _prepare_output_dir(output_dir: str | Path) -> Path:

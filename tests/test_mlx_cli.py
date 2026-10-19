@@ -146,6 +146,86 @@ def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
     assert exc_info.value.code == 2
 
 
+def _fail_load_model(model_name):
+    raise AssertionError("load_model_fn must not be called for invalid args")
+
+
+def _write_fake_model_files(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text("{}", encoding="utf-8")
+    (directory / "model.safetensors").write_bytes(b"original-weights")
+
+
+def test_output_dir_equal_to_source_model_dir_is_rejected(tmp_path):
+    source = tmp_path / "local-model"
+    _write_fake_model_files(source)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--model-name",
+                str(source),
+                "--dataset-name",
+                "dataset",
+                "--output-dir",
+                f"{source}/",
+            ],
+            load_model_fn=_fail_load_model,
+        )
+
+    assert exc_info.value.code == 2
+    assert (source / "model.safetensors").read_bytes() == b"original-weights"
+
+
+def test_output_dir_with_foreign_model_files_is_rejected(tmp_path):
+    output = tmp_path / "someone-elses-model"
+    _write_fake_model_files(output)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--model-name",
+                "model",
+                "--dataset-name",
+                "dataset",
+                "--output-dir",
+                str(output),
+            ],
+            load_model_fn=_fail_load_model,
+        )
+
+    assert exc_info.value.code == 2
+    assert (output / "model.safetensors").read_bytes() == b"original-weights"
+
+
+def test_output_dir_from_a_previous_reap_run_is_reused(tmp_path):
+    output = tmp_path / "pruned"
+    _write_fake_model_files(output)
+    (output / "validation-metrics.json").write_text("{}", encoding="utf-8")
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--allow-partial-calibration",
+            "--output-dir",
+            str(output),
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [{"input_ids": [1]}],
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=output
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+
+
 def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_path):
     from types import SimpleNamespace
     events = []
