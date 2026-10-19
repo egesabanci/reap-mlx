@@ -510,9 +510,10 @@ def _observe_selected_moe_layer(
         # Optional gated shared experts (e.g. Qwen2-MoE).
         shared_gate = getattr(moe, "shared_expert_gate", None)
         if callable(shared_gate):
-            mx = _require_mlx_core()
             shared_out = mx.sigmoid(shared_gate(moe_input)) * shared_out
-        state.accumulate_shared_expert(shared_out)
+        # NumPy cannot read bfloat16 buffers, so hand the metrics path a
+        # float32 copy; the residual keeps the model dtype.
+        state.accumulate_shared_expert(shared_out.astype(mx.float32))
         moe_out = moe_out + shared_out
     return moe_out
 

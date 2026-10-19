@@ -578,6 +578,66 @@ def test_observe_model_adds_shared_expert_to_hidden_flow_only():
     np.testing.assert_allclose(observer_data[0]["ean_sum"], [np.sqrt(5.0), 0.0, 0.0])
 
 
+class Bfloat16SharedExpert(TinySharedExpert):
+    def __call__(self, hidden_states):
+        return super().__call__(hidden_states).astype(self.mx.bfloat16)
+
+
+@requires_mlx
+def test_observe_model_accepts_bfloat16_shared_expert_outputs():
+    import mlx.core as mx
+
+    shared_expert = Bfloat16SharedExpert(mx, value=5.0)
+    model = TinyModel(
+        mx,
+        [TinyLayer(mx, TinyMoeMlp(mx, top_k=1, shared_expert=shared_expert))],
+    )
+
+    observer_data = observe_model(
+        model,
+        [[0, 1]],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+    )
+
+    assert observer_data[0]["shared_expert_tokens"] == 2
+    np.testing.assert_allclose(
+        observer_data[0]["shared_expert_ean_mean"], np.sqrt(50.0), rtol=1e-6
+    )
+
+
+@requires_mlx
+def test_observe_model_runs_real_qwen2_moe_shared_expert_in_bfloat16():
+    import mlx.core as mx
+    from mlx_lm.models import qwen2_moe
+
+    args = qwen2_moe.ModelArgs(
+        model_type="qwen2_moe",
+        hidden_size=64,
+        num_hidden_layers=1,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_experts_per_tok=2,
+        num_experts=4,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=2,
+    )
+    model = qwen2_moe.Model(args)
+    model.set_dtype(mx.bfloat16)
+    mx.eval(model.parameters())
+
+    observer_data = observe_model(
+        model,
+        [np.arange(1, 9, dtype=np.int32)],
+        {"model_type": "qwen2_moe", "num_experts": 4, "num_experts_per_tok": 2},
+    )
+
+    assert observer_data[0]["total_tokens"] == 8
+    assert observer_data[0]["shared_expert_tokens"] == 8
+
+
 @requires_mlx
 def test_observe_model_rejects_empty_calibration_sequence():
     import mlx.core as mx
