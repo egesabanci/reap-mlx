@@ -66,6 +66,7 @@ The CLI rejects:
 - `max_seq_length < 1`;
 - `eval_frequency < 1`;
 - `smoke_max_tokens < 1`;
+- `--min-calibration-samples` larger than `--max-samples`;
 - an `--output-dir` that is the source model directory (saving there would
   delete the original weights);
 - an existing `--output-dir` that contains model files (`config.json`,

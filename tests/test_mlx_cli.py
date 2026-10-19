@@ -124,9 +124,13 @@ def test_help_works_without_heavy_runtime_imports():
         (["--max-seq-length", "0"], "max_seq_length"),
         (["--eval-frequency", "0"], "eval_frequency"),
         (["--smoke-max-tokens", "0"], "smoke_max_tokens"),
+        (
+            ["--max-samples", "4", "--min-calibration-samples", "5"],
+            "cannot exceed --max-samples",
+        ),
     ],
 )
-def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
+def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message, capsys):
     def fail_load_model(model_name):
         raise AssertionError("load_model_fn must not be called for invalid args")
 
@@ -145,6 +149,7 @@ def test_invalid_arguments_fail_before_pipeline_functions(extra_args, message):
         main(args, load_model_fn=fail_load_model)
 
     assert exc_info.value.code == 2
+    assert message in capsys.readouterr().err
 
 
 def _fail_load_model(model_name):

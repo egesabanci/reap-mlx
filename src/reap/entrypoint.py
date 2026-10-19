@@ -706,6 +706,12 @@ def _validate_args(args: argparse.Namespace) -> None:
     _validate_positive_int(args.smoke_max_tokens, "smoke_max_tokens")
     if args.min_calibration_samples is not None:
         _validate_positive_int(args.min_calibration_samples, "min_calibration_samples")
+        if int(args.min_calibration_samples) > int(args.max_samples):
+            raise ValueError(
+                f"--min-calibration-samples ({args.min_calibration_samples}) "
+                f"cannot exceed --max-samples ({args.max_samples}); at most "
+                "--max-samples sequences are ever loaded."
+            )
     if args.target_experts is not None:
         _validate_positive_int(args.target_experts, "target_experts")
     if args.eval_calibration_sequences is not None:
