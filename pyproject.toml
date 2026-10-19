@@ -32,6 +32,7 @@ packages = ["src/reap"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "ruff>=0.14.2",
 ]
 
 [project.urls]

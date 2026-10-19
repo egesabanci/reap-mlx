@@ -31,12 +31,21 @@ Run CLI help:
 uv run python -m reap.entrypoint --help
 ```
 
+Lint (ruff with the `E`, `F`, `W`, `I`, `SIM` rules at 88 columns):
+
+```bash
+uv run ruff check src tests
+```
+
 Check lockfile and whitespace:
 
 ```bash
 uv lock --check
 git diff --check
 ```
+
+CI runs the lockfile check, lint, tests, and CLI smoke on Python 3.12 (the
+required `tests` check), plus the test suite on Python 3.13.
 
 ## Import-Safety Tests
 
@@ -67,6 +76,9 @@ function that executes the runtime behavior.
 | `test_mlx_prune.py` | Expert ranking, slicing, metadata/config updates, failures. |
 | `test_mlx_save.py` | Save/reload validation, artifact checks, smoke generation. |
 | `test_mlx_validation_metrics.py` | Telemetry JSON, timings, throughput, failure payload. |
+| `test_mlx_checkpoint.py` | Checkpoint schema, round trips, atomic writes. |
+| `test_mlx_eval_nll.py` | Calibration NLL across fp32/fp16/bf16 logits. |
+| `test_mlx_e2e.py` | Tiny random mlx-lm models per family (bf16 + 4-bit): CLI prune/save/reload and bit-exact replay parity. |
 
 Some tests require MLX or MLX-LM and skip when those packages are unavailable.
 
@@ -91,8 +103,11 @@ For a new model family:
 2. Add router behavior matching the architecture's MLX-LM routing semantics.
 3. Decide whether existing slicing rules cover the family.
 4. Extend save/reload validation for any new expert-stacked fields.
-5. Add fixture-style unit tests that do not require real model downloads.
-6. Preserve import-safety tests.
+5. Add fixture-style unit tests that do not require real model downloads, and
+   add the family to `tests/test_mlx_e2e.py` (tiny random mlx-lm model in bf16
+   and 4-bit); fixtures alone miss quantized-gate and config-key bugs.
+6. Add the model type to `SUPPORTED_MODEL_TYPES`.
+7. Preserve import-safety tests.
 
 Use the existing Qwen3 and LFM2 adapters as the reference pattern.
 
