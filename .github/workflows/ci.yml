@@ -33,11 +33,13 @@ jobs:
       - name: Install uv
         run: python -m pip install --upgrade pip uv
 
-      - name: Sync dependencies
-        run: uv sync --group dev
-
+      # Check before syncing: a plain `uv sync` rewrites a stale lockfile,
+      # which would let pyproject-only dependency bumps pass unnoticed.
       - name: Check lockfile
         run: uv lock --check
+
+      - name: Sync dependencies
+        run: uv sync --group dev --locked
 
       - name: Lint
         run: uv run ruff check src tests
@@ -69,7 +71,7 @@ jobs:
         run: python -m pip install --upgrade pip uv
 
       - name: Sync dependencies
-        run: uv sync --group dev --frozen
+        run: uv sync --group dev --locked
 
       - name: Run tests
         run: uv run python -m pytest -q tests/test_mlx_*.py
