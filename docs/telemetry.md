@@ -158,6 +158,8 @@ Top-level observer fields:
 
 - `observed_moe_layer_count`
 - `observed_moe_layer_indices`
+- `observed_sequences` (fully observed calibration sequences; lower than the
+  sample count when out-of-memory stopped observation early)
 - `total_input_tokens`
 - `per_layer`
 

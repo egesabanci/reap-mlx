@@ -36,7 +36,13 @@ EXPECTED_PRUNING_KEYS = {
     "shared_expert_ean_sum",
     "shared_expert_ean_mean",
     "shared_expert_tokens",
+    "observed_sequences",
 }
+
+MLX_ALLOCATION_ERROR = (
+    "[metal::malloc] Attempting to allocate 17179869184 bytes which is greater "
+    "than the maximum allowed buffer size of 9534832640 bytes."
+)
 
 
 def test_observer_module_import_does_not_import_heavy_runtime_packages():
@@ -927,16 +933,19 @@ def test_observe_model_raises_when_switch_mlp_returns_wrong_shape():
 
 
 class FlakyEmbed:
-    """embed_tokens that raises MemoryError after the first successful call."""
+    """embed_tokens that raises after the first successful call."""
 
-    def __init__(self, mx):
+    def __init__(self, mx, error=None):
         self.mx = mx
         self.calls = 0
+        self.error = (
+            MemoryError("simulated OOM on second sequence") if error is None else error
+        )
 
     def __call__(self, tokens):
         self.calls += 1
         if self.calls > 1:
-            raise MemoryError("simulated OOM on second sequence")
+            raise self.error
         token_values = tokens.astype(self.mx.float32)
         return self.mx.stack([token_values, token_values + 1.0], axis=-1)
 
@@ -963,5 +972,68 @@ def test_observe_model_salvages_data_on_memory_error():
     report = observer_data[0]
     assert set(report) == EXPECTED_PRUNING_KEYS
     assert report["total_tokens"] == 2
+    assert report["observed_sequences"] == 1
     # A user-visible salvage notice was emitted.
     assert any("out of memory" in m for m in messages)
+
+
+@requires_mlx
+def test_observe_model_salvages_data_on_mlx_allocation_runtime_error():
+    """MLX reports allocation failures as RuntimeError, not MemoryError."""
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, TinyMoeMlp(mx, top_k=1))])
+    model.model.embed_tokens = FlakyEmbed(mx, RuntimeError(MLX_ALLOCATION_ERROR))
+
+    messages: list[str] = []
+    observer_data = observe_model(
+        model,
+        [{"input_ids": [0, 1]}, {"input_ids": [2, 3]}],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+        print_fn=messages.append,
+    )
+
+    assert observer_data[0]["total_tokens"] == 2
+    assert observer_data[0]["observed_sequences"] == 1
+    assert any("out of memory" in m for m in messages)
+
+
+@requires_mlx
+def test_observe_model_reraises_runtime_errors_that_are_not_out_of_memory():
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, TinyMoeMlp(mx, top_k=1))])
+    model.model.embed_tokens = FlakyEmbed(mx, RuntimeError("shape mismatch in gather"))
+
+    with pytest.raises(RuntimeError, match="shape mismatch in gather"):
+        observe_model(
+            model,
+            [{"input_ids": [0, 1]}, {"input_ids": [2, 3]}],
+            {"num_experts": 3, "num_experts_per_tok": 1},
+        )
+
+
+@requires_mlx
+def test_observe_model_eval_fallback_handles_mlx_allocation_runtime_error():
+    import mlx.core as mx
+
+    model = TinyModel(mx, [TinyLayer(mx, TinyMoeMlp(mx, top_k=1))])
+    state = {"failed": False}
+
+    def flaky_eval(h):
+        if not state["failed"]:
+            state["failed"] = True
+            raise RuntimeError(MLX_ALLOCATION_ERROR)
+        mx.eval(h)
+
+    messages: list[str] = []
+    observer_data = observe_model(
+        model,
+        [[0, 1]],
+        {"num_experts": 3, "num_experts_per_tok": 1},
+        eval_fn=flaky_eval,
+        print_fn=messages.append,
+    )
+
+    assert observer_data[0]["observed_sequences"] == 1
+    assert any("out of memory (RuntimeError)" in m for m in messages)

@@ -444,6 +444,30 @@ def main(
                     "Observer returned no data. The model may have no observable MoE layers "
                     "or the adapter could not identify them."
                 )
+            observed_sequences = _observed_sequence_count(observer_data)
+            if (
+                observed_sequences is not None
+                and observed_sequences < len(calibration_sequences)
+            ):
+                _emit(
+                    print_fn,
+                    f"observe: only {observed_sequences}/"
+                    f"{len(calibration_sequences)} calibration sequences were "
+                    "observed before running out of memory",
+                )
+                if (
+                    not args.allow_partial_calibration
+                    and observed_sequences < min_samples
+                ):
+                    raise RuntimeError(
+                        f"Observation stopped after {observed_sequences} of "
+                        f"{len(calibration_sequences)} calibration sequences "
+                        f"(out of memory), but {min_samples} are required "
+                        "(--min-calibration-samples / default --max-samples). "
+                        "Reduce --max-seq-length or --max-samples, free memory, "
+                        "or pass --allow-partial-calibration to prune with "
+                        "fewer sequences."
+                    )
             total_observer_tokens = sum(
                 int(layer.get("total_tokens", 0)) for layer in observer_data.values()
             )
@@ -741,6 +765,18 @@ def _infer_adapter_safely(model: Any, config: Mapping[str, Any]) -> Any | None:
             f"{unsupported_architecture_message(config)} "
             f"Underlying error: {exc.__class__.__name__}: {exc}"
         ) from exc
+
+
+def _observed_sequence_count(
+    observer_data: Mapping[int, Mapping[str, Any]],
+) -> int | None:
+    """Return how many calibration sequences every MoE layer fully observed."""
+    counts = [
+        int(layer_data["observed_sequences"])
+        for layer_data in observer_data.values()
+        if "observed_sequences" in layer_data
+    ]
+    return min(counts) if counts else None
 
 
 def _observer_saliency_is_all_zero(

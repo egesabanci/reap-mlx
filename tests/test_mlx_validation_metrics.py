@@ -326,6 +326,20 @@ def test_record_observer_reports_replay_parity_error(tmp_path):
     per_layer = metrics.data["observer"]["per_layer"]
     assert per_layer["0"]["replay_parity_error"] == 0.0
     assert per_layer["1"]["replay_parity_error"] is None
+    assert metrics.data["observer"]["observed_sequences"] is None
+
+
+def test_record_observer_reports_fewest_observed_sequences(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    metrics.record_observer(
+        {
+            0: {"total_tokens": 4, "reap": [1.0], "observed_sequences": 2},
+            1: {"total_tokens": 4, "reap": [1.0], "observed_sequences": 2},
+        },
+        "reap",
+    )
+
+    assert metrics.data["observer"]["observed_sequences"] == 2
 
 
 def test_record_observer_empty_observer_data(tmp_path):

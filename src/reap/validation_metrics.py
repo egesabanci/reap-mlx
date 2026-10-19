@@ -275,9 +275,15 @@ class RunMetrics:
                 "replay_parity_error": layer_data.get("replay_parity_error"),
             }
 
+        sequence_counts = [
+            int(layer_data["observed_sequences"])
+            for layer_data in observer_data.values()
+            if layer_data.get("observed_sequences") is not None
+        ]
         self.data["observer"] = {
             "observed_moe_layer_count": len(observer_data),
             "observed_moe_layer_indices": [int(idx) for idx in sorted(observer_data)],
+            "observed_sequences": min(sequence_counts) if sequence_counts else None,
             "total_input_tokens": total_tokens,
             "per_layer": per_layer,
         }

@@ -33,7 +33,7 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 | `--per-layer-ratios` | none | `index:ratio` overrides; selected layers must retain a uniform count. |
 | `--target-experts` | unset | Retain exactly N experts per MoE layer (overrides ratio planning). |
 | `--min-calibration-samples` | `= max-samples` | Hard floor on non-empty sequences (default equals `--max-samples`). |
-| `--allow-partial-calibration` | off | Allow fewer than the min sample floor. |
+| `--allow-partial-calibration` | off | Allow fewer than the min sample floor, both when loading and when out-of-memory stops observation early. |
 | `--eval-calibration-nll` | off | After reload, compute mean next-token NLL on calibration data. |
 | `--resume-from-checkpoint` | unset | Re-apply keep indices and retry save only. |
 | `--strict-resume` / `--no-strict-resume` | strict on | Require checkpoint model/adapter to match. |

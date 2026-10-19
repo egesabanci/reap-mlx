@@ -31,14 +31,25 @@ layers and sequences.
 layers and also flush the final layer of each sequence when needed. Higher
 values reduce GPU synchronization barriers but increase peak memory.
 
-Only a `MemoryError` from `eval_fn` triggers a temporary fallback to
-`eval_frequency=1` for the rest of the current sequence. Other `RuntimeError`
-failures are re-raised so real graph bugs are not masked as memory pressure.
+Out-of-memory errors are recognised in both forms they take: `MemoryError`
+and the `RuntimeError` MLX raises for allocation failures (for example
+`[metal::malloc] Attempting to allocate ... greater than the maximum allowed
+buffer size`). Other `RuntimeError` failures are re-raised so real graph bugs
+are not masked as memory pressure.
 
-On sequence-level `MemoryError`, observer state is rolled back to the snapshot
-taken before that sequence started (so MoE layers never disagree on how many
-sequences they saw), then observation stops and fully completed sequences are
-retained.
+An out-of-memory error from `eval_fn` clears the MLX buffer cache and falls back
+to `eval_frequency=1` for the rest of the current sequence.
+
+An out-of-memory error anywhere else in a sequence rolls observer state back to
+the snapshot taken before that sequence started (so MoE layers never disagree
+on how many sequences they saw), clears the buffer cache, stops observation,
+and keeps the fully completed sequences. Every layer report carries
+`observed_sequences`; the CLI fails the run when it is below
+`--min-calibration-samples` unless `--allow-partial-calibration` is passed.
+
+A Metal command-buffer failure ("Insufficient Memory") can abort the process
+inside MLX before Python sees an exception; lower `--max-seq-length` if that
+happens.
 
 ## Qwen3 Replay
 

@@ -403,6 +403,59 @@ def test_main_passes_configured_eval_frequency_to_observer(tmp_path):
     assert payload["run_config"]["eval_frequency"] == 4
 
 
+def _run_with_partial_observation(tmp_path, *extra_args):
+    output = []
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--max-samples",
+            "2",
+            "--output-dir",
+            str(tmp_path),
+            "--no-smoke",
+            *extra_args,
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=lambda *args, **kwargs: [
+            {"input_ids": [1, 2]},
+            {"input_ids": [3, 4]},
+        ],
+        # Out of memory after the first of two sequences.
+        observe_model_fn=lambda *args, **kwargs: {
+            0: {"reap": [1.0, 0.5], "total_tokens": 2, "observed_sequences": 1}
+        },
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=output.append,
+    )
+    return code, output
+
+
+def test_partial_observation_must_still_meet_min_calibration_samples(tmp_path):
+    with pytest.raises(RuntimeError, match="Observation stopped after 1 of 2"):
+        _run_with_partial_observation(tmp_path)
+
+    payload = json.loads(
+        (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["status"] == "failed"
+    assert payload["observer"]["observed_sequences"] == 1
+
+
+def test_partial_observation_is_allowed_with_allow_partial_calibration(tmp_path):
+    code, output = _run_with_partial_observation(
+        tmp_path, "--allow-partial-calibration"
+    )
+
+    assert code == 0
+    assert any("only 1/2 calibration sequences" in line for line in output)
+
+
 def test_pack_calibration_flag_is_forwarded_to_the_loader(tmp_path):
     loader_kwargs = {}
 

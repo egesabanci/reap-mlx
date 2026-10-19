@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 # 0.1-1, far above this tolerance.
 REPLAY_PARITY_TOLERANCE = 1e-2
 
+# MLX reports allocation failures as RuntimeError, for example
+# "[metal::malloc] Attempting to allocate ... greater than the maximum allowed
+# buffer size", not as MemoryError. Lower-cased substrings that identify them.
+_OOM_MESSAGE_MARKERS = (
+    "malloc",
+    "out of memory",
+    "insufficient memory",
+    "outofmemory",
+)
+
 
 def observe_model(
     model: Any,
@@ -217,9 +227,12 @@ def _observe_layers(
                 if debug_memory:
                     _log_memory(mx, layer_idx)
             completed_sequences += 1
-        except MemoryError:
+        except (MemoryError, RuntimeError) as exc:
+            if not _is_out_of_memory(exc):
+                raise
             for layer_idx, snap in snapshots.items():
                 accumulators[layer_idx].restore(snap)
+            _release_cached_memory(mx)
             _emit_oom_salvage(
                 print_fn,
                 seq_idx=seq_idx,
@@ -229,9 +242,28 @@ def _observe_layers(
             break
 
     observer_data = _report_with_layer_guard(accumulators)
-    for layer_idx, error in parity_errors.items():
-        observer_data[layer_idx]["replay_parity_error"] = error
+    for layer_idx, layer_data in observer_data.items():
+        layer_data["observed_sequences"] = completed_sequences
+        if layer_idx in parity_errors:
+            layer_data["replay_parity_error"] = parity_errors[layer_idx]
     return observer_data
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    """Return True for MemoryError and MLX allocation-failure RuntimeErrors."""
+    if isinstance(exc, MemoryError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _OOM_MESSAGE_MARKERS)
+
+
+def _release_cached_memory(mx: Any) -> None:
+    """Drop MLX's buffer cache so a retry after an allocation failure can fit."""
+    clear_cache = getattr(mx, "clear_cache", None)
+    if callable(clear_cache):
+        clear_cache()
 
 
 def _replay_parity_error(moe: Any, moe_input: Any, replay_output: Any) -> float | None:
@@ -533,17 +565,20 @@ def _run_eval_boundary(
 ) -> int:
     """Evaluate the graph at a layer boundary.
 
-    Only ``MemoryError`` triggers a fallback to ``eval_frequency=1``. Other
-    ``RuntimeError`` subclasses are re-raised so real graph bugs are not
-    masked as memory pressure.
+    Only out-of-memory errors (``MemoryError`` or MLX allocation-failure
+    ``RuntimeError``) trigger a fallback to ``eval_frequency=1``. Other errors
+    are re-raised so real graph bugs are not masked as memory pressure.
     """
     try:
         eval_fn(h)
         return eval_frequency
-    except MemoryError as eval_err:
+    except (MemoryError, RuntimeError) as eval_err:
+        if not _is_out_of_memory(eval_err):
+            raise
         logger.warning(
-            "eval_fn MemoryError at layer %d/%d (eval_frequency=%d): %s. "
+            "eval_fn out of memory (%s) at layer %d/%d (eval_frequency=%d): %s. "
             "Falling back to eval_frequency=1 for remaining layers.",
+            type(eval_err).__name__,
             layer_idx,
             layer_count,
             eval_frequency,
@@ -551,17 +586,19 @@ def _run_eval_boundary(
         )
         if print_fn is not None:
             print_fn(
-                f"[reap-mlx] observe: eval_fn MemoryError at layer "
-                f"{layer_idx}/{layer_count}; "
+                f"[reap-mlx] observe: eval_fn out of memory "
+                f"({type(eval_err).__name__}) at layer {layer_idx}/{layer_count}; "
                 "falling back to eval_frequency=1 for this sequence.",
             )
+        _release_cached_memory(_require_mlx_core())
         try:
             eval_fn(h)
-        except MemoryError:
-            logger.error(
-                "eval_fn retry also failed at layer %d. Raising.",
-                layer_idx,
-            )
+        except (MemoryError, RuntimeError) as retry_err:
+            if _is_out_of_memory(retry_err):
+                logger.error(
+                    "eval_fn retry also ran out of memory at layer %d. Raising.",
+                    layer_idx,
+                )
             raise
         return 1
 
@@ -574,7 +611,7 @@ def _emit_oom_salvage(
     completed_sequences: int,
 ) -> None:
     logger.warning(
-        "MemoryError processing sequence %d/%d. "
+        "Out of memory while processing sequence %d/%d. "
         "Discarding partial progress for this sequence and stopping. "
         "Completed sequences retained: %d.",
         seq_idx + 1,
