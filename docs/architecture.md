@@ -17,6 +17,8 @@ keeping the main pruning pipeline inspectable.
 | `reap.prune` | In-place expert slicing and pruning method resolution. | None beyond NumPy |
 | `reap.save` | Save, reload, shape validation, and smoke generation. | `mlx_lm` when default save/load/generate executes |
 | `reap.validation_metrics` | Structured run telemetry. | `mlx.core` only for memory sampling |
+| `reap.checkpoint` | Prune-plan checkpoints (schema v3) and atomic file writes. | None |
+| `reap.eval_nll` | Next-token NLL on calibration sequences. | `mlx.core` when evaluating |
 | `reap.entrypoint` | CLI parsing and phase orchestration. | Deferred through called functions |
 
 ## Import-Safety Boundary
@@ -117,5 +119,8 @@ telemetry.
 - Router input supports `[tokens, hidden]` and `[batch, seq, hidden]`.
 - Saliency arrays must be one-dimensional and match the layer expert count.
 - Saliency arrays must not contain NaN values.
+- Only model types in `SUPPORTED_MODEL_TYPES` are accepted, and the observer
+  replay must match the live MoE blocks (first-sequence parity check).
+- The prune plan is checkpointed before any weight is sliced.
 - Saved artifacts must reload and validate before the run is marked successful.
 

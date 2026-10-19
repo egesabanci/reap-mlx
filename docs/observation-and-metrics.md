@@ -169,6 +169,15 @@ LFM2 returns two score tensors:
 This keeps REAP ranking aligned with routing probability rather than additive
 expert bias, while the residual path still matches the live model.
 
+Upstream note: the replay deliberately mirrors mlx-lm, which is the runtime
+that executes the pruned model. mlx-lm's LFM2-MoE block (0.31.x) applies a
+softmax, adds `expert_bias` to the probabilities, and weights experts with the
+biased scores. The Hugging Face reference implementation instead uses sigmoid
+scores, applies `expert_bias` only to the top-k selection, and multiplies by
+`routed_scaling_factor` (1.0 for released LFM2-MoE checkpoints). If mlx-lm
+changes its LFM2 routing, the replay parity check fails fast instead of
+silently measuring saliency on the old routes.
+
 ## Selected Expert Outputs
 
 For a routed MoE layer, observation calls:

@@ -33,14 +33,15 @@ checkpoints (most MLX conversions) get a precise value. If no sequence can be
 evaluated, the `quality` block reports `status: "skipped"` together with the
 last error that occurred.
 
-## Third-party eval stacks
+## External evaluation harnesses
 
-The `third-party/` directory holds reference harnesses (EvalPlus, LiveCodeBench,
-HELM, EvalScope, etc.). They are **not** installed as package dependencies and
-are **not** run by CI. To evaluate a pruned artifact:
+Task benchmarks (EvalPlus, LiveCodeBench, HELM, EvalScope, and similar) are not
+part of this repository, not installed as dependencies, and not run by CI. To
+evaluate a pruned artifact:
 
 1. Save a pruned model to `output_dir` with REAP MLX.
-2. Serve or load that path with your preferred stack (vLLM, mlx_lm, transformers).
+2. Serve or load that path with your preferred stack (for example
+   `mlx_lm.server`, which exposes an OpenAI-compatible endpoint).
 3. Point the harness at the served endpoint or local path.
 
 Example with mlx_lm generation smoke only:
@@ -53,5 +54,5 @@ print(generate(model, tok, prompt='Hello', max_tokens=32))
 "
 ```
 
-For code benchmarks, follow the upstream README inside each `third-party/*`
-project after installing its own environment.
+For code benchmarks, follow each harness's own README and install it in its
+own environment.

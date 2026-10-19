@@ -72,7 +72,16 @@ This keeps highest saliency first and breaks ties by **lower expert id**
 so slicing preserves the original expert order among retained experts.
 
 `max_activations` ranks by the maximum absolute element of each selected expert
-output (not the L2 norm used by EAN metrics).
+output (not the L2 norm used by EAN metrics). The Cerebras reference uses the
+signed maximum instead, so this method can rank experts with large negative
+activations differently from the reference.
+
+The `reap` score follows the reference definition: the mean, over the tokens
+routed to an expert, of the router weight times the L2 norm of that expert's
+output. The router weights are the softmax probabilities of the selected
+experts, renormalized over the top-k when the model sets `norm_topk_prob`
+(LFM2 uses the bias-free softmax; see
+[observation and metrics](observation-and-metrics.md)).
 
 Expert weight slicing preserves MLX arrays (`mx.take`) so
 `mlx.nn.Module.parameters()` still tracks pruned tensors for save/reload.
