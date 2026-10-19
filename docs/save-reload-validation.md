@@ -65,6 +65,14 @@ save_fn(
 
 The helper uses the passed config mapping. It must not rely on `model.config`.
 
+For a Hugging Face model, the CLI passes the local snapshot directory that
+mlx-lm loaded the model from as `original_model_name`, not the repo id. That
+snapshot is the `--revision` that was loaded. Passing a path also skips
+mlx-lm's own repo lookup: mlx-lm 0.31 repeats it without the download's file
+patterns, and huggingface-hub 1.33 rejects that lookup because the snapshot is
+partial. The CLI falls back to the repo id when the snapshot is not in the
+local cache.
+
 `output_dir` is created if needed. If it already exists as a file, saving raises
 `OSError`.
 
