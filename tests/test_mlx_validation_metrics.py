@@ -225,7 +225,6 @@ def test_run_metrics_writes_failure_payload(tmp_path):
 
 def test_run_metrics_write_survives_non_finite_values(tmp_path):
     """write() must never crash on NaN/Inf in metrics data (failure telemetry)."""
-    import math
 
     metrics = RunMetrics(tmp_path, clock=FakeClock())
     # Inject NaN/Inf directly into the metrics payload -- _json_safe should
@@ -234,7 +233,10 @@ def test_run_metrics_write_survives_non_finite_values(tmp_path):
     metrics.data["inf_value"] = float("inf")
     metrics.data["nested"] = {"bad": [float("nan"), float("-inf"), 1.0]}
 
-    path = metrics.write(status="failed", failure=metrics.failure_payload("observe", RuntimeError("x")))
+    path = metrics.write(
+        status="failed",
+        failure=metrics.failure_payload("observe", RuntimeError("x")),
+    )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
@@ -301,7 +303,11 @@ def test_record_observer_counts_non_finite_saliency(tmp_path):
     metrics = RunMetrics(tmp_path)
     observer_data = {
         0: {"total_tokens": 2, "expert_frequency": [1, 1], "reap": [0.5, 2.0]},
-        1: {"total_tokens": 3, "expert_frequency": [1, 0], "reap": [float("nan"), float("inf")]},
+        1: {
+            "total_tokens": 3,
+            "expert_frequency": [1, 0],
+            "reap": [float("nan"), float("inf")],
+        },
     }
     metrics.record_observer(observer_data, "reap")
 

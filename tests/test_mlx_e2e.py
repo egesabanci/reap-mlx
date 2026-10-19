@@ -23,7 +23,6 @@ from reap.entrypoint import main
 from reap.model_adapters import config_num_experts
 from reap.observer import observe_model
 
-
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mlx_lm") is None,
     reason="MLX-LM is not installed in this environment.",

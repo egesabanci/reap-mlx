@@ -90,20 +90,14 @@ def write_checkpoint(
     """
     serialised_keep: dict[str, list[int]] = {}
     for layer_idx, keep in keep_by_layer.items():
-        if hasattr(keep, "tolist"):
-            keep_list = keep.tolist()
-        else:
-            keep_list = list(keep)
+        keep_list = keep.tolist() if hasattr(keep, "tolist") else list(keep)
         serialised_keep[str(int(layer_idx))] = [int(x) for x in keep_list]
 
     serialised_saliency: dict[str, list[float]] | None = None
     if saliency_by_layer:
         serialised_saliency = {}
         for layer_idx, scores in saliency_by_layer.items():
-            if hasattr(scores, "tolist"):
-                values = scores.tolist()
-            else:
-                values = list(scores)
+            values = scores.tolist() if hasattr(scores, "tolist") else list(scores)
             serialised_saliency[str(int(layer_idx))] = [float(x) for x in values]
 
     payload = {

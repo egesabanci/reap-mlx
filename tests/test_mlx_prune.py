@@ -21,7 +21,6 @@ from reap.prune import (
     slice_first_dim,
 )
 
-
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
 
 requires_mlx = pytest.mark.skipif(
@@ -444,7 +443,9 @@ def test_prune_experts_raises_clear_message_when_no_moe_architecture_detected():
     model = SimpleNamespace(
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=object())])
     )
-    with pytest.raises(ValueError, match="Cannot detect a supported MoE architecture") as excinfo:
+    with pytest.raises(
+        ValueError, match="Cannot detect a supported MoE architecture"
+    ) as excinfo:
         prune_experts(model, {"model_type": "bert"}, {}, "reap", 0.5)
     # The message should point to supported architectures, not print 'None'.
     assert "Qwen3-MoE" in str(excinfo.value) and "LFM2-MoE" in str(excinfo.value)
@@ -952,6 +953,7 @@ def test_prune_experts_preserves_switch_glu_parameters_and_forward():
     import mlx.nn as nn
     from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import SwitchGLU
+
     from reap.model_adapters import Lfm2MoeModelAdapter
 
     class Moe(nn.Module):
@@ -971,7 +973,9 @@ def test_prune_experts_preserves_switch_glu_parameters_and_forward():
     before = len(tree_flatten(moe.parameters()))
     assert before >= 5
 
-    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)]))
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)])
+    )
     config = {
         "model_type": "lfm2_moe",
         "num_experts": 4,
@@ -1004,7 +1008,6 @@ def test_prune_experts_preserves_switch_glu_parameters_and_forward():
 @requires_mlx
 def test_prune_quantized_switch_linear_preserves_parameters_and_forward():
     import mlx.core as mx
-    import mlx.nn as nn
     from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
@@ -1134,6 +1137,7 @@ def test_prune_switch_glu_save_model_writes_nonempty_weights(tmp_path):
     from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import SwitchGLU
     from mlx_lm.utils import save_model
+
     from reap.model_adapters import Lfm2MoeModelAdapter
 
     class Moe(nn.Module):
@@ -1150,7 +1154,9 @@ def test_prune_switch_glu_save_model_writes_nonempty_weights(tmp_path):
 
     moe = Moe()
     mx.eval(moe.parameters())
-    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)]))
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)])
+    )
     config = {
         "model_type": "lfm2_moe",
         "num_experts": 4,

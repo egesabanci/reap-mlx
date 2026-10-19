@@ -311,7 +311,10 @@ def test_infer_model_adapter_selects_lfm2_from_config_and_layout():
     ).adapter_name == "lfm2_moe"
 
     lfm2_model = model_model_layers(
-        [layer_with_feed_forward(DenseMlp()), layer_with_feed_forward(Lfm2FeedForward())]
+        [
+            layer_with_feed_forward(DenseMlp()),
+            layer_with_feed_forward(Lfm2FeedForward()),
+        ]
     )
     qwen_model = model_model_layers([layer_with_mlp(MoeMlp())])
 
@@ -430,6 +433,7 @@ def test_make_attention_mask_requires_mlx_lm_when_missing():
 
 def test_infer_mixtral_adapter_from_block_sparse_moe_layout():
     from types import SimpleNamespace
+
     from reap.model_adapters import MixtralMoeModelAdapter, infer_model_adapter
 
     layer = SimpleNamespace(
@@ -443,7 +447,9 @@ def test_infer_mixtral_adapter_from_block_sparse_moe_layout():
     adapter = infer_model_adapter(model, {"model_type": "mixtral"})
     assert isinstance(adapter, MixtralMoeModelAdapter)
     assert adapter.identify_moe_layers(model) == [0]
-    cfg = adapter.get_layer_config(layer, {"num_local_experts": 8, "num_experts_per_tok": 2})
+    cfg = adapter.get_layer_config(
+        layer, {"num_local_experts": 8, "num_experts_per_tok": 2}
+    )
     assert cfg.num_experts == 8
     assert cfg.top_k == 2
 
@@ -513,10 +519,14 @@ def test_supported_model_types_map_to_their_adapters(model_type, adapter_name):
 
 
 def test_unsupported_architecture_message_lists_supported_model_types():
-    from reap.model_adapters import unsupported_architecture_message
+    from reap.model_adapters import (
+        SUPPORTED_MODEL_TYPES,
+        unsupported_architecture_message,
+    )
 
     message = unsupported_architecture_message({"model_type": "minimax"})
 
     assert "model_type='minimax'" in message
-    for model_type in ("qwen2_moe", "qwen3_moe", "olmoe", "mixtral", "phimoe", "lfm2_moe"):
-        assert model_type in message
+    for adapter_types in SUPPORTED_MODEL_TYPES.values():
+        for model_type in adapter_types:
+            assert model_type in message

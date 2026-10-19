@@ -22,7 +22,6 @@ from reap.model_adapters import (
 )
 from reap.router import Lfm2MoeRouter, MixtralMoeRouter, Qwen3MoeRouter
 
-
 logger = logging.getLogger(__name__)
 
 # On the first calibration sequence every replayed MoE output is also compared
@@ -109,7 +108,12 @@ class _StandardLayout:
             mask_fn=None,
         )
 
-    def mix(self, layer: Any, hidden_states: Any, sequence_masks: Any) -> tuple[Any, Any]:
+    def mix(
+        self,
+        layer: Any,
+        hidden_states: Any,
+        sequence_masks: Any,
+    ) -> tuple[Any, Any]:
         """Apply the token mixer; return (residual stream, MoE/MLP input)."""
         mask = (
             sequence_masks
@@ -140,7 +144,12 @@ class _Lfm2Layout:
             mask_fn=self.mask_fn,
         )
 
-    def mix(self, layer: Any, hidden_states: Any, sequence_masks: Any) -> tuple[Any, Any]:
+    def mix(
+        self,
+        layer: Any,
+        hidden_states: Any,
+        sequence_masks: Any,
+    ) -> tuple[Any, Any]:
         """Apply the token mixer; return (residual stream, MoE/MLP input)."""
         attn_mask, conv_mask = sequence_masks
         operator_mask = attn_mask if _is_lfm2_attention_layer(layer) else conv_mask
@@ -213,7 +222,9 @@ def _observe_layers(
                             adapter.get_moe(layer), moe_input, moe_out
                         )
                         if error is not None:
-                            _check_replay_parity(error, layer_idx=layer_idx, config=config)
+                            _check_replay_parity(
+                                error, layer_idx=layer_idx, config=config
+                            )
                             parity_errors[layer_idx] = error
                     h = h + moe_out
                 else:
@@ -695,7 +706,9 @@ def _log_memory(mx: Any, layer_idx: int) -> None:
         if callable(getter):
             memory_parts.append(f"{name}={getter()}")
     if memory_parts:
-        logger.debug("MLX memory after layer %s: %s", layer_idx, ", ".join(memory_parts))
+        logger.debug(
+            "MLX memory after layer %s: %s", layer_idx, ", ".join(memory_parts)
+        )
 
 
 __all__ = ["observe_model"]

@@ -250,7 +250,9 @@ class RunMetrics:
                 "quantization_config": _json_safe(config.get("quantization_config")),
                 "hidden_size": config.get("hidden_size"),
                 "num_hidden_layers": config.get("num_hidden_layers", len(layers)),
-                "layer_count": len(layers) if layers else config.get("num_hidden_layers"),
+                "layer_count": (
+                    len(layers) if layers else config.get("num_hidden_layers")
+                ),
                 "layer_types": _json_safe(config.get("layer_types")),
                 "moe_layer_indices": moe_layer_indices,
                 "dense_layer_indices": dense_layer_indices,
@@ -284,7 +286,9 @@ class RunMetrics:
 
     def record_calibration(self, calibration_sequences: list[Any]) -> None:
         """Record sample and token counts for loaded calibration sequences."""
-        token_counts = [_sequence_length(sequence) for sequence in calibration_sequences]
+        token_counts = [
+            _sequence_length(sequence) for sequence in calibration_sequences
+        ]
         total_tokens = sum(token_counts)
         self.data["run_config"].update(
             {
@@ -316,7 +320,9 @@ class RunMetrics:
             frequency = _numeric_list(layer_data.get("expert_frequency", []))
             saliency = _numeric_list(layer_data.get(resolved_method, []))
             finite_saliency = [
-                value for value in saliency if isinstance(value, float) and math.isfinite(value)
+                value
+                for value in saliency
+                if isinstance(value, float) and math.isfinite(value)
             ]
             non_finite_count = len(saliency) - len(finite_saliency)
 

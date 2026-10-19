@@ -29,7 +29,6 @@ from reap.prune import (
 from reap.save import generation_smoke, save_pruned_model
 from reap.validation_metrics import RunMetrics
 
-
 logger = logging.getLogger(__name__)
 
 # Files a previous reap-mlx run leaves in its output directory.
@@ -355,8 +354,9 @@ def main(
         moe_layer_indices = adapter.identify_moe_layers(model)
         if not moe_layer_indices:
             raise ValueError(
-                f"Model has no MoE layers detected by the {adapter.adapter_name} adapter. "
-                "REAP pruning requires an MoE model with at least one MoE layer."
+                "Model has no MoE layers detected by the "
+                f"{adapter.adapter_name} adapter. REAP pruning requires an MoE "
+                "model with at least one MoE layer."
             )
         metrics.sample_memory("after_model_load")
         per_layer_ratios = _parse_per_layer_ratios(args.per_layer_ratios)
@@ -401,11 +401,7 @@ def main(
                     skip_layer_indices=checkpoint.get("skip_layer_indices"),
                     prune_layer_indices=checkpoint.get("prune_layer_indices"),
                 )
-            for layer_idx in sorted(keep_by_layer):
-                _emit(
-                    print_fn,
-                    f"keep: layer {layer_idx} -> {list(map(int, keep_by_layer[layer_idx]))}",
-                )
+            _emit_keep_indices(print_fn, keep_by_layer)
             metrics.record_pruning(
                 keep_by_layer,
                 config_before=config_before_prune,
@@ -496,8 +492,8 @@ def main(
             metrics.record_observer(observer_data, args.prune_method)
             if not observer_data:
                 raise RuntimeError(
-                    "Observer returned no data. The model may have no observable MoE layers "
-                    "or the adapter could not identify them."
+                    "Observer returned no data. The model may have no observable "
+                    "MoE layers or the adapter could not identify them."
                 )
             observed_sequences = _observed_sequence_count(observer_data)
             if (
@@ -577,7 +573,10 @@ def main(
                     observer_data=observer_data,
                 )
                 checkpoint_written = True
-                _emit(print_fn, f"checkpoint: wrote prune decision to {checkpoint_path}")
+                _emit(
+                    print_fn,
+                    f"checkpoint: wrote prune decision to {checkpoint_path}",
+                )
 
             with metrics.phase("prune"):
                 keep_by_layer = prune_experts_fn(
@@ -603,11 +602,7 @@ def main(
                 observer_data=observer_data,
             )
             metrics.sample_memory("after_prune")
-            for layer_idx in sorted(keep_by_layer):
-                _emit(
-                    print_fn,
-                    f"keep: layer {layer_idx} -> {list(map(int, keep_by_layer[layer_idx]))}",
-                )
+            _emit_keep_indices(print_fn, keep_by_layer)
 
         current_phase = "save_reload_smoke"
         _emit(print_fn, "save: saving pruned model and validating reload")
@@ -736,9 +731,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     parsed_ratios = _parse_per_layer_ratios(args.per_layer_ratios)
     if parsed_ratios:
         for layer_idx, layer_ratio in parsed_ratios.items():
-            if not math.isfinite(layer_ratio) or layer_ratio < 0.0 or layer_ratio >= 1.0:
+            if not math.isfinite(layer_ratio) or not 0.0 <= layer_ratio < 1.0:
                 raise ValueError(
-                    f"per_layer_ratios[{layer_idx}] must be in [0, 1), got {layer_ratio}."
+                    f"per_layer_ratios[{layer_idx}] must be in [0, 1), "
+                    f"got {layer_ratio}."
                 )
 
 
@@ -1006,6 +1002,15 @@ def _observer_saliency_is_all_zero(
 
 def _emit(print_fn: Callable[[str], Any], message: str) -> None:
     print_fn(f"[reap-mlx] {message}")
+
+
+def _emit_keep_indices(
+    print_fn: Callable[[str], Any],
+    keep_by_layer: Mapping[int, Any],
+) -> None:
+    for layer_idx in sorted(keep_by_layer):
+        retained = [int(index) for index in keep_by_layer[layer_idx]]
+        _emit(print_fn, f"keep: layer {layer_idx} -> {retained}")
 
 
 if __name__ == "__main__":

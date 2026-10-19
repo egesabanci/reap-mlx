@@ -42,4 +42,6 @@ reap-mlx = "reap.entrypoint:main"
 
 [tool.ruff]
 line-length = 88
-select = ["SIM"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "SIM"]

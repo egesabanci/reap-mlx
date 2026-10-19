@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-
 _NORM_EPSILON: float = 1e-20
 
 # mlx-lm partitions Qwen2-MoE and OLMoE gates in descending order

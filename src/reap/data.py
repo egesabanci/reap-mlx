@@ -42,7 +42,8 @@ def load_calibration_sequences(
     """
     max_samples = _positive_int(max_samples, "max_samples")
     max_seq_length = _positive_int(max_seq_length, "max_seq_length")
-    load_dataset_fn = _default_load_dataset if load_dataset_fn is None else load_dataset_fn
+    if load_dataset_fn is None:
+        load_dataset_fn = _default_load_dataset
 
     load_kwargs: dict[str, Any] = {"split": split}
     if dataset_config_name is not None:

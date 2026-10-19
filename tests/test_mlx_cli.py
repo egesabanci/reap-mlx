@@ -266,7 +266,9 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         events.append(("observe", model_arg, sequences, config_arg, kwargs))
         return {0: {"reap": [1.0, 0.5, 0.25, 0.0]}}
 
-    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
+    def fake_prune_experts(
+        model_arg, config_arg, observer_data, method, ratio, **kwargs
+    ):
         events.append(("prune", model_arg, config_arg, observer_data, method, ratio))
         config_arg["num_experts"] = 3
         return {0: [0, 1, 2]}
@@ -817,7 +819,9 @@ def _multi_moe_model_and_config(num_layers: int = 2, num_experts: int = 4):
 def test_main_passes_layer_selection_flags_to_prune(tmp_path):
     prune_kwargs = {}
 
-    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
+    def fake_prune_experts(
+        model_arg, config_arg, observer_data, method, ratio, **kwargs
+    ):
         del model_arg, config_arg, observer_data, method, ratio
         prune_kwargs.update(kwargs)
         return {0: [0, 1, 2, 3]}
@@ -860,7 +864,9 @@ def test_main_passes_layer_selection_flags_to_prune(tmp_path):
 def test_main_passes_per_layer_ratios_to_prune(tmp_path):
     prune_kwargs = {}
 
-    def fake_prune_experts(model_arg, config_arg, observer_data, method, ratio, **kwargs):
+    def fake_prune_experts(
+        model_arg, config_arg, observer_data, method, ratio, **kwargs
+    ):
         del model_arg, config_arg, observer_data, method, ratio
         prune_kwargs.update(kwargs)
         return {0: [0, 1], 1: [0, 1]}
@@ -957,6 +963,7 @@ def test_main_rejects_malformed_per_layer_ratios(tmp_path):
 
 def test_main_resume_skips_observe_and_prune_and_applies_checkpoint(tmp_path):
     import numpy as np
+
     from reap.checkpoint import write_checkpoint
 
     ckpt_path = tmp_path / "reap-checkpoint.json"
@@ -1049,6 +1056,7 @@ def test_checkpoint_is_written_before_pruning_mutates_the_model(tmp_path):
 
 def _write_resume_checkpoint(tmp_path, *, model_name="model", config_before_prune=None):
     import numpy as np
+
     from reap.checkpoint import write_checkpoint
 
     return write_checkpoint(

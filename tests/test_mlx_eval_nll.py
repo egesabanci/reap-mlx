@@ -15,7 +15,6 @@ import pytest
 
 from reap.eval_nll import calibration_mean_nll
 
-
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
 
 requires_mlx = pytest.mark.skipif(

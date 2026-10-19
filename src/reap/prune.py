@@ -6,8 +6,8 @@ module import time.
 """
 
 from __future__ import annotations
-import logging
 
+import logging
 from collections.abc import Callable, Mapping, MutableMapping
 from typing import Any
 
@@ -75,7 +75,8 @@ def _select_moe_layers(
         if invalid_skip:
             raise ValueError(
                 "skip_layer_indices contains non-MoE layer indices: "
-                f"{sorted(invalid_skip)}. Available MoE layers: {sorted(all_moe_indices)}.",
+                f"{sorted(invalid_skip)}. Available MoE layers: "
+                f"{sorted(all_moe_indices)}.",
             )
         selected = [i for i in selected if i not in skip_set]
     if not selected:
@@ -295,7 +296,8 @@ def prune_experts(
         method_for_layer = prune_method if primary else "expert_frequency"
 
         num_to_prune = int(layer_config.num_experts) - retained_count
-        if primary and layer_ratio > 0.0 and num_to_prune == 0 and target_experts is None:
+        ratio_prunes_nothing = layer_ratio > 0.0 and num_to_prune == 0
+        if primary and ratio_prunes_nothing and target_experts is None:
             logger.warning(
                 "Layer %d: compression_ratio=%.4f prunes 0 of %d experts "
                 "(floor(num_experts * ratio) == 0). Increase the ratio or "
@@ -505,7 +507,8 @@ def _validate_keep_indices(
         )
     if keep_indices.size != np.unique(keep_indices).size:
         raise ValueError(
-            f"Layer {layer_idx}: keep indices must be unique, got {keep_indices.tolist()}."
+            f"Layer {layer_idx}: keep indices must be unique, "
+            f"got {keep_indices.tolist()}."
         )
     min_index = int(keep_indices.min())
     max_index = int(keep_indices.max())

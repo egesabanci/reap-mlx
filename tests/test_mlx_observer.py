@@ -14,7 +14,6 @@ import pytest
 
 from reap.observer import observe_model
 
-
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
 
 requires_mlx = pytest.mark.skipif(
@@ -756,7 +755,9 @@ def test_observe_model_detects_upstream_routing_change_on_real_block(monkeypatch
     tokens = np.arange(1, 17, dtype=np.int32)
     assert observe_model(model, [tokens], config)[0]["replay_parity_error"] == 0.0
 
-    monkeypatch.setattr(qwen3_moe.Qwen3MoeSparseMoeBlock, "__call__", sigmoid_gating_call)
+    monkeypatch.setattr(
+        qwen3_moe.Qwen3MoeSparseMoeBlock, "__call__", sigmoid_gating_call
+    )
 
     with pytest.raises(ValueError, match="Replay parity check failed"):
         observe_model(model, [tokens], config)

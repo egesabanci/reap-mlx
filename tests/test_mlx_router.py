@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import inspect
 import importlib.util
+import inspect
 import os
 import subprocess
 import sys
@@ -19,7 +19,6 @@ from reap.router import (
     Qwen3MoeRouter,
     RouterResult,
 )
-
 
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
 

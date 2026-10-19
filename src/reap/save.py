@@ -6,6 +6,7 @@ default save, load, or generation helpers are executed.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import logging
@@ -22,7 +23,6 @@ from reap.model_adapters import (
     infer_model_adapter,
     unsupported_architecture_message,
 )
-
 
 _WEIGHT_PATTERNS = ("*.safetensors", "*.npz")
 logger = logging.getLogger(__name__)
@@ -92,10 +92,8 @@ def save_pruned_model(
 
     # If adapter inference failed on the original model, try the reloaded model
     if adapter is None:
-        try:
+        with contextlib.suppress(Exception):
             adapter = infer_model_adapter(reloaded_model, reloaded_config)
-        except Exception:
-            pass
     if adapter is None:
         # Neither the original nor the reloaded model exposed a supported MoE
         # architecture. Fail with a clear message instead of a confusing

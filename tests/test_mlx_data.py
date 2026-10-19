@@ -109,7 +109,9 @@ class ChatTokenizer(WhitespaceTokenizer):
                 "add_generation_prompt": add_generation_prompt,
             }
         )
-        return " ".join(f"{message['role']}:{message['content']}" for message in messages)
+        return " ".join(
+            f"{message['role']}:{message['content']}" for message in messages
+        )
 
 
 class CallableTokenizer:
@@ -370,8 +372,18 @@ def test_sharegpt_conversations_are_mapped_to_chat_template_roles():
     )
 
     assert tokenizer.template_calls[0]["messages"] == [
-        {"from": "system", "value": "Be brief.", "role": "system", "content": "Be brief."},
-        {"from": "human", "value": "Explain REAP.", "role": "user", "content": "Explain REAP."},
+        {
+            "from": "system",
+            "value": "Be brief.",
+            "role": "system",
+            "content": "Be brief.",
+        },
+        {
+            "from": "human",
+            "value": "Explain REAP.",
+            "role": "user",
+            "content": "Explain REAP.",
+        },
         {
             "from": "gpt",
             "value": "REAP prunes experts.",

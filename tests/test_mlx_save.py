@@ -21,7 +21,6 @@ from reap.save import (
     save_pruned_model,
 )
 
-
 MLX_LM_AVAILABLE = importlib.util.find_spec("mlx_lm") is not None
 
 
@@ -378,7 +377,7 @@ def test_save_pruned_model_rejects_missing_expected_expert_count(tmp_path):
         )
 
 
-def test_save_pruned_model_raises_clear_message_when_no_moe_architecture_detected(tmp_path):
+def test_save_pruned_model_raises_clear_message_without_moe_architecture(tmp_path):
     # Neither the original nor the reloaded model expose MoE structure, so
     # adapter inference returns None for both -> fail with a clear message.
     dense_model = SimpleNamespace(
@@ -387,7 +386,9 @@ def test_save_pruned_model_raises_clear_message_when_no_moe_architecture_detecte
     dense_reloaded = SimpleNamespace(
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=object())])
     )
-    with pytest.raises(ValueError, match="Cannot detect a supported MoE architecture") as excinfo:
+    with pytest.raises(
+        ValueError, match="Cannot detect a supported MoE architecture"
+    ) as excinfo:
         save_pruned_model(
             dense_model,
             object(),
@@ -663,7 +664,9 @@ def test_generation_smoke_falls_back_to_raw_prompt_when_chat_template_fails(capl
     assert result == "hello"
     assert calls == [(model, tokenizer, "Who are you?", 4)]
     # The fallback should be logged with the exception details.
-    assert any("Chat template application failed" in rec.message for rec in caplog.records)
+    assert any(
+        "Chat template application failed" in rec.message for rec in caplog.records
+    )
 
 
 def test_generation_smoke_propagates_unexpected_chat_template_errors():

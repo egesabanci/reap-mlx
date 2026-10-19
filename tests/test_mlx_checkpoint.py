@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import subprocess
@@ -35,7 +34,10 @@ def test_checkpoint_module_import_does_not_import_heavy_runtime_packages():
         cwd=Path(__file__).resolve().parent.parent,
         capture_output=True,
         text=True,
-        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src"),
+        },
     )
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
@@ -103,7 +105,10 @@ def test_load_checkpoint_accepts_version_1(tmp_path):
 
 def test_load_checkpoint_rejects_unsupported_version(tmp_path):
     path = tmp_path / "bad.json"
-    path.write_text(json.dumps({"version": 999, "keep_by_layer": {"0": [1]}}), encoding="utf-8")
+    path.write_text(
+        json.dumps({"version": 999, "keep_by_layer": {"0": [1]}}),
+        encoding="utf-8",
+    )
     with pytest.raises(ValueError, match="Unsupported checkpoint version"):
         load_checkpoint(path)
 

@@ -11,7 +11,6 @@ from typing import Any
 
 import numpy as np
 
-
 _FLOAT_EPS = np.finfo(np.float64).eps
 
 
