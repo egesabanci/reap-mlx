@@ -186,6 +186,82 @@ def assert_allclose(mx, actual, expected, *, atol=1e-6):
     assert float(diff) <= atol
 
 
+class RecordingSwitchMlp:
+    """Stand-in switch_mlp that records the experts an mlx-lm block selects."""
+
+    def __init__(self, mx):
+        self.mx = mx
+        self.indices = None
+
+    def __call__(self, x, indices):
+        self.indices = indices
+        return self.mx.zeros((*indices.shape, x.shape[-1]), dtype=x.dtype)
+
+
+def _mlx_lm_block_with_tied_gate(mx, model_type):
+    """Build an mlx-lm MoE block whose gate logits tie at the top-2 boundary."""
+    import importlib
+
+    arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+    common = {
+        "model_type": model_type,
+        "hidden_size": 8,
+        "num_hidden_layers": 1,
+        "intermediate_size": 8,
+        "num_attention_heads": 2,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 16,
+        "num_key_value_heads": 2,
+    }
+    extra = {
+        "qwen3_moe": {
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [],
+            "moe_intermediate_size": 8,
+            "head_dim": 4,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 16,
+            "norm_topk_prob": False,
+        },
+        "qwen2_moe": {
+            "moe_intermediate_size": 8,
+            "shared_expert_intermediate_size": 8,
+        },
+        "olmoe": {},
+    }[model_type]
+    args = arch.ModelArgs.from_dict({**common, **extra})
+    block_cls = {
+        "qwen3_moe": "Qwen3MoeSparseMoeBlock",
+        "qwen2_moe": "Qwen2MoeSparseMoeBlock",
+        "olmoe": "OlmoeSparseMoeBlock",
+    }[model_type]
+    block = getattr(arch, block_cls)(args)
+    weight = mx.zeros((4, 8))
+    weight[:, 0] = mx.array([1.0, 0.5, 0.5, 0.0])
+    block.gate.weight = weight
+    block.switch_mlp = RecordingSwitchMlp(mx)
+    hidden_states = mx.zeros((1, 1, 8))
+    hidden_states[..., 0] = 1.0
+    return block, hidden_states
+
+
+@requires_mlx
+@pytest.mark.parametrize("model_type", ["qwen3_moe", "qwen2_moe", "olmoe"])
+def test_qwen_router_breaks_top_k_ties_like_mlx_lm(model_type):
+    import mlx.core as mx
+
+    block, hidden_states = _mlx_lm_block_with_tied_gate(mx, model_type)
+    mx.eval(block(hidden_states))
+    mlx_lm_selected = sorted(block.switch_mlp.indices.reshape(-1).tolist())
+
+    result = Qwen3MoeRouter(block, {"model_type": model_type})(hidden_states)
+
+    assert sorted(result.indices.reshape(-1).tolist()) == mlx_lm_selected
+
+
 def test_router_normalization_epsilon_is_shared():
     assert router_module._NORM_EPSILON == 1e-20
     assert "_NORM_EPSILON" in inspect.getsource(Qwen3MoeRouter.__call__)

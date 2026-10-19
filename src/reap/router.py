@@ -12,6 +12,13 @@ from typing import Any, Mapping
 
 _NORM_EPSILON: float = 1e-20
 
+# mlx-lm partitions Qwen2-MoE and OLMoE gates in descending order
+# (argpartition(-gates, kth=k-1)[..., :k]) but Qwen3-MoE in ascending order
+# (argpartition(gates, kth=-k)[..., -k:]). On exact ties at the top-k boundary,
+# which are common with bfloat16 gates, the two forms keep different experts,
+# so the replay must use the same form as the architecture it mirrors.
+_DESCENDING_TOPK_MODEL_TYPES = frozenset({"qwen2_moe", "olmoe"})
+
 
 @dataclass(frozen=True)
 class RouterResult:
@@ -108,6 +115,8 @@ class Qwen3MoeRouter:
                 default=False,
             )
         )
+        model_type = _config_value(config, "model_type", default="")
+        self.descending_topk = str(model_type) in _DESCENDING_TOPK_MODEL_TYPES
 
     def __call__(self, hidden_states: Any) -> RouterResult:
         mx = _require_mlx_core()
@@ -136,9 +145,14 @@ class Qwen3MoeRouter:
         # it mirrors that architecture's own MLX-LM forward pass.
         # See docs/observation-and-metrics.md for full router semantics.
         gates = mx.softmax(logits, axis=-1, precise=True)
-        flat_indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[
-            ..., -self.top_k :
-        ]
+        if self.descending_topk:
+            flat_indices = mx.argpartition(-gates, kth=self.top_k - 1, axis=-1)[
+                ..., : self.top_k
+            ]
+        else:
+            flat_indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[
+                ..., -self.top_k :
+            ]
         flat_scores = mx.take_along_axis(gates, flat_indices, axis=-1)
 
         if self.norm_topk_prob:

@@ -111,7 +111,11 @@ Qwen3 routing:
 2. Flattens leading dimensions before gate projection.
 3. Computes gate logits with `moe.gate`.
 4. Applies `mx.softmax(logits, axis=-1, precise=True)`.
-5. Selects top-k experts through `mx.argpartition`.
+5. Selects top-k experts through `mx.argpartition`, using the same form as the
+   mlx-lm architecture: ascending (`argpartition(gates, kth=-k)[..., -k:]`) for
+   `qwen3_moe`, descending (`argpartition(-gates, kth=k-1)[..., :k]`) for
+   `qwen2_moe` and `olmoe`. The two forms keep different experts on exact ties
+   at the top-k boundary, which bfloat16 gates produce regularly.
 6. Gathers selected softmax scores.
 7. Optionally renormalizes selected scores with the shared epsilon denominator
    when `norm_topk_prob` is enabled.
