@@ -25,8 +25,16 @@ def load_calibration_sequences(
     max_seq_length: int = 2048,
     seed: int = 42,
     load_dataset_fn: Callable[..., Iterable[Any]] | None = None,
+    pack: bool = False,
 ) -> list[dict[str, np.ndarray]]:
-    """Load unpadded batch-size-1 calibration token sequences."""
+    """Load unpadded batch-size-1 calibration token sequences.
+
+    With ``pack``, consecutive samples are concatenated into sequences of
+    exactly ``max_seq_length`` tokens (a sample that does not fit is truncated
+    to the remaining room), like the REAP reference implementation; then
+    ``max_samples`` counts packed sequences. The last sequence may be shorter
+    when the dataset runs out.
+    """
     max_samples = _positive_int(max_samples, "max_samples")
     max_seq_length = _positive_int(max_seq_length, "max_seq_length")
     load_dataset_fn = _default_load_dataset if load_dataset_fn is None else load_dataset_fn
@@ -38,6 +46,7 @@ def load_calibration_sequences(
     dataset = _maybe_shuffle(dataset, seed)
 
     sequences: list[dict[str, np.ndarray]] = []
+    packed: list[int] = []
     records_seen = 0
     empty_text_or_tokens = 0
     for record in dataset:
@@ -52,6 +61,11 @@ def load_calibration_sequences(
             empty_text_or_tokens += 1
             continue
 
+        if pack:
+            packed.extend(token_ids[: max_seq_length - len(packed)])
+            if len(packed) < max_seq_length:
+                continue
+            token_ids, packed = packed, []
         sequences.append(
             {
                 "input_ids": np.asarray(token_ids, dtype=np.int32),
@@ -59,6 +73,9 @@ def load_calibration_sequences(
         )
         if len(sequences) >= max_samples:
             break
+
+    if packed and len(sequences) < max_samples:
+        sequences.append({"input_ids": np.asarray(packed, dtype=np.int32)})
 
     if empty_text_or_tokens and records_seen:
         empty_ratio = empty_text_or_tokens / records_seen
@@ -84,7 +101,14 @@ def load_calibration_sequences(
 
 
 def extract_text(record: Any, *, tokenizer: Any | None = None) -> str:
-    """Extract text from common calibration dataset record shapes."""
+    """Extract text from common calibration dataset record shapes.
+
+    Instruction-style records (instruction/prompt/question plus
+    output/completion/response/answer) are rendered as a user/assistant
+    conversation through the tokenizer's chat template when it has one, which
+    is how the model is used and how the REAP reference formats them. Without
+    a chat template the parts are joined with blank lines.
+    """
     if not isinstance(record, Mapping):
         return _normalize_content(record).strip()
 
@@ -101,12 +125,21 @@ def extract_text(record: Any, *, tokenizer: Any | None = None) -> str:
     output = _first_present(record, "output", "completion", "response", "answer")
     input_text = _first_present(record, "input", "context")
     if instruction is not None or output is not None:
-        parts = [
-            _normalize_content(part).strip()
-            for part in (instruction, input_text, output)
-            if part is not None
-        ]
-        return "\n\n".join(part for part in parts if part)
+        prompt = "\n\n".join(
+            part
+            for part in (
+                _normalize_content(instruction).strip(),
+                _normalize_content(input_text).strip(),
+            )
+            if part
+        )
+        answer = _normalize_content(output).strip()
+        if prompt and _has_chat_template(tokenizer):
+            messages = [{"role": "user", "content": prompt}]
+            if answer:
+                messages.append({"role": "assistant", "content": answer})
+            return _messages_to_text(messages, tokenizer=tokenizer).strip()
+        return "\n\n".join(part for part in (prompt, answer) if part)
 
     return ""
 
@@ -189,12 +222,24 @@ def _maybe_json_load(value: Any) -> Any:
     return value
 
 
+def _has_chat_template(tokenizer: Any | None) -> bool:
+    """Return True when ``apply_chat_template`` has a template to render."""
+    if not callable(getattr(tokenizer, "apply_chat_template", None)):
+        return False
+    # mlx-lm's TokenizerWrapper also counts templates registered through
+    # chat_template_type, which the Hugging Face attribute does not see.
+    has_template = getattr(tokenizer, "has_chat_template", None)
+    if isinstance(has_template, bool):
+        return has_template
+    return bool(getattr(tokenizer, "chat_template", None))
+
+
 def _messages_to_text(messages: Any, *, tokenizer: Any | None) -> str:
     if not isinstance(messages, list):
         return _normalize_content(messages)
 
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
-    if callable(apply_chat_template):
+    if _has_chat_template(tokenizer):
         try:
             rendered = apply_chat_template(
                 messages,

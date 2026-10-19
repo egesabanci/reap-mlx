@@ -334,6 +334,7 @@ def test_main_runs_pipeline_with_injected_functions_and_progress_messages(tmp_pa
         "max_samples": 3,
         "max_seq_length": 16,
         "seed": 9,
+        "pack": False,
     }
     assert events[2][4]["eval_frequency"] == 1
     assert "print_fn" in events[2][4]
@@ -400,6 +401,42 @@ def test_main_passes_configured_eval_frequency_to_observer(tmp_path):
         (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
     )
     assert payload["run_config"]["eval_frequency"] == 4
+
+
+def test_pack_calibration_flag_is_forwarded_to_the_loader(tmp_path):
+    loader_kwargs = {}
+
+    def fake_load_calibration_sequences(tokenizer_arg, dataset_name, **kwargs):
+        loader_kwargs.update(kwargs)
+        return [{"input_ids": [1]}]
+
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--allow-partial-calibration",
+            "--output-dir",
+            str(tmp_path),
+            "--pack-calibration",
+        ],
+        load_model_fn=lambda model_name: (*_moe_model_and_config(),),
+        load_calibration_sequences_fn=fake_load_calibration_sequences,
+        observe_model_fn=lambda *args, **kwargs: {0: {"reap": [1.0]}},
+        prune_experts_fn=lambda *args, **kwargs: {},
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path
+        ),
+        print_fn=lambda message: None,
+    )
+
+    assert code == 0
+    assert loader_kwargs["pack"] is True
+    payload = json.loads(
+        (tmp_path / "validation-metrics.json").read_text(encoding="utf-8")
+    )
+    assert payload["run_config"]["pack_calibration"] is True
 
 
 def test_skip_replay_check_disables_observer_parity_verification(tmp_path):

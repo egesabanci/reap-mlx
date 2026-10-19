@@ -162,6 +162,116 @@ def test_extract_text_supports_instruction_input_output_records():
     assert text == "Write a function.\n\nUse Python.\n\ndef f(): pass"
 
 
+def test_instruction_records_use_chat_template_when_available():
+    tokenizer = ChatTokenizer()
+
+    text = extract_text(
+        {
+            "instruction": "Write a function.",
+            "input": "Use Python.",
+            "output": "def f(): pass",
+        },
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls == [
+        {
+            "messages": [
+                {"role": "user", "content": "Write a function.\n\nUse Python."},
+                {"role": "assistant", "content": "def f(): pass"},
+            ],
+            "tokenize": False,
+            "add_generation_prompt": False,
+        }
+    ]
+    assert text == "user:Write a function.\n\nUse Python. assistant:def f(): pass"
+
+
+def test_instruction_records_without_a_prompt_stay_plain_text():
+    tokenizer = ChatTokenizer()
+
+    text = extract_text({"output": "def f(): pass"}, tokenizer=tokenizer)
+
+    assert text == "def f(): pass"
+    assert tokenizer.template_calls == []
+
+
+class TemplatelessChatTokenizer(ChatTokenizer):
+    """Has apply_chat_template but no template (Hugging Face base models)."""
+
+    chat_template = None
+
+
+def test_records_skip_apply_chat_template_when_tokenizer_has_no_template():
+    tokenizer = TemplatelessChatTokenizer()
+
+    message_text = extract_text(
+        {"messages": [{"role": "user", "content": "Hello"}]},
+        tokenizer=tokenizer,
+    )
+    instruction_text = extract_text(
+        {"instruction": "Write a function.", "output": "def f(): pass"},
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls == []
+    assert message_text == "user: Hello"
+    assert instruction_text == "Write a function.\n\ndef f(): pass"
+
+
+def test_mlx_lm_has_chat_template_flag_enables_templates():
+    tokenizer = TemplatelessChatTokenizer()
+    tokenizer.has_chat_template = True
+
+    extract_text({"instruction": "Hi", "output": "Hello"}, tokenizer=tokenizer)
+
+    assert len(tokenizer.template_calls) == 1
+
+
+def test_pack_concatenates_samples_into_full_length_sequences():
+    records = [
+        {"text": "a bb ccc"},
+        {"text": "dddd eeeee"},
+        {"text": "f gg hhh iiii"},
+        {"text": "a bb"},
+    ]
+
+    sequences = load_calibration_sequences(
+        WhitespaceTokenizer(),
+        "pack/data",
+        max_samples=3,
+        max_seq_length=4,
+        pack=True,
+        load_dataset_fn=lambda dataset_name, **kwargs: records,
+    )
+
+    # [1, 2, 3] + [4, 5] fills the first sequence (5 is dropped), [1, 2, 3, 4]
+    # fills the second, and [1, 2] is kept as a shorter final sequence.
+    assert [seq["input_ids"].tolist() for seq in sequences] == [
+        [1, 2, 3, 4],
+        [1, 2, 3, 4],
+        [1, 2],
+    ]
+
+
+def test_pack_stops_at_max_samples_packed_sequences():
+    records = [{"text": "a bb ccc dddd"}] * 5
+
+    sequences = load_calibration_sequences(
+        WhitespaceTokenizer(),
+        "pack/data",
+        max_samples=2,
+        max_seq_length=4,
+        pack=True,
+        load_dataset_fn=lambda dataset_name, **kwargs: records,
+    )
+
+    assert [seq["input_ids"].tolist() for seq in sequences] == [
+        [1, 2, 3, 4],
+        [1, 2, 3, 4],
+    ]
+
+
 def test_message_records_use_tokenizer_chat_template_when_available():
     tokenizer = ChatTokenizer()
 

@@ -236,6 +236,38 @@ def test_cli_prunes_saves_and_reloads_tiny_model(tmp_path, family, quantize):
     assert metrics["save_reload"]["reloaded_config_expert_count"] == 6
 
 
+def test_cli_packs_calibration_into_full_length_sequences(tmp_path):
+    source = _write_source_model(tmp_path / "source", "qwen3_moe", quantize=False)
+    output = tmp_path / "pruned"
+
+    exit_code = main(
+        [
+            "--model-name",
+            str(source),
+            "--dataset-name",
+            "tiny-synthetic",
+            "--max-samples",
+            "2",
+            "--max-seq-length",
+            "32",
+            "--pack-calibration",
+            "--output-dir",
+            str(output),
+            "--no-smoke",
+        ],
+        load_calibration_sequences_fn=functools.partial(
+            load_calibration_sequences,
+            load_dataset_fn=_calibration_records,
+        ),
+        print_fn=lambda _message: None,
+    )
+
+    assert exit_code == 0
+    metrics = json.loads((output / "validation-metrics.json").read_text())
+    # Each 24-token sample is packed into exactly 32-token sequences.
+    assert metrics["run_config"]["actual_token_counts"] == [32, 32]
+
+
 @pytest.mark.parametrize("quantize", [False, True], ids=["bf16", "4bit"])
 @pytest.mark.parametrize("family", FAMILIES)
 def test_observer_replay_is_bit_identical_to_live_layers(family, quantize):

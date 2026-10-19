@@ -65,6 +65,7 @@ Run config records user-facing CLI inputs:
 - `seed`
 - `max_samples`
 - `max_seq_length`
+- `pack_calibration`
 - `eval_frequency`
 - `prune_method`
 - `resolved_prune_method`

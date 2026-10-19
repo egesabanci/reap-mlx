@@ -40,6 +40,7 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 | `--max-samples` | `128` | Maximum non-empty calibration samples. |
 | `--num-calibration-sequences` | alias | Alias for `--max-samples`. |
 | `--max-seq-length` | `2048` | Maximum tokens per calibration sequence. |
+| `--pack-calibration` | off | Pack samples into full `--max-seq-length` sequences (REAP reference behaviour). |
 | `--eval-frequency` | `1` | Evaluate the MLX graph every N observation layers. |
 | `--skip-replay-check` | off | Skip the first-sequence check that the layer replay matches each live MoE block. |
 | `--seed` | `42` | Shuffle seed when the dataset supports shuffle. |

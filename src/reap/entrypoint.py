@@ -140,6 +140,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument(
+        "--pack-calibration",
+        action="store_true",
+        help=(
+            "Concatenate calibration samples into sequences of exactly "
+            "--max-seq-length tokens, like the REAP reference implementation. "
+            "--max-samples then counts packed sequences."
+        ),
+    )
+    parser.add_argument(
         "--strict-resume",
         action="store_true",
         default=True,
@@ -394,6 +403,7 @@ def main(
                     max_samples=args.max_samples,
                     max_seq_length=args.max_seq_length,
                     seed=args.seed,
+                    pack=args.pack_calibration,
                 )
             if not calibration_sequences:
                 raise RuntimeError("No non-empty calibration sequences were loaded.")
