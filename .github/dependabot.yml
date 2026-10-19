@@ -6,8 +6,21 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
-  - package-ecosystem: pip
+  # The uv ecosystem updates pyproject.toml and uv.lock together. The pip
+  # ecosystem only edited pyproject.toml, which fails CI's lockfile check.
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Keep the lower bounds: raise upper bounds as the pip updates did, and
+    # bump uv.lock alone for releases the ranges already allow.
+    versioning-strategy: widen
+    groups:
+      # mlx-lm releases need a matching mlx (mlx-lm 0.32 needs mlx>=0.32.2),
+      # and uv keeps mlx-lm where it is while mlx stays locked, so the two
+      # are updated in one pull request.
+      mlx:
+        patterns:
+          - "mlx"
+          - "mlx-lm"
