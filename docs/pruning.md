@@ -77,9 +77,10 @@ output (not the L2 norm used by EAN metrics).
 Expert weight slicing preserves MLX arrays (`mx.take`) so
 `mlx.nn.Module.parameters()` still tracks pruned tensors for save/reload.
 
-## Qwen3 Slicing
+## Expert Slicing
 
-Qwen3 pruning requires:
+All supported adapters (`qwen3_moe`, `lfm2_moe`, `mixtral_moe`) share one
+slicing path. Pruning requires:
 
 ```txt
 moe.switch_mlp.gate_proj.weight
@@ -95,34 +96,24 @@ For switch projections, any present fields are sliced:
 - `biases`
 - `bias`
 
-For the gate, any present fields are sliced:
+For the router gate, any present fields are sliced:
 
 - `weight`
+- `scales`
+- `biases`
 - `bias`
 - `e_score_correction_bias`
 
+Quantized checkpoints usually store the gate as a `QuantizedLinear`, so
+`scales` and `biases` must be sliced together with the packed `weight`;
+otherwise reload fails with a stale `gate.scales` shape.
+
+If `use_expert_bias` is enabled or `expert_bias` exists on the MoE block,
+`expert_bias` is also sliced on dimension 0. If expert bias is enabled but
+missing, pruning raises a `ValueError`.
+
 Each sliced value must expose a shape and have first dimension equal to the
 pre-pruning expert count.
-
-## LFM2 Slicing
-
-LFM2 pruning slices the same switch projection fields:
-
-- `weight`
-- `scales`
-- `biases`
-- `bias`
-
-For the LFM2 gate, any present fields are sliced:
-
-- `weight`
-- `scales`
-- `biases`
-- `bias`
-
-If `use_expert_bias` is enabled or `expert_bias` exists, `expert_bias` is also
-sliced on dimension 0. If expert bias is enabled but missing, pruning raises a
-`ValueError`.
 
 ## Runtime Metadata Updates
 

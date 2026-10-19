@@ -38,6 +38,9 @@ _SUPPORTED_PRUNE_METHODS = {
 }
 
 _SLICE_FIELD_NAMES = ("weight", "scales", "biases", "bias")
+# Router gates may be quantized (QuantizedLinear: weight + scales + biases);
+# every per-expert field must be sliced together or reload sees stale shapes.
+_GATE_FIELD_NAMES = (*_SLICE_FIELD_NAMES, "e_score_correction_bias")
 _SWITCH_PROJECTION_NAMES = ("gate_proj", "up_proj", "down_proj")
 _TOP_K_ATTRS = ("top_k", "num_experts_per_tok", "k")
 
@@ -320,24 +323,13 @@ def prune_experts(
         )
         keep_indices = compute_keep_indices(saliency, retained_count)
 
-        if adapter.adapter_name == "lfm2_moe":
-            _prune_lfm2_moe_layer(
-                adapter.get_moe(layer),
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
-        else:
-            # qwen3_moe, mixtral_moe, and other switch_mlp families share
-            # gate/switch projection layouts for dim-0 expert slicing.
-            _prune_qwen3_moe_layer(
-                adapter.get_moe(layer),
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
+        _prune_switch_moe_layer(
+            moe,
+            keep_indices,
+            num_experts=layer_config.num_experts,
+            old_top_k=layer_config.top_k,
+            layer_idx=layer_idx,
+        )
         keep_by_layer[layer_idx] = keep_indices
         if retained_count >= layer_config.num_experts:
             if primary:
@@ -430,22 +422,13 @@ def apply_keep_indices(
             layer_idx=int(layer_idx),
         )
         retained_count = int(len(keep_indices))
-        if adapter.adapter_name == "lfm2_moe":
-            _prune_lfm2_moe_layer(
-                moe,
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
-        else:
-            _prune_qwen3_moe_layer(
-                moe,
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
+        _prune_switch_moe_layer(
+            moe,
+            keep_indices,
+            num_experts=layer_config.num_experts,
+            old_top_k=layer_config.top_k,
+            layer_idx=layer_idx,
+        )
         new_top_k = min(layer_config.top_k, retained_count)
         if config_num_experts is None:
             config_num_experts = retained_count
@@ -647,7 +630,7 @@ def _saliency_scores(
     return scores
 
 
-def _prune_qwen3_moe_layer(
+def _prune_switch_moe_layer(
     moe: Any,
     keep_indices: np.ndarray,
     *,
@@ -655,6 +638,12 @@ def _prune_qwen3_moe_layer(
     old_top_k: int,
     layer_idx: int,
 ) -> None:
+    """Slice one switch_mlp MoE block: projections, router gate, expert bias.
+
+    Every supported adapter (qwen3_moe, lfm2_moe, mixtral_moe) stores experts
+    on dimension 0 of the same fields, so a single slicing path keeps the
+    families from drifting apart.
+    """
     switch_mlp = getattr(moe, "switch_mlp", None)
     if switch_mlp is None:
         raise ValueError(f"MoE layer {layer_idx} does not expose switch_mlp.")
@@ -688,56 +677,7 @@ def _prune_qwen3_moe_layer(
         keep_indices,
         num_experts=num_experts,
         required=True,
-        field_names=("weight", "bias", "e_score_correction_bias"),
-    )
-
-    retained_count = len(keep_indices)
-    new_top_k = min(int(old_top_k), retained_count)
-    _update_runtime_attrs(moe, gate, retained_count=retained_count, top_k=new_top_k)
-
-
-def _prune_lfm2_moe_layer(
-    moe: Any,
-    keep_indices: np.ndarray,
-    *,
-    num_experts: int,
-    old_top_k: int,
-    layer_idx: int,
-) -> None:
-    switch_mlp = getattr(moe, "switch_mlp", None)
-    if switch_mlp is None:
-        raise ValueError(f"MoE layer {layer_idx} does not expose switch_mlp.")
-
-    for projection_name in _SWITCH_PROJECTION_NAMES:
-        projection = getattr(switch_mlp, projection_name, None)
-        if projection is None:
-            raise ValueError(
-                f"MoE layer {layer_idx} switch_mlp is missing "
-                f"{projection_name}."
-            )
-        if _get_module_value(projection, "weight") is None:
-            raise ValueError(
-                f"MoE layer {layer_idx} switch_mlp.{projection_name} is "
-                "missing required weight."
-            )
-        slice_first_dim(
-            projection,
-            keep_indices,
-            num_experts=num_experts,
-            required=True,
-        )
-
-    gate = getattr(moe, "gate", None)
-    if gate is None:
-        raise ValueError(f"MoE layer {layer_idx} does not expose a gate.")
-    if _get_module_value(gate, "weight") is None:
-        raise ValueError(f"MoE layer {layer_idx} gate is missing required weight.")
-    slice_first_dim(
-        gate,
-        keep_indices,
-        num_experts=num_experts,
-        required=True,
-        field_names=("weight", "scales", "biases", "bias"),
+        field_names=_GATE_FIELD_NAMES,
     )
 
     if getattr(moe, "use_expert_bias", False) or hasattr(moe, "expert_bias"):

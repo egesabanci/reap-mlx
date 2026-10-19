@@ -139,13 +139,19 @@ class TinyGate:
         self.top_k = 3
 
 
-class TinyLfmGate(TinyGate):
+class TinyQuantizedGate(TinyGate):
+    """Gate shaped like mlx.nn.QuantizedLinear: weight plus per-expert scales/biases."""
+
     def __init__(self, num_experts: int):
         super().__init__(num_experts)
         self.scales = np.arange(num_experts, dtype=np.float32).reshape(num_experts, 1)
         self.biases = (
             np.arange(num_experts, dtype=np.float32).reshape(num_experts, 1) + 100
         )
+
+
+class TinyLfmGate(TinyQuantizedGate):
+    pass
 
 
 class TinyMoe:
@@ -298,6 +304,27 @@ def test_prune_experts_slices_qwen_switch_router_metadata_and_config():
     assert config["num_experts"] == 2
     assert config["num_experts_per_tok"] == 2
     assert config["top_k"] == 2
+
+
+def test_prune_experts_slices_quantized_qwen_gate_scales_and_biases():
+    model = make_model(num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    moe = model.model.layers[0].mlp
+    moe.gate = TinyQuantizedGate(4)
+    keep = np.array([1, 3])
+    gate_scales = moe.gate.scales.copy()
+    gate_biases = moe.gate.biases.copy()
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+        "reap",
+        0.5,
+    )
+
+    np.testing.assert_array_equal(moe.gate.scales, gate_scales[keep])
+    np.testing.assert_array_equal(moe.gate.biases, gate_biases[keep])
 
 
 def test_prune_experts_accepts_weighted_frequency_alias():
@@ -847,6 +874,61 @@ def test_prune_quantized_switch_linear_preserves_parameters_and_forward():
     y = ql(x[:, None, :], idx)
     mx.eval(y)
     assert y.shape[0] == 2
+
+
+@requires_mlx
+def test_prune_experts_keeps_quantized_qwen3_gate_runnable():
+    """A real mlx-lm Qwen3 MoE block with a quantized router gate stays usable."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models import qwen3_moe
+
+    args = qwen3_moe.ModelArgs(
+        model_type="qwen3_moe",
+        hidden_size=64,
+        num_hidden_layers=1,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        moe_intermediate_size=64,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=2,
+        head_dim=16,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        max_position_embeddings=64,
+        norm_topk_prob=True,
+    )
+    moe = qwen3_moe.Qwen3MoeSparseMoeBlock(args)
+    nn.quantize(moe, group_size=64, bits=4)
+    mx.eval(moe.parameters())
+    assert isinstance(moe.gate, nn.QuantizedLinear)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(mlp=moe)]))
+    config = {
+        "model_type": "qwen3_moe",
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": True,
+    }
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.arange(8, dtype=np.float32)}},
+        "reap",
+        0.25,
+    )
+
+    assert moe.gate.weight.shape[0] == 6
+    assert moe.gate.scales.shape[0] == 6
+    assert moe.gate.biases.shape[0] == 6
+    y = moe(mx.random.normal((1, 5, 64)))
+    mx.eval(y)
+    assert y.shape == (1, 5, 64)
 
 
 def test_apply_keep_indices_rejects_out_of_range_and_duplicates():

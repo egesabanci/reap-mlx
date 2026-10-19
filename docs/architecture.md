@@ -91,9 +91,9 @@ module supports regular attributes and MLX-LM modules exposing `.get(field)`.
 Sliceable fields include:
 
 - switch projection `weight`, `scales`, `biases`, `bias`;
-- gate `weight`, `bias`, `e_score_correction_bias` for Qwen3-style gates;
-- gate `weight`, `scales`, `biases`, `bias` for LFM2-style gates;
-- LFM2 `expert_bias` when enabled or present.
+- router gate `weight`, `scales`, `biases`, `bias`, `e_score_correction_bias`
+  (quantized gates carry `scales`/`biases`);
+- `expert_bias` on the MoE block when enabled or present (LFM2).
 
 Pruning updates runtime attributes after slicing so later forward passes and
 reload validation see the new expert count.
