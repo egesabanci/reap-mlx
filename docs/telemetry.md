@@ -231,7 +231,10 @@ Smoke telemetry records:
 - max tokens;
 - elapsed seconds;
 - generated token count when tokenizer encoding is available;
-- result preview.
+- result preview;
+- `output_warnings`: signs of a broken pruned model, such as empty output or a
+  single token repeated four or more times. These are warnings only; the run
+  still succeeds, because a healthy model can stop immediately on some prompts.
 
 The result preview is truncated to 500 characters.
 

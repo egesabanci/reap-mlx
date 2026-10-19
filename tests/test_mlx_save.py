@@ -686,6 +686,66 @@ def test_generation_smoke_propagates_unexpected_chat_template_errors():
 
 
 
+def test_generation_smoke_runs_outside_the_main_thread():
+    import threading
+
+    class Tokenizer:
+        chat_template = None
+
+    results = []
+
+    def run():
+        results.append(
+            generation_smoke(
+                object(),
+                Tokenizer(),
+                prompt="Hi",
+                max_tokens=2,
+                generate_fn=lambda model, tokenizer, *, prompt, max_tokens: "ok",
+            )
+        )
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join(timeout=10)
+
+    assert results == ["ok"]
+
+
+class WhitespaceSmokeTokenizer:
+    def encode(self, text, add_special_tokens=True):
+        return text.split()
+
+
+@pytest.mark.parametrize(
+    ("generated", "expected_warnings"),
+    [
+        ("Paris is in France.", []),
+        ("   ", ["generated text is empty"]),
+        ("the the the the the", ["generated text repeats a single token 5 times"]),
+    ],
+)
+def test_save_pruned_model_flags_degenerate_smoke_output(
+    tmp_path, generated, expected_warnings
+):
+    result = save_pruned_model(
+        object(),
+        object(),
+        {"num_experts": 1},
+        tmp_path / "saved",
+        "source-model",
+        smoke_fn=lambda model, tokenizer, config: generated,
+        save_fn=fake_save_factory([]),
+        load_fn=fake_load_factory(
+            make_reloaded_model(1),
+            WhitespaceSmokeTokenizer(),
+            {"num_experts": 1},
+        ),
+    )
+
+    assert result.metrics["smoke"]["output_warnings"] == expected_warnings
+
+
 def test_generation_smoke_times_out_when_generate_stalls():
     """A stalling generate_fn must be interrupted by the wall-clock timeout."""
     import time as _time

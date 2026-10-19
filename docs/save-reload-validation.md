@@ -181,6 +181,13 @@ from mlx_lm import generate
 Smoke runs on the reloaded model and reloaded tokenizer. `--no-smoke` disables
 smoke by passing `smoke_fn=None`.
 
+Generation is bounded by a 120 second wall-clock timeout (`SIGALRM`). The alarm
+can only be installed from the main thread, so when the pipeline runs in
+another thread the timeout is skipped with a warning instead of failing.
+
+Empty output, or output that repeats a single token four or more times, is
+logged and recorded in `smoke.output_warnings`; the run is not failed for it.
+
 ## Common Failure Meanings
 
 | Failure | Likely cause |

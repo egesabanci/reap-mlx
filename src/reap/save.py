@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import signal
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -119,6 +120,7 @@ def save_pruned_model(
         "elapsed_seconds": None,
         "generated_token_count": None,
         "result_preview": None,
+        "output_warnings": [],
     }
     if smoke_fn is not None:
         smoke_started = time.perf_counter()
@@ -129,15 +131,19 @@ def save_pruned_model(
         )
         smoke_elapsed = time.perf_counter() - smoke_started
         timings["smoke_seconds"] = smoke_elapsed
+        generated_ids = _generated_token_ids(reloaded_tokenizer, smoke_result)
+        output_warnings = _smoke_output_warnings(smoke_result, generated_ids)
+        for warning in output_warnings:
+            logger.warning("generation smoke: %s", warning)
         smoke_metrics.update(
             {
                 "completed": True,
                 "elapsed_seconds": smoke_elapsed,
-                "generated_token_count": _count_generated_tokens(
-                    reloaded_tokenizer,
-                    smoke_result,
+                "generated_token_count": (
+                    None if generated_ids is None else len(generated_ids)
                 ),
                 "result_preview": _preview(smoke_result),
+                "output_warnings": output_warnings,
             }
         )
 
@@ -192,13 +198,21 @@ def generation_smoke(
             )
 
     # Guard against a degenerate pruned model that loops or stalls: bound the
-    # generation wall-clock time. SIGALRM is Unix-only; on platforms without
-    # it the timeout is a no-op rather than a hard failure.
+    # generation wall-clock time. SIGALRM is Unix-only and can only be
+    # installed from the main thread; elsewhere the timeout is skipped rather
+    # than failing the run.
     use_alarm = (
         timeout_seconds is not None
         and float(timeout_seconds) > 0
         and hasattr(signal, "SIGALRM")
     )
+    if use_alarm and threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "generation smoke runs outside the main thread; the %ss timeout "
+            "cannot be enforced there.",
+            timeout_seconds,
+        )
+        use_alarm = False
 
     def _run_generation() -> Any:
         return generate_fn(
@@ -542,7 +556,7 @@ def _validate_first_dim(
         )
 
 
-def _count_generated_tokens(tokenizer: Any, text: Any) -> int | None:
+def _generated_token_ids(tokenizer: Any, text: Any) -> list[Any] | None:
     if not isinstance(text, str):
         return None
 
@@ -561,9 +575,33 @@ def _count_generated_tokens(tokenizer: Any, text: Any) -> int | None:
         return None
 
     try:
-        return len(token_ids)
+        return list(token_ids)
     except TypeError:
         return None
+
+
+# A generation made of one token repeated this many times or more is flagged.
+_REPEATED_TOKEN_WARNING_MIN = 4
+
+
+def _smoke_output_warnings(text: Any, token_ids: list[Any] | None) -> list[str]:
+    """Flag smoke generations that suggest a broken pruned model.
+
+    The smoke test only proves that generation runs; these warnings are
+    recorded in telemetry instead of failing the run, because a healthy model
+    can also stop immediately for some prompts.
+    """
+    if not isinstance(text, str):
+        return []
+    if not text.strip():
+        return ["generated text is empty"]
+    if (
+        token_ids is not None
+        and len(token_ids) >= _REPEATED_TOKEN_WARNING_MIN
+        and len(set(token_ids)) == 1
+    ):
+        return [f"generated text repeats a single token {len(token_ids)} times"]
+    return []
 
 
 def _preview(value: Any, *, max_chars: int = 500) -> str | None:
