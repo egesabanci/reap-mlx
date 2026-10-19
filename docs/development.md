@@ -52,7 +52,9 @@ git diff --check
 ```
 
 CI runs the lockfile check, lint, tests, and CLI smoke on Python 3.12 (the
-required `tests` check), plus the test suite on Python 3.13.
+required `tests` check), plus the test suite on Python 3.13 and against the
+oldest mlx and mlx-lm that `pyproject.toml` allows (`mlx==0.31.0`,
+`mlx-lm==0.31.1`).
 
 ## Import-Safety Tests
 
