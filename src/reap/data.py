@@ -234,21 +234,82 @@ def _has_chat_template(tokenizer: Any | None) -> bool:
     return bool(getattr(tokenizer, "chat_template", None))
 
 
+# ShareGPT speaker names mapped to the chat-template roles they stand for.
+_SHAREGPT_ROLES = {
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "bot": "assistant",
+    "model": "assistant",
+    "system": "system",
+    "tool": "tool",
+    "function": "tool",
+}
+
+
+def _messages_for_chat_template(messages: list[Any]) -> list[dict[str, Any]] | None:
+    """Convert turns to the role/content messages chat templates expect.
+
+    ShareGPT-style turns ({"from": "human", "value": ...}) are renamed, and
+    multimodal content lists are reduced to their text. Returns None when a
+    turn has no role or content, so the caller falls back to plain text.
+    """
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            return None
+        message = dict(message)
+        if "role" not in message:
+            speaker = _normalize_content(_first_present(message, "from", "speaker"))
+            speaker = speaker.strip()
+            if not speaker:
+                return None
+            message["role"] = _SHAREGPT_ROLES.get(speaker.lower(), speaker)
+        content = message.get("content")
+        if content is None:
+            content = _first_present(message, "value", "text")
+        if content is None:
+            return None
+        message["content"] = (
+            content if isinstance(content, str) else _normalize_content(content)
+        )
+        normalized.append(message)
+    return normalized
+
+
+def _render_chat_template(tokenizer: Any, messages: list[dict[str, Any]]) -> Any:
+    apply_chat_template = tokenizer.apply_chat_template
+    try:
+        return apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except TypeError:
+        return apply_chat_template(messages, tokenize=False)
+
+
 def _messages_to_text(messages: Any, *, tokenizer: Any | None) -> str:
     if not isinstance(messages, list):
         return _normalize_content(messages)
 
-    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if _has_chat_template(tokenizer):
-        try:
-            rendered = apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        except TypeError:
-            rendered = apply_chat_template(messages, tokenize=False)
-        return _normalize_content(rendered)
+        template_messages = _messages_for_chat_template(messages)
+        if template_messages is not None:
+            try:
+                return _normalize_content(
+                    _render_chat_template(tokenizer, template_messages)
+                )
+            except Exception as exc:
+                # Templates can reject valid data (e.g. strict role alternation);
+                # keep the record as plain text rather than failing calibration.
+                logger.warning(
+                    "Chat template failed for a calibration record (%s: %s); "
+                    "using plain 'role: content' text instead.",
+                    type(exc).__name__,
+                    exc,
+                )
 
     parts = []
     for message in messages:

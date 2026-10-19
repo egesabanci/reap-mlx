@@ -304,6 +304,77 @@ def test_message_records_use_tokenizer_chat_template_when_available():
     np.testing.assert_array_equal(sequences[0]["input_ids"], [10, 12])
 
 
+def test_sharegpt_conversations_are_mapped_to_chat_template_roles():
+    tokenizer = ChatTokenizer()
+
+    text = extract_text(
+        {
+            "conversations": [
+                {"from": "system", "value": "Be brief."},
+                {"from": "human", "value": "Explain REAP."},
+                {"from": "gpt", "value": "REAP prunes experts."},
+            ]
+        },
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls[0]["messages"] == [
+        {"from": "system", "value": "Be brief.", "role": "system", "content": "Be brief."},
+        {"from": "human", "value": "Explain REAP.", "role": "user", "content": "Explain REAP."},
+        {
+            "from": "gpt",
+            "value": "REAP prunes experts.",
+            "role": "assistant",
+            "content": "REAP prunes experts.",
+        },
+    ]
+    assert text == "system:Be brief. user:Explain REAP. assistant:REAP prunes experts."
+
+
+def test_chat_template_receives_text_only_content_for_multimodal_messages():
+    tokenizer = ChatTokenizer()
+
+    extract_text(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this."},
+                        {"type": "image_url", "image_url": {"url": "x.png"}},
+                    ],
+                }
+            ]
+        },
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls[0]["messages"] == [
+        {"role": "user", "content": "Describe this."}
+    ]
+
+
+class RejectingChatTokenizer(ChatTokenizer):
+    def apply_chat_template(self, messages, **kwargs):
+        raise ValueError("Conversation roles must alternate user/assistant")
+
+
+def test_chat_template_errors_fall_back_to_role_content_text(caplog):
+    with caplog.at_level(logging.WARNING, logger="reap.data"):
+        text = extract_text(
+            {
+                "messages": [
+                    {"role": "user", "content": "One"},
+                    {"role": "user", "content": "Two"},
+                ]
+            },
+            tokenizer=RejectingChatTokenizer(),
+        )
+
+    assert text == "user: One\nuser: Two"
+    assert any("Chat template failed" in rec.message for rec in caplog.records)
+
+
 def test_conversation_records_fall_back_to_role_content_text():
     text = extract_text(
         {

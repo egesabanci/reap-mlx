@@ -102,6 +102,14 @@ add_generation_prompt=False
 If the tokenizer's chat template signature does not accept
 `add_generation_prompt`, the loader retries with `tokenize=False` only.
 
+Before rendering, turns are converted to the `role`/`content` shape chat
+templates expect: ShareGPT turns such as `{"from": "human", "value": ...}`
+become `{"role": "user", "content": ...}` (`gpt`/`bot`/`model` map to
+`assistant`), and multimodal content lists are reduced to their text parts.
+If the template still rejects a record (for example strict role alternation),
+the loader logs a warning and uses the plain text rendering below for that
+record.
+
 Without a chat template, each message is rendered as:
 
 ```txt
