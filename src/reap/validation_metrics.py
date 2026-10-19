@@ -132,6 +132,7 @@ class RunMetrics:
         self.data["run_config"].update(
             {
                 "model_name": model_name,
+                "revision": getattr(args, "revision", None),
                 "dataset_name": getattr(args, "dataset_name", None),
                 "dataset_config_name": getattr(args, "dataset_config_name", None),
                 "split": getattr(args, "split", None),
@@ -145,15 +146,74 @@ class RunMetrics:
                     getattr(args, "prune_method", None)
                 ),
                 "compression_ratio": getattr(args, "compression_ratio", None),
+                "skip_layer_indices": _json_safe(
+                    getattr(args, "skip_layer_indices", None)
+                ),
+                "prune_layer_indices": _json_safe(
+                    getattr(args, "prune_layer_indices", None)
+                ),
+                "per_layer_ratios": _json_safe(getattr(args, "per_layer_ratios", None)),
+                "target_experts": getattr(args, "target_experts", None),
+                "min_calibration_samples": getattr(
+                    args, "min_calibration_samples", None
+                ),
+                "allow_partial_calibration": bool(
+                    getattr(args, "allow_partial_calibration", False)
+                ),
+                "resume_from_checkpoint": getattr(args, "resume_from_checkpoint", None),
+                "strict_resume": getattr(args, "strict_resume", None),
                 "output_dir": str(getattr(args, "output_dir", self.output_dir)),
                 "metrics_file": str(getattr(args, "metrics_file", self.metrics_file)),
                 "smoke_enabled": not bool(getattr(args, "no_smoke", False)),
+                "smoke_prompt": getattr(args, "smoke_prompt", None),
+                "smoke_max_tokens": getattr(args, "smoke_max_tokens", None),
+                "eval_calibration_nll": bool(
+                    getattr(args, "eval_calibration_nll", False)
+                ),
+                "eval_calibration_sequences": getattr(
+                    args, "eval_calibration_sequences", None
+                ),
                 "replay_check_enabled": not bool(
                     getattr(args, "skip_replay_check", False)
                 ),
             }
         )
         self.data["model"]["model_name"] = model_name
+
+    def record_resume(
+        self,
+        checkpoint: Mapping[str, Any],
+        checkpoint_path: str | Path,
+    ) -> None:
+        """Record the checkpoint a resumed run re-applies and its prune plan.
+
+        On resume the prune decision comes from the checkpoint, so its plan
+        settings replace the (unused) CLI defaults in ``run_config``.
+        """
+        run_config = self.data["run_config"]
+        for key in (
+            "prune_method",
+            "compression_ratio",
+            "dataset_name",
+            "seed",
+            "max_samples",
+            "max_seq_length",
+            "skip_layer_indices",
+            "prune_layer_indices",
+            "per_layer_ratios",
+            "target_experts",
+        ):
+            run_config[key] = _json_safe(checkpoint.get(key))
+        run_config["resolved_prune_method"] = _resolve_method_or_none(
+            checkpoint.get("prune_method")
+        )
+        run_config["checkpoint"] = {
+            "path": str(checkpoint_path),
+            "version": checkpoint.get("version"),
+            "created_at": checkpoint.get("created_at"),
+            "model_name": checkpoint.get("model_name"),
+            "adapter_name": checkpoint.get("adapter_name"),
+        }
 
     def record_model_metadata(
         self,

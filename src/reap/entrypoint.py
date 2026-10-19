@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import inspect
 import logging
 import math
@@ -43,6 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the MLX-only REAP expert pruning pipeline.",
     )
     parser.add_argument("--model-name", required=True)
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help=(
+            "Hugging Face branch, tag, or commit to load --model-name at. The "
+            "resolved commit is recorded in the validation metrics."
+        ),
+    )
     parser.add_argument(
         "--dataset-name",
         default=None,
@@ -267,7 +276,8 @@ def main(
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
 
-    load_model_fn = _default_load_model if load_model_fn is None else load_model_fn
+    if load_model_fn is None:
+        load_model_fn = functools.partial(_default_load_model, revision=args.revision)
     load_calibration_sequences_fn = (
         load_calibration_sequences
         if load_calibration_sequences_fn is None
@@ -325,6 +335,9 @@ def main(
             raise ValueError("MLX-LM load must return a mapping config.")
         adapter = _infer_adapter_safely(model, config)
         metrics.record_model_metadata(model, config, adapter=adapter)
+        model_revision = _resolve_hub_revision(args.model_name, args.revision)
+        if model_revision is not None:
+            metrics.data["model"]["model_revision"] = model_revision
         if adapter is None:
             raise ValueError(unsupported_architecture_message(config))
         moe_layer_indices = adapter.identify_moe_layers(model)
@@ -340,6 +353,7 @@ def main(
             current_phase = "checkpoint_load"
             _emit(print_fn, f"resume: loading checkpoint {args.resume_from_checkpoint}")
             checkpoint = load_checkpoint(args.resume_from_checkpoint)
+            metrics.record_resume(checkpoint, args.resume_from_checkpoint)
             mismatches = []
             ckpt_model = checkpoint.get("model_name")
             if ckpt_model and not _same_model_reference(ckpt_model, args.model_name):
@@ -368,7 +382,12 @@ def main(
             _emit(print_fn, "resume: re-applying pruned experts from checkpoint")
             with metrics.phase("prune"):
                 keep_by_layer = apply_keep_indices_fn(
-                    model, config, checkpoint["keep_by_layer"], adapter=adapter,
+                    model,
+                    config,
+                    checkpoint["keep_by_layer"],
+                    adapter=adapter,
+                    skip_layer_indices=checkpoint.get("skip_layer_indices"),
+                    prune_layer_indices=checkpoint.get("prune_layer_indices"),
                 )
             for layer_idx in sorted(keep_by_layer):
                 _emit(
@@ -693,6 +712,7 @@ def _write_prune_checkpoint(
         skip_layer_indices=args.skip_layer_indices,
         prune_layer_indices=args.prune_layer_indices,
         per_layer_ratios=per_layer_ratios,
+        target_experts=args.target_experts,
         saliency_by_layer={
             int(idx): layer.get(resolved_method)
             for idx, layer in observer_data.items()
@@ -738,7 +758,11 @@ def _validate_positive_int(value: Any, name: str) -> None:
         raise ValueError(f"{name} must be a positive integer, got {value}.")
 
 
-def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
+def _default_load_model(
+    model_name: str,
+    *,
+    revision: str | None = None,
+) -> tuple[Any, Any, Mapping[str, Any]]:
     try:
         from mlx_lm import load
     except ModuleNotFoundError as exc:
@@ -746,8 +770,14 @@ def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
             "MLX entrypoint requires the optional 'mlx_lm' package to load models."
         ) from exc
 
+    load_kwargs: dict[str, Any] = {}
+    if revision is not None:
+        if not _supports_keyword(load, "revision"):
+            raise ValueError("The installed mlx-lm does not support --revision.")
+        load_kwargs["revision"] = revision
+
     if _supports_keyword(load, "return_config"):
-        loaded = load(model_name, return_config=True)
+        loaded = load(model_name, return_config=True, **load_kwargs)
         if not isinstance(loaded, tuple) or len(loaded) != 3:
             raise ValueError(
                 "Expected mlx_lm.load(..., return_config=True) to return "
@@ -755,7 +785,7 @@ def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
             )
         return loaded
 
-    loaded = load(model_name)
+    loaded = load(model_name, **load_kwargs)
     if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise ValueError(
             "Expected mlx_lm.load(...) to return (model, tokenizer)."
@@ -777,6 +807,28 @@ def _load_mlx_lm_config(model_name: str) -> Mapping[str, Any]:
     if not isinstance(config, Mapping):
         raise ValueError("MLX-LM load_config must return a mapping config.")
     return config
+
+
+def _resolve_hub_revision(model_name: str, revision: str | None) -> str | None:
+    """Return the Hub commit a model was loaded at, else the requested revision.
+
+    Local model paths have no Hub revision. The commit is read from the local
+    Hugging Face cache that mlx-lm populated while loading, so no network
+    request is made.
+    """
+    if Path(model_name).exists():
+        return None
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot = snapshot_download(
+            model_name,
+            revision=revision,
+            local_files_only=True,
+        )
+    except Exception:
+        return revision
+    return Path(snapshot).name
 
 
 def _supports_keyword(fn: Callable[..., Any], keyword: str) -> bool:

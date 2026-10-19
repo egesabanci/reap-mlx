@@ -58,7 +58,7 @@ environment.
 
 Run config records user-facing CLI inputs:
 
-- `model_name`
+- `model_name`, `revision`
 - `dataset_name`
 - `dataset_config_name`
 - `split`
@@ -66,14 +66,24 @@ Run config records user-facing CLI inputs:
 - `max_samples`
 - `max_seq_length`
 - `pack_calibration`
+- `min_calibration_samples`, `allow_partial_calibration`
 - `eval_frequency`
 - `prune_method`
 - `resolved_prune_method`
 - `compression_ratio`
+- `skip_layer_indices`, `prune_layer_indices`, `per_layer_ratios`,
+  `target_experts`
+- `resume_from_checkpoint`, `strict_resume`
 - `output_dir`
 - `metrics_file`
-- `smoke_enabled`
+- `smoke_enabled`, `smoke_prompt`, `smoke_max_tokens`
+- `eval_calibration_nll`, `eval_calibration_sequences`
 - `replay_check_enabled`
+
+On `--resume-from-checkpoint` the prune plan comes from the checkpoint, so its
+`prune_method`, `compression_ratio`, layer filters, `target_experts`, and
+calibration settings replace the unused CLI values, and `checkpoint` records the
+checkpoint's path, schema version, creation time, model name, and adapter.
 
 After calibration, it also records actual sample and token counts:
 
@@ -88,7 +98,8 @@ After calibration, it also records actual sample and token counts:
 
 Model telemetry includes adapter-visible metadata:
 
-- model name, revision, and source path when available;
+- model name, revision, and source path when available (for Hub models,
+  `model_revision` is the commit that was loaded, read from the local cache);
 - adapter name;
 - model type and architectures;
 - quantization metadata;

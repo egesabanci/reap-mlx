@@ -367,13 +367,7 @@ def prune_experts(
             num_experts=config_num_experts,
             top_k=config_top_k or config_num_experts,
         )
-        # Audit metadata for heterogeneous native layouts / selective plans.
-        config["reap_retained_experts_by_layer"] = {
-            str(int(k)): int(v) for k, v in sorted(final_counts.items())
-        }
-        config["reap_primary_prune_layers"] = [
-            int(i) for i in sorted(selected_set)
-        ]
+        _record_prune_audit(config, final_counts, selected_set)
 
     if total_pruned_global == 0:
         logger.warning(
@@ -391,6 +385,8 @@ def apply_keep_indices(
     keep_by_layer: Mapping[int, Any],
     *,
     adapter: Any | None = None,
+    skip_layer_indices: list[int] | None = None,
+    prune_layer_indices: list[int] | None = None,
 ) -> dict[int, np.ndarray]:
     """Re-apply a previously computed keep_by_layer to a fresh (unpruned) model.
 
@@ -401,6 +397,10 @@ def apply_keep_indices(
     every MoE layer from a single scalar expert count in config. All checks
     run before any weight is sliced, so a mismatched checkpoint leaves the
     model untouched.
+
+    ``skip_layer_indices`` / ``prune_layer_indices`` are the filters the plan
+    was made with; they only feed the ``reap_primary_prune_layers`` audit key,
+    so a resumed artifact records the same metadata as a fresh run.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
     _validate_adapter(adapter, config)
@@ -470,7 +470,24 @@ def apply_keep_indices(
         num_experts=retained_count,
         top_k=config_top_k,
     )
+    _record_prune_audit(
+        config,
+        retained_counts,
+        _select_moe_layers(moe_layer_indices, skip_layer_indices, prune_layer_indices),
+    )
     return result
+
+
+def _record_prune_audit(
+    config: MutableMapping[str, Any],
+    retained_by_layer: Mapping[int, int],
+    primary_layers: Any,
+) -> None:
+    """Record per-layer retained counts and primary-method layers in config."""
+    config["reap_retained_experts_by_layer"] = {
+        str(int(k)): int(v) for k, v in sorted(retained_by_layer.items())
+    }
+    config["reap_primary_prune_layers"] = [int(i) for i in sorted(primary_layers)]
 
 
 def _validate_keep_indices(

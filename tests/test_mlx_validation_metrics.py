@@ -385,6 +385,84 @@ def test_record_pruning_records_zero_removed_noop(tmp_path):
     assert p["per_layer"]["0"]["removed_expert_count"] == 0
 
 
+def test_record_run_config_records_every_plan_and_validation_flag(tmp_path):
+    from reap.entrypoint import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--model-name",
+            "org/model",
+            "--revision",
+            "v1.0",
+            "--dataset-name",
+            "data",
+            "--output-dir",
+            str(tmp_path),
+            "--skip-layer-indices",
+            "1",
+            "--prune-layer-indices",
+            "0",
+            "1",
+            "--per-layer-ratios",
+            "0:0.5",
+            "--target-experts",
+            "4",
+            "--min-calibration-samples",
+            "2",
+            "--allow-partial-calibration",
+            "--eval-calibration-nll",
+            "--smoke-max-tokens",
+            "7",
+        ]
+    )
+    metrics = RunMetrics(tmp_path)
+
+    metrics.record_run_config(args)
+
+    run_config = metrics.data["run_config"]
+    assert run_config["revision"] == "v1.0"
+    assert run_config["skip_layer_indices"] == [1]
+    assert run_config["prune_layer_indices"] == [0, 1]
+    assert run_config["per_layer_ratios"] == ["0:0.5"]
+    assert run_config["target_experts"] == 4
+    assert run_config["min_calibration_samples"] == 2
+    assert run_config["allow_partial_calibration"] is True
+    assert run_config["eval_calibration_nll"] is True
+    assert run_config["eval_calibration_sequences"] == 8
+    assert run_config["smoke_max_tokens"] == 7
+    assert run_config["strict_resume"] is True
+    assert run_config["resume_from_checkpoint"] is None
+
+
+def test_record_resume_replaces_cli_defaults_with_the_checkpoint_plan(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    metrics.record_run_config(
+        SimpleNamespace(model_name="m", prune_method="reap", compression_ratio=0.25)
+    )
+
+    metrics.record_resume(
+        {
+            "version": 3,
+            "created_at": "2026-10-19T00:00:00+00:00",
+            "model_name": "m",
+            "adapter_name": "qwen3_moe",
+            "prune_method": "frequency",
+            "compression_ratio": 0.5,
+            "target_experts": None,
+            "skip_layer_indices": [1],
+        },
+        tmp_path / "reap-checkpoint.json",
+    )
+
+    run_config = metrics.data["run_config"]
+    assert run_config["prune_method"] == "frequency"
+    assert run_config["resolved_prune_method"] == "expert_frequency"
+    assert run_config["compression_ratio"] == 0.5
+    assert run_config["skip_layer_indices"] == [1]
+    assert run_config["checkpoint"]["version"] == 3
+    assert run_config["checkpoint"]["path"] == str(tmp_path / "reap-checkpoint.json")
+
+
 def test_record_pruning_reads_mixtral_expert_counts(tmp_path):
     metrics = RunMetrics(tmp_path)
     metrics.record_pruning(

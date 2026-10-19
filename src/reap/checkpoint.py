@@ -19,8 +19,9 @@ from typing import Any, Mapping
 
 # v1: keep indices + basic metadata
 # v2: adds dataset/seed/layer filters/saliency summaries for auditability
-_CHECKPOINT_VERSION = 2
-_SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, 2})
+# v3: adds target_experts so the full prune plan can be reproduced
+_CHECKPOINT_VERSION = 3
+_SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, 2, 3})
 
 
 def atomic_write_text(path: str | Path, text: str) -> Path:
@@ -77,6 +78,7 @@ def write_checkpoint(
     skip_layer_indices: list[int] | None = None,
     prune_layer_indices: list[int] | None = None,
     per_layer_ratios: dict[int, float] | None = None,
+    target_experts: int | None = None,
     saliency_by_layer: Mapping[int, Any] | None = None,
     observer_token_totals: Mapping[int, int] | None = None,
 ) -> Path:
@@ -127,6 +129,7 @@ def write_checkpoint(
             if per_layer_ratios is None
             else {str(int(k)): float(v) for k, v in per_layer_ratios.items()}
         ),
+        "target_experts": None if target_experts is None else int(target_experts),
         "observer_token_totals": (
             None
             if observer_token_totals is None
@@ -144,7 +147,7 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
     """Load a checkpoint written by :func:`write_checkpoint`.
 
     Returns the payload with ``keep_by_layer`` keys converted back to ints.
-    Supports checkpoint schema versions 1 and 2.
+    Supports checkpoint schema versions 1, 2, and 3.
     """
     path = Path(path)
     payload = json.loads(path.read_text(encoding="utf-8"))

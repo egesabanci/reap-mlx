@@ -984,6 +984,67 @@ def _resume(tmp_path, model_name, checkpoint_path, *extra_args):
     return code, applied
 
 
+def test_resume_records_the_checkpoint_plan_instead_of_cli_defaults(tmp_path):
+    checkpoint = _write_resume_checkpoint(tmp_path)
+
+    code, _ = _resume(tmp_path, "model", checkpoint)
+
+    assert code == 0
+    payload = json.loads((tmp_path / "out" / "validation-metrics.json").read_text())
+    assert payload["run_config"]["compression_ratio"] == 0.5
+    assert payload["run_config"]["checkpoint"]["path"] == str(checkpoint)
+    assert payload["run_config"]["resume_from_checkpoint"] == str(checkpoint)
+
+
+def test_default_loader_passes_revision_to_mlx_lm(monkeypatch):
+    import mlx_lm
+
+    from reap.entrypoint import _default_load_model
+
+    calls = []
+
+    def fake_load(model_name, return_config=False, revision=None):
+        calls.append((model_name, return_config, revision))
+        return object(), object(), {"model_type": "qwen3_moe"}
+
+    monkeypatch.setattr(mlx_lm, "load", fake_load)
+
+    _default_load_model("org/model", revision="abc123")
+
+    assert calls == [("org/model", True, "abc123")]
+
+
+def test_resolve_hub_revision_reads_the_cached_snapshot_commit(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from reap.entrypoint import _resolve_hub_revision
+
+    snapshot = tmp_path / "snapshots" / "0123abcd"
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda repo_id, revision=None, local_files_only=False: str(snapshot),
+    )
+
+    assert _resolve_hub_revision("org/model", "main") == "0123abcd"
+    # Local paths have no Hub revision.
+    assert _resolve_hub_revision(str(tmp_path), None) is None
+
+
+def test_resolve_hub_revision_falls_back_to_the_requested_revision(monkeypatch):
+    import huggingface_hub
+
+    from reap.entrypoint import _resolve_hub_revision
+
+    def not_cached(repo_id, revision=None, local_files_only=False):
+        raise FileNotFoundError(repo_id)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", not_cached)
+
+    assert _resolve_hub_revision("org/model", "v2") == "v2"
+    assert _resolve_hub_revision("org/model", None) is None
+
+
 def test_resume_accepts_another_spelling_of_the_same_local_model_path(tmp_path):
     model_dir = tmp_path / "local-model"
     model_dir.mkdir()

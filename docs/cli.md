@@ -24,6 +24,7 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 
 | Option | Default | Description |
 | --- | --- | --- |
+| `--revision` | unset | Hugging Face branch, tag, or commit for `--model-name`; the resolved commit is recorded in telemetry. |
 | `--split` | `train` | Dataset split passed to `load_dataset`. |
 | `--dataset-config-name` | unset | Optional Hugging Face dataset config name. |
 | `--prune-method` | `reap` | Saliency key or alias used to rank experts. |

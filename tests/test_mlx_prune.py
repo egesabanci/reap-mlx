@@ -846,6 +846,40 @@ def test_prune_experts_validates_every_layer_before_mutating():
     assert config["num_experts"] == 4
 
 
+def test_apply_keep_indices_records_the_same_audit_keys_as_a_fresh_prune():
+    observer_data = {
+        0: {
+            "reap": np.array([0.1, 0.9, 0.2, 0.8]),
+            "expert_frequency": np.array([1, 4, 2, 3]),
+        },
+        1: {
+            "reap": np.array([0.3, 0.7, 0.4, 0.6]),
+            "expert_frequency": np.array([5, 1, 1, 1]),
+        },
+    }
+    fresh_config = qwen_config(num_experts=4, top_k=3)
+    keep_by_layer = prune_experts(
+        make_multi_moe_model(num_layers=2, num_experts=4, top_k=3),
+        fresh_config,
+        observer_data,
+        "reap",
+        0.5,
+        skip_layer_indices=[1],
+    )
+    resumed_config = qwen_config(num_experts=4, top_k=3)
+
+    apply_keep_indices(
+        make_multi_moe_model(num_layers=2, num_experts=4, top_k=3),
+        resumed_config,
+        keep_by_layer,
+        skip_layer_indices=[1],
+    )
+
+    for key in ("reap_retained_experts_by_layer", "reap_primary_prune_layers"):
+        assert resumed_config[key] == fresh_config[key]
+    assert resumed_config["reap_primary_prune_layers"] == [0]
+
+
 def test_apply_keep_indices_rejects_missing_moe_layers_before_mutating():
     model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
     config = qwen_config(num_experts=4, top_k=3)
