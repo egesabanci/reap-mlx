@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -907,6 +908,93 @@ def test_main_resume_skips_observe_and_prune_and_applies_checkpoint(tmp_path):
     assert "save" in events
     # The checkpoint keep indices were forwarded to apply_keep_indices.
     assert apply_calls == [{0: [1, 3]}]
+
+
+def _write_resume_checkpoint(tmp_path, *, model_name="model", config_before_prune=None):
+    import numpy as np
+    from reap.checkpoint import write_checkpoint
+
+    return write_checkpoint(
+        tmp_path / "checkpoint" / "reap-checkpoint.json",
+        keep_by_layer={0: np.array([1, 3])},
+        config_before_prune=config_before_prune or {"num_experts": 4},
+        model_name=model_name,
+        prune_method="reap",
+        compression_ratio=0.5,
+        adapter_name="qwen3_moe",
+    )
+
+
+def _resume(tmp_path, model_name, checkpoint_path, *extra_args):
+    applied = []
+
+    def fake_apply(model_arg, config_arg, keep_by_layer, **kwargs):
+        applied.append(keep_by_layer)
+        return dict(keep_by_layer)
+
+    code = main(
+        [
+            "--model-name",
+            model_name,
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--resume-from-checkpoint",
+            str(checkpoint_path),
+            "--no-smoke",
+            *extra_args,
+        ],
+        load_model_fn=lambda name: (*_moe_model_and_config(),),
+        apply_keep_indices_fn=fake_apply,
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path / "out"
+        ),
+        print_fn=lambda message: None,
+    )
+    return code, applied
+
+
+def test_resume_accepts_another_spelling_of_the_same_local_model_path(tmp_path):
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    checkpoint = _write_resume_checkpoint(tmp_path, model_name=str(model_dir))
+
+    code, applied = _resume(tmp_path, f"{model_dir}/", checkpoint)
+
+    assert code == 0
+    assert applied
+
+
+def test_resume_rejects_a_checkpoint_made_for_a_different_layout(tmp_path):
+    checkpoint = _write_resume_checkpoint(
+        tmp_path,
+        config_before_prune={"num_experts": 8, "num_hidden_layers": 1},
+    )
+
+    with pytest.raises(ValueError, match="made for 8 experts per layer"):
+        _resume(tmp_path, "model", checkpoint)
+
+
+def test_no_strict_resume_downgrades_layout_mismatch_to_a_warning(tmp_path, caplog):
+    checkpoint = _write_resume_checkpoint(
+        tmp_path,
+        config_before_prune={"num_experts": 8},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="reap.entrypoint"):
+        code, applied = _resume(tmp_path, "model", checkpoint, "--no-strict-resume")
+
+    assert code == 0
+    assert applied
+    assert any("made for 8 experts" in record.message for record in caplog.records)
+
+
+def test_strict_resume_flag_is_accepted_explicitly(tmp_path):
+    checkpoint = _write_resume_checkpoint(tmp_path)
+
+    code, applied = _resume(tmp_path, "model", checkpoint, "--strict-resume")
+
+    assert code == 0
+    assert applied
 
 
 def test_main_resume_requires_existing_checkpoint_file(tmp_path):

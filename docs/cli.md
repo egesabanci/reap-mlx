@@ -36,7 +36,7 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 | `--allow-partial-calibration` | off | Allow fewer than the min sample floor, both when loading and when out-of-memory stops observation early. |
 | `--eval-calibration-nll` | off | After reload, compute mean next-token NLL on calibration data. |
 | `--resume-from-checkpoint` | unset | Re-apply keep indices and retry save only. |
-| `--strict-resume` / `--no-strict-resume` | strict on | Require checkpoint model/adapter to match. |
+| `--strict-resume` / `--no-strict-resume` | strict on | Require the checkpoint's model, adapter, and pre-prune config to match (warn instead when off). |
 | `--max-samples` | `128` | Maximum non-empty calibration samples. |
 | `--num-calibration-sequences` | alias | Alias for `--max-samples`. |
 | `--max-seq-length` | `2048` | Maximum tokens per calibration sequence. |

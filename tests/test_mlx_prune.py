@@ -789,6 +789,33 @@ def test_apply_keep_indices_reproduces_prune_result_on_fresh_model():
     assert fresh_config["num_experts"] == 2
 
 
+def test_apply_keep_indices_rejects_missing_moe_layers_before_mutating():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+
+    with pytest.raises(ValueError, match=r"missing MoE layers \[1\]"):
+        apply_keep_indices(model, config, {0: np.array([1, 3])})
+
+    assert model.model.layers[0].mlp.num_experts == 4
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 4
+    assert config["num_experts"] == 4
+
+
+def test_apply_keep_indices_rejects_non_uniform_counts_before_mutating():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+
+    with pytest.raises(ValueError, match="non-uniform retained counts"):
+        apply_keep_indices(
+            model,
+            config,
+            {0: np.array([1, 3]), 1: np.array([0, 1, 2])},
+        )
+
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 4
+    assert config["num_experts"] == 4
+
+
 def test_apply_keep_indices_rejects_non_moe_layer_index():
     model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
     config = qwen_config(num_experts=4, top_k=3)

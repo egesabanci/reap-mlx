@@ -384,21 +384,22 @@ def apply_keep_indices(
 
     This is the resume path for pipeline checkpointing: it slices each MoE
     layer's experts to the provided retained indices without re-running
-    observation or saliency. ``keep_by_layer`` must have uniform retained
-    counts because mlx-lm reload rebuilds every MoE layer from a single
-    scalar ``num_experts`` in config.
+    observation or saliency. ``keep_by_layer`` must cover exactly the model's
+    MoE layers with uniform retained counts, because mlx-lm reload rebuilds
+    every MoE layer from a single scalar expert count in config. All checks
+    run before any weight is sliced, so a mismatched checkpoint leaves the
+    model untouched.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
     _validate_adapter(adapter, config)
     layers = adapter.layers(model)
-    config_num_experts: int | None = None
-    config_top_k: int | None = None
-    result: dict[int, np.ndarray] = {}
 
     if not keep_by_layer:
         raise ValueError("keep_by_layer must contain at least one MoE layer.")
 
-    for layer_idx, keep in keep_by_layer.items():
+    plan: list[tuple[int, Any, Any, np.ndarray]] = []
+    for layer_idx, keep in sorted(keep_by_layer.items()):
+        layer_idx = int(layer_idx)
         if layer_idx < 0 or layer_idx >= len(layers):
             raise ValueError(
                 f"keep_by_layer layer index {layer_idx} is out of range "
@@ -415,9 +416,32 @@ def apply_keep_indices(
         keep_indices = _validate_keep_indices(
             keep,
             num_experts=layer_config.num_experts,
-            layer_idx=int(layer_idx),
+            layer_idx=layer_idx,
         )
-        retained_count = int(len(keep_indices))
+        plan.append((layer_idx, moe, layer_config, keep_indices))
+
+    moe_layer_indices = sorted(adapter.identify_moe_layers(model))
+    missing = sorted(set(moe_layer_indices) - {layer_idx for layer_idx, *_ in plan})
+    if missing:
+        raise ValueError(
+            f"keep_by_layer is missing MoE layers {missing}. It must cover every "
+            f"MoE layer of the loaded model ({moe_layer_indices}) because "
+            "mlx-lm reloads all of them with the same expert count. Ensure the "
+            "checkpoint matches the loaded model."
+        )
+    retained_counts = {
+        layer_idx: len(keep_indices) for layer_idx, _, _, keep_indices in plan
+    }
+    if len(set(retained_counts.values())) > 1:
+        raise ValueError(
+            "keep_by_layer has non-uniform retained counts "
+            f"{retained_counts}; mlx-lm reload requires a uniform expert count."
+        )
+    retained_count = next(iter(retained_counts.values()))
+
+    result: dict[int, np.ndarray] = {}
+    config_top_k = retained_count
+    for layer_idx, moe, layer_config, keep_indices in plan:
         _prune_switch_moe_layer(
             moe,
             keep_indices,
@@ -425,28 +449,15 @@ def apply_keep_indices(
             old_top_k=layer_config.top_k,
             layer_idx=layer_idx,
         )
-        new_top_k = min(layer_config.top_k, retained_count)
-        if config_num_experts is None:
-            config_num_experts = retained_count
-            config_top_k = new_top_k
-        elif config_num_experts != retained_count:
-            raise ValueError(
-                "keep_by_layer has non-uniform retained counts; mlx-lm "
-                "reload requires a uniform num_experts. Layer "
-                f"{layer_idx} retains {retained_count}, expected "
-                f"{config_num_experts}."
-            )
-        else:
-            config_top_k = min(config_top_k or new_top_k, new_top_k)
+        config_top_k = min(config_top_k, layer_config.top_k)
         result[layer_idx] = keep_indices
 
-    if config_num_experts is not None:
-        update_moe_config(
-            config,
-            adapter_name=adapter.adapter_name,
-            num_experts=config_num_experts,
-            top_k=config_top_k or config_num_experts,
-        )
+    update_moe_config(
+        config,
+        adapter_name=adapter.adapter_name,
+        num_experts=retained_count,
+        top_k=config_top_k,
+    )
     return result
 
 

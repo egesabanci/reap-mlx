@@ -13,7 +13,11 @@ from typing import Any
 
 from reap.checkpoint import load_checkpoint, write_checkpoint
 from reap.data import load_calibration_sequences
-from reap.model_adapters import infer_model_adapter, unsupported_architecture_message
+from reap.model_adapters import (
+    config_num_experts,
+    infer_model_adapter,
+    unsupported_architecture_message,
+)
 from reap.observer import observe_model
 from reap.prune import (
     apply_keep_indices,
@@ -150,18 +154,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--strict-resume",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "On --resume-from-checkpoint, error when checkpoint model_name "
-            "or adapter_name does not match the loaded model (default: on)."
+            "On --resume-from-checkpoint, error (instead of warning) when the "
+            "checkpoint's model name, adapter, or pre-prune config does not "
+            "match the loaded model."
         ),
-    )
-    parser.add_argument(
-        "--no-strict-resume",
-        action="store_false",
-        dest="strict_resume",
-        help="Allow resume when checkpoint model/adapter metadata mismatches.",
     )
     parser.add_argument(
         "--eval-frequency",
@@ -341,24 +340,29 @@ def main(
             current_phase = "checkpoint_load"
             _emit(print_fn, f"resume: loading checkpoint {args.resume_from_checkpoint}")
             checkpoint = load_checkpoint(args.resume_from_checkpoint)
+            mismatches = []
             ckpt_model = checkpoint.get("model_name")
-            if ckpt_model and ckpt_model != args.model_name:
-                message = (
-                    f"Checkpoint was created for model {ckpt_model!r} but "
-                    f"--model-name is {args.model_name!r}."
+            if ckpt_model and not _same_model_reference(ckpt_model, args.model_name):
+                mismatches.append(
+                    f"it was created for model {ckpt_model!r} but --model-name "
+                    f"is {args.model_name!r}"
                 )
+            ckpt_adapter = checkpoint.get("adapter_name")
+            if ckpt_adapter and ckpt_adapter != adapter.adapter_name:
+                mismatches.append(
+                    f"its adapter {ckpt_adapter!r} differs from the inferred "
+                    f"adapter {adapter.adapter_name!r}"
+                )
+            mismatches.extend(
+                _config_mismatches(checkpoint.get("config_before_prune"), config)
+            )
+            if mismatches:
+                message = "Checkpoint does not match the loaded model: " + "; ".join(
+                    mismatches
+                ) + "."
                 if args.strict_resume:
                     raise ValueError(message + " Pass --no-strict-resume to override.")
                 logger.warning("%s Keep indices may not apply correctly.", message)
-            ckpt_adapter = checkpoint.get("adapter_name")
-            if ckpt_adapter and ckpt_adapter != adapter.adapter_name:
-                message = (
-                    f"Checkpoint adapter {ckpt_adapter!r} differs from inferred "
-                    f"adapter {adapter.adapter_name!r}."
-                )
-                if args.strict_resume:
-                    raise ValueError(message + " Pass --no-strict-resume to override.")
-                logger.warning("%s", message)
             config_before_prune = copy.deepcopy(config)
             current_phase = "prune"
             _emit(print_fn, "resume: re-applying pruned experts from checkpoint")
@@ -765,6 +769,47 @@ def _infer_adapter_safely(model: Any, config: Mapping[str, Any]) -> Any | None:
             f"{unsupported_architecture_message(config)} "
             f"Underlying error: {exc.__class__.__name__}: {exc}"
         ) from exc
+
+
+def _same_model_reference(first: str, second: str) -> bool:
+    """Compare model references, resolving spellings of the same local path."""
+    first_path, second_path = Path(first), Path(second)
+    if first_path.exists() and second_path.exists():
+        return first_path.resolve() == second_path.resolve()
+    return str(first).rstrip("/") == str(second).rstrip("/")
+
+
+# Config facts that must agree between a checkpoint and the model it is
+# re-applied to: keep indices are only meaningful for the same layout.
+_RESUME_CONFIG_KEYS = ("model_type", "num_hidden_layers", "hidden_size")
+
+
+def _config_mismatches(
+    checkpoint_config: Mapping[str, Any] | None,
+    config: Mapping[str, Any],
+) -> list[str]:
+    """Describe structural differences between a checkpoint and the model."""
+    if not checkpoint_config:
+        return []
+    mismatches = []
+    for key in _RESUME_CONFIG_KEYS:
+        expected, actual = checkpoint_config.get(key), config.get(key)
+        if expected is not None and actual is not None and expected != actual:
+            mismatches.append(
+                f"config {key} was {expected!r}, the model has {actual!r}"
+            )
+    expected_experts = config_num_experts(checkpoint_config)
+    actual_experts = config_num_experts(config)
+    if (
+        expected_experts is not None
+        and actual_experts is not None
+        and expected_experts != actual_experts
+    ):
+        mismatches.append(
+            f"the checkpoint was made for {expected_experts} experts per layer, "
+            f"the model has {actual_experts}"
+        )
+    return mismatches
 
 
 def _observed_sequence_count(

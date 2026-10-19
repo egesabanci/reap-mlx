@@ -21,11 +21,20 @@ Resume branch (`--resume-from-checkpoint`):
 
 ```txt
 model_load
-  -> checkpoint_load
-  -> apply_keep_indices
+  -> checkpoint_load         # model name, adapter, and pre-prune config must match
+  -> apply_keep_indices      # validates every layer before slicing anything
   -> save_reload_smoke
   -> metrics write
 ```
+
+On resume, the checkpoint's model name (local paths compared after resolving),
+adapter, and pre-prune config (`model_type`, `num_hidden_layers`,
+`hidden_size`, expert count) must match the loaded model. Mismatches raise
+unless `--no-strict-resume` is passed, in which case they are logged as
+warnings. `apply_keep_indices` then requires keep indices for exactly the
+model's MoE layers with a uniform retained count, and checks all of it before
+slicing, so a mismatched checkpoint leaves the model and the output directory
+untouched.
 
 | Phase | Main function | Responsibility | Output |
 | --- | --- | --- | --- |
