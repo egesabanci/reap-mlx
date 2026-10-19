@@ -29,7 +29,7 @@ function that needs those packages executes.
 | [Save Reload Validation](save-reload-validation.md) | Artifact saving, reload checks, shape validation, and smoke generation. |
 | [CLI](cli.md) | Command-line options, examples, wrapper script, and failure behavior. |
 | [Telemetry](telemetry.md) | `validation-metrics.json` schema and interpretation guide. |
-| [Eval](eval.md) | Calibration NLL and third-party evaluation recipes. |
+| [Eval](eval.md) | Held-out NLL comparison and external evaluation harnesses. |
 | [Development](development.md) | Test commands, import-safety checks, and extension workflow. |
 
 ## Core Guarantees
@@ -42,8 +42,9 @@ REAP MLX currently guarantees:
 - observation replays model layers and collects selected-expert statistics only;
 - pruning mutates live MLX-LM-style modules by slicing expert-stacked arrays on
   dimension 0;
-- `num_experts` and `num_experts_per_tok` are updated after pruning, with top-k
-  clamped to the retained expert count;
+- `num_experts` (`num_local_experts` for Mixtral/PhiMoE) and
+  `num_experts_per_tok` are updated after pruning, with top-k clamped to the
+  retained expert count;
 - saved artifacts are reloaded and validated before a run is considered
   successful;
 - every run writes structured telemetry, including failure telemetry when the
@@ -53,8 +54,12 @@ REAP MLX currently guarantees:
 
 | Adapter | Model family | MoE module location | Notes |
 | --- | --- | --- | --- |
-| `lfm2_moe` | Liquid LFM2.5 MoE MLX-LM models | `layer.feed_forward` | Supports attention and conv/SSM operators plus optional `expert_bias`. |
-| `qwen3_moe` | Qwen3-MoE MLX-LM-style models | `layer.mlp` | Default adapter when LFM2 cannot be inferred. |
+| `lfm2_moe` | Liquid LFM2.5 MoE MLX-LM models (`lfm2_moe`) | `layer.feed_forward` | Supports attention and conv/SSM operators plus optional `expert_bias`. |
+| `qwen3_moe` | Qwen2-MoE, Qwen3-MoE, OLMoE (`qwen2_moe`, `qwen3_moe`, `olmoe`) | `layer.mlp` | Optional (gated) shared expert. |
+| `mixtral_moe` | Mixtral, PhiMoE (`mixtral`, `phimoe`) | `layer.block_sparse_moe` | Config uses `num_local_experts`. |
+
+Other model types are rejected even when their module layout matches, because
+their routing differs (see [Model Adapters](model-adapters.md)).
 
 The implementation assumes a uniform post-pruning expert count across MoE
 layers because the saved config uses a single global `num_experts` value.

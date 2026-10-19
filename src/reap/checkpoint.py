@@ -12,14 +12,34 @@ runtime packages.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 # v1: keep indices + basic metadata
 # v2: adds dataset/seed/layer filters/saliency summaries for auditability
-_CHECKPOINT_VERSION = 2
-_SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, 2})
+# v3: adds target_experts so the full prune plan can be reproduced
+_CHECKPOINT_VERSION = 3
+_SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, 2, 3})
+
+
+def atomic_write_text(path: str | Path, text: str) -> Path:
+    """Write ``text`` to ``path`` through a temporary file and an atomic rename.
+
+    A crash or interrupt mid-write leaves the previous file intact instead of
+    a truncated JSON document.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def _jsonable(value: Any) -> Any:
@@ -58,6 +78,7 @@ def write_checkpoint(
     skip_layer_indices: list[int] | None = None,
     prune_layer_indices: list[int] | None = None,
     per_layer_ratios: dict[int, float] | None = None,
+    target_experts: int | None = None,
     saliency_by_layer: Mapping[int, Any] | None = None,
     observer_token_totals: Mapping[int, int] | None = None,
 ) -> Path:
@@ -69,20 +90,14 @@ def write_checkpoint(
     """
     serialised_keep: dict[str, list[int]] = {}
     for layer_idx, keep in keep_by_layer.items():
-        if hasattr(keep, "tolist"):
-            keep_list = keep.tolist()
-        else:
-            keep_list = list(keep)
+        keep_list = keep.tolist() if hasattr(keep, "tolist") else list(keep)
         serialised_keep[str(int(layer_idx))] = [int(x) for x in keep_list]
 
     serialised_saliency: dict[str, list[float]] | None = None
     if saliency_by_layer:
         serialised_saliency = {}
         for layer_idx, scores in saliency_by_layer.items():
-            if hasattr(scores, "tolist"):
-                values = scores.tolist()
-            else:
-                values = list(scores)
+            values = scores.tolist() if hasattr(scores, "tolist") else list(scores)
             serialised_saliency[str(int(layer_idx))] = [float(x) for x in values]
 
     payload = {
@@ -108,6 +123,7 @@ def write_checkpoint(
             if per_layer_ratios is None
             else {str(int(k)): float(v) for k, v in per_layer_ratios.items()}
         ),
+        "target_experts": None if target_experts is None else int(target_experts),
         "observer_token_totals": (
             None
             if observer_token_totals is None
@@ -118,20 +134,14 @@ def write_checkpoint(
         "keep_by_layer": serialised_keep,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-    return path
+    return atomic_write_text(path, json.dumps(payload, indent=2, allow_nan=False))
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
     """Load a checkpoint written by :func:`write_checkpoint`.
 
     Returns the payload with ``keep_by_layer`` keys converted back to ints.
-    Supports checkpoint schema versions 1 and 2.
+    Supports checkpoint schema versions 1, 2, and 3.
     """
     path = Path(path)
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -163,4 +173,4 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-__all__ = ["write_checkpoint", "load_checkpoint"]
+__all__ = ["atomic_write_text", "write_checkpoint", "load_checkpoint"]

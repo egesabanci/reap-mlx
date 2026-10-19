@@ -6,18 +6,23 @@ default save, load, or generation helpers are executed.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import logging
 import signal
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from reap.model_adapters import infer_model_adapter
-
+from reap.model_adapters import (
+    config_num_experts,
+    infer_model_adapter,
+    unsupported_architecture_message,
+)
 
 _WEIGHT_PATTERNS = ("*.safetensors", "*.npz")
 logger = logging.getLogger(__name__)
@@ -53,6 +58,7 @@ def save_pruned_model(
 ) -> SaveReloadResult:
     """Save a pruned model, reload it, and validate the reloaded artifact."""
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
+    _reject_source_model_dir(Path(output_dir), original_model_name)
     output_path = _prepare_output_dir(output_dir)
     expected_count = _expected_expert_count(config, expected_expert_count)
     save_fn = _default_save_fn() if save_fn is None else save_fn
@@ -86,20 +92,13 @@ def save_pruned_model(
 
     # If adapter inference failed on the original model, try the reloaded model
     if adapter is None:
-        try:
+        with contextlib.suppress(Exception):
             adapter = infer_model_adapter(reloaded_model, reloaded_config)
-        except Exception:
-            pass
     if adapter is None:
         # Neither the original nor the reloaded model exposed a supported MoE
         # architecture. Fail with a clear message instead of a confusing
         # AttributeError deep in _validate_reloaded_model_shapes.
-        raise ValueError(
-            "Cannot detect a supported MoE architecture. REAP currently "
-            "supports Qwen3-MoE and LFM2-MoE models. Ensure the model config "
-            "exposes a recognized model_type/architectures, or pass an "
-            "explicit adapter.",
-        )
+        raise ValueError(unsupported_architecture_message(config))
     validation_started = time.perf_counter()
     _validate_reloaded_config(reloaded_config, expected_count)
     _validate_reloaded_model_shapes(
@@ -119,6 +118,7 @@ def save_pruned_model(
         "elapsed_seconds": None,
         "generated_token_count": None,
         "result_preview": None,
+        "output_warnings": [],
     }
     if smoke_fn is not None:
         smoke_started = time.perf_counter()
@@ -129,15 +129,19 @@ def save_pruned_model(
         )
         smoke_elapsed = time.perf_counter() - smoke_started
         timings["smoke_seconds"] = smoke_elapsed
+        generated_ids = _generated_token_ids(reloaded_tokenizer, smoke_result)
+        output_warnings = _smoke_output_warnings(smoke_result, generated_ids)
+        for warning in output_warnings:
+            logger.warning("generation smoke: %s", warning)
         smoke_metrics.update(
             {
                 "completed": True,
                 "elapsed_seconds": smoke_elapsed,
-                "generated_token_count": _count_generated_tokens(
-                    reloaded_tokenizer,
-                    smoke_result,
+                "generated_token_count": (
+                    None if generated_ids is None else len(generated_ids)
                 ),
                 "result_preview": _preview(smoke_result),
+                "output_warnings": output_warnings,
             }
         )
 
@@ -192,13 +196,21 @@ def generation_smoke(
             )
 
     # Guard against a degenerate pruned model that loops or stalls: bound the
-    # generation wall-clock time. SIGALRM is Unix-only; on platforms without
-    # it the timeout is a no-op rather than a hard failure.
+    # generation wall-clock time. SIGALRM is Unix-only and can only be
+    # installed from the main thread; elsewhere the timeout is skipped rather
+    # than failing the run.
     use_alarm = (
         timeout_seconds is not None
         and float(timeout_seconds) > 0
         and hasattr(signal, "SIGALRM")
     )
+    if use_alarm and threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "generation smoke runs outside the main thread; the %ss timeout "
+            "cannot be enforced there.",
+            timeout_seconds,
+        )
+        use_alarm = False
 
     def _run_generation() -> Any:
         return generate_fn(
@@ -223,6 +235,22 @@ def generation_smoke(
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old_handler)
+
+
+def _reject_source_model_dir(
+    output_path: Path,
+    original_model_name: str | Path,
+) -> None:
+    source_path = Path(original_model_name)
+    if (
+        source_path.exists()
+        and output_path.exists()
+        and source_path.resolve() == output_path.resolve()
+    ):
+        raise ValueError(
+            f"Refusing to save into the source model directory {output_path}: "
+            "cleaning it would delete the original weights."
+        )
 
 
 def _prepare_output_dir(output_dir: str | Path) -> Path:
@@ -260,11 +288,11 @@ def _expected_expert_count(
 ) -> int:
     value = expected_expert_count
     if value is None:
-        value = config.get("num_experts")
+        value = config_num_experts(config)
     if value is None:
         raise ValueError(
-            "expected_expert_count is required when config['num_experts'] "
-            "is missing."
+            "expected_expert_count is required when the config has neither "
+            "'num_experts' nor 'num_local_experts'."
         )
     value = int(value)
     if value < 1:
@@ -423,10 +451,11 @@ def _validate_reloaded_config(
     reloaded_config: Mapping[str, Any],
     expected_expert_count: int,
 ) -> None:
-    actual = reloaded_config.get("num_experts")
+    actual = config_num_experts(reloaded_config)
     if actual is None:
-        raise ValueError("Reloaded config is missing 'num_experts'.")
-    actual = int(actual)
+        raise ValueError(
+            "Reloaded config is missing 'num_experts' / 'num_local_experts'."
+        )
     if actual != expected_expert_count:
         raise ValueError(
             "Reloaded config expert count mismatch: "
@@ -525,7 +554,7 @@ def _validate_first_dim(
         )
 
 
-def _count_generated_tokens(tokenizer: Any, text: Any) -> int | None:
+def _generated_token_ids(tokenizer: Any, text: Any) -> list[Any] | None:
     if not isinstance(text, str):
         return None
 
@@ -544,9 +573,33 @@ def _count_generated_tokens(tokenizer: Any, text: Any) -> int | None:
         return None
 
     try:
-        return len(token_ids)
+        return list(token_ids)
     except TypeError:
         return None
+
+
+# A generation made of one token repeated this many times or more is flagged.
+_REPEATED_TOKEN_WARNING_MIN = 4
+
+
+def _smoke_output_warnings(text: Any, token_ids: list[Any] | None) -> list[str]:
+    """Flag smoke generations that suggest a broken pruned model.
+
+    The smoke test only proves that generation runs; these warnings are
+    recorded in telemetry instead of failing the run, because a healthy model
+    can also stop immediately for some prompts.
+    """
+    if not isinstance(text, str):
+        return []
+    if not text.strip():
+        return ["generated text is empty"]
+    if (
+        token_ids is not None
+        and len(token_ids) >= _REPEATED_TOKEN_WARNING_MIN
+        and len(set(token_ids)) == 1
+    ):
+        return [f"generated text repeats a single token {len(token_ids)} times"]
+    return []
 
 
 def _preview(value: Any, *, max_chars: int = 500) -> str | None:

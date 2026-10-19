@@ -133,9 +133,13 @@ The pruning pipeline is intentionally linear and inspectable.
 
 | Adapter | Model family | Status |
 | --- | --- | --- |
-| `lfm2_moe` | Liquid LFM2.5 MoE MLX-LM models | Validated with `LiquidAI/LFM2.5-8B-A1B-MLX-4bit` |
-| `qwen3_moe` | Qwen2/3-MoE, OLMoE, DeepSeek MoE (`mlp.switch_mlp`) | Adapter + unit coverage |
-| `mixtral_moe` | Mixtral / PhiMoE (`block_sparse_moe.switch_mlp`) | Adapter + unit coverage |
+| `lfm2_moe` | Liquid LFM2.5 MoE (`lfm2_moe`) | Validated with `LiquidAI/LFM2.5-8B-A1B-MLX-4bit` |
+| `qwen3_moe` | Qwen2-MoE, Qwen3-MoE, OLMoE (`qwen2_moe`, `qwen3_moe`, `olmoe`) | Tiny-model end-to-end coverage (bf16 + 4-bit) |
+| `mixtral_moe` | Mixtral, PhiMoE (`mixtral`, `phimoe`) | Tiny-model end-to-end coverage (bf16 + 4-bit) |
+
+Only these model types are accepted. Architectures that reuse a supported
+module layout but route differently (for example DeepSeek, GLM4-MoE, or
+MiniMax) are rejected up front instead of being pruned with the wrong routing.
 
 Adding a model family should usually mean adding or extending an adapter in
 `src/reap/model_adapters.py`, router logic in `src/reap/router.py`, and pruning
@@ -169,7 +173,9 @@ Higher scores are kept.
 For LFM2 models with `use_expert_bias=True`, residual routing still uses
 bias-adjusted scores, but REAP saliency accumulation uses **pure softmax**
 probabilities at the selected indices so ranking is not distorted by additive
-bias.
+bias. The replay follows mlx-lm's LFM2-MoE routing, which differs from the
+Hugging Face reference implementation; see
+[observation and metrics](docs/observation-and-metrics.md#lfm2-router-semantics).
 
 `--compression-ratio` must be in `[0, 1)`. For each MoE layer, REAP MLX prunes
 `int(num_experts * compression_ratio)` experts and always keeps at least one
@@ -188,21 +194,34 @@ Core options:
 | Option | Default | Description |
 | --- | --- | --- |
 | `--model-name` | required | MLX-LM model path or Hugging Face repo id. |
-| `--dataset-name` | required | Hugging Face dataset name for calibration. |
+| `--revision` | unset | Hugging Face branch, tag, or commit to load. |
+| `--dataset-name` | required | Hugging Face dataset name for calibration (not needed with `--resume-from-checkpoint`). |
 | `--split` | `train` | Dataset split. |
 | `--dataset-config-name` | unset | Optional dataset config name. |
+| `--dataset-streaming` | off | Stream the split instead of preparing the whole dataset. |
 | `--prune-method` | `reap` | Saliency metric used for expert ranking. |
 | `--compression-ratio` | `0.25` | Fraction of experts to remove per MoE layer. |
+| `--target-experts` | unset | Retain exactly N experts per MoE layer instead of using a ratio. |
 | `--max-samples` | `128` | Number of non-empty calibration samples. |
 | `--max-seq-length` | `2048` | Maximum token length per calibration sample. |
+| `--pack-calibration` | off | Pack samples into full `--max-seq-length` sequences (REAP reference behaviour). |
 | `--eval-frequency` | `1` | Evaluate the MLX graph every N observation layers. |
 | `--seed` | `42` | Dataset shuffle seed when shuffle is available. |
-| `--output-dir` | required | Directory for the pruned MLX-LM artifact. |
+| `--output-dir` | required | Directory for the pruned MLX-LM artifact (never the source model directory). |
 | `--metrics-file` | `validation-metrics.json` | Metrics filename or absolute path. |
+| `--eval-calibration-nll` | off | Compare held-out NLL of the unpruned and pruned model. |
+| `--resume-from-checkpoint` | unset | Re-apply a saved prune decision and retry only save/reload. |
 | `--verbose` | off | Print pipeline progress. |
 | `--no-smoke` | off | Skip generation smoke after save/reload validation. |
 | `--smoke-prompt` | `What is your name?` | Prompt for generation smoke validation. |
 | `--smoke-max-tokens` | `16` | Maximum tokens for generation smoke validation. |
+
+Selective pruning (`--skip-layer-indices`, `--prune-layer-indices`,
+`--per-layer-ratios`), calibration minimums
+(`--min-calibration-samples`, `--allow-partial-calibration`), resume
+strictness (`--strict-resume` / `--no-strict-resume`), and the observer
+replay check (`--skip-replay-check`) are described in the full
+[CLI reference](docs/cli.md).
 
 ## Metrics
 
@@ -253,8 +272,10 @@ reap-mlx/
     *.md
   src/
     reap/
+      checkpoint.py
       data.py
       entrypoint.py
+      eval_nll.py
       metrics.py
       model_adapters.py
       observer.py
@@ -263,7 +284,7 @@ reap-mlx/
       save.py
       validation_metrics.py
   tests/
-    test_mlx_*.py
+    test_mlx_*.py        # test_mlx_e2e.py runs tiny real mlx-lm models
 ```
 
 ## Development
@@ -280,9 +301,10 @@ Run tests:
 uv run python -m pytest -q tests/test_mlx_*.py
 ```
 
-Run import-safety and CLI smoke checks:
+Run lint, import-safety, and CLI smoke checks:
 
 ```bash
+uv run ruff check src tests
 uv run python -c "import reap; import reap.entrypoint"
 uv run python -m reap.entrypoint --help
 uv lock --check
@@ -296,11 +318,11 @@ git diff --check
 
 ## Evaluation
 
-- Optional **calibration NLL** after reload: `--eval-calibration-nll`
-- Longer recipe and third-party harness notes: [docs/eval.md](docs/eval.md)
-
-The `third-party/` directory holds reference evaluation stacks (EvalPlus,
-LiveCodeBench, HELM, etc.). They are not run by CI; see `docs/eval.md`.
+- Optional **held-out NLL** comparison of the unpruned and pruned model:
+  `--eval-calibration-nll`
+- Task benchmarks are out of scope for this repository; see
+  [docs/eval.md](docs/eval.md) for how to evaluate a saved artifact with
+  external harnesses.
 
 ## License
 

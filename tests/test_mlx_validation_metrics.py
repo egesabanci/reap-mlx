@@ -225,7 +225,6 @@ def test_run_metrics_writes_failure_payload(tmp_path):
 
 def test_run_metrics_write_survives_non_finite_values(tmp_path):
     """write() must never crash on NaN/Inf in metrics data (failure telemetry)."""
-    import math
 
     metrics = RunMetrics(tmp_path, clock=FakeClock())
     # Inject NaN/Inf directly into the metrics payload -- _json_safe should
@@ -234,7 +233,10 @@ def test_run_metrics_write_survives_non_finite_values(tmp_path):
     metrics.data["inf_value"] = float("inf")
     metrics.data["nested"] = {"bad": [float("nan"), float("-inf"), 1.0]}
 
-    path = metrics.write(status="failed", failure=metrics.failure_payload("observe", RuntimeError("x")))
+    path = metrics.write(
+        status="failed",
+        failure=metrics.failure_payload("observe", RuntimeError("x")),
+    )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
@@ -301,7 +303,11 @@ def test_record_observer_counts_non_finite_saliency(tmp_path):
     metrics = RunMetrics(tmp_path)
     observer_data = {
         0: {"total_tokens": 2, "expert_frequency": [1, 1], "reap": [0.5, 2.0]},
-        1: {"total_tokens": 3, "expert_frequency": [1, 0], "reap": [float("nan"), float("inf")]},
+        1: {
+            "total_tokens": 3,
+            "expert_frequency": [1, 0],
+            "reap": [float("nan"), float("inf")],
+        },
     }
     metrics.record_observer(observer_data, "reap")
 
@@ -313,6 +319,33 @@ def test_record_observer_counts_non_finite_saliency(tmp_path):
     assert obs["per_layer"]["0"]["saliency_finite_count"] == 2
     assert obs["per_layer"]["1"]["saliency_non_finite_count"] == 2
     assert obs["per_layer"]["1"]["saliency_finite_count"] == 0
+
+
+def test_record_observer_reports_replay_parity_error(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    observer_data = {
+        0: {"total_tokens": 2, "reap": [0.5, 2.0], "replay_parity_error": 0.0},
+        1: {"total_tokens": 2, "reap": [0.5, 2.0]},
+    }
+    metrics.record_observer(observer_data, "reap")
+
+    per_layer = metrics.data["observer"]["per_layer"]
+    assert per_layer["0"]["replay_parity_error"] == 0.0
+    assert per_layer["1"]["replay_parity_error"] is None
+    assert metrics.data["observer"]["observed_sequences"] is None
+
+
+def test_record_observer_reports_fewest_observed_sequences(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    metrics.record_observer(
+        {
+            0: {"total_tokens": 4, "reap": [1.0], "observed_sequences": 2},
+            1: {"total_tokens": 4, "reap": [1.0], "observed_sequences": 2},
+        },
+        "reap",
+    )
+
+    assert metrics.data["observer"]["observed_sequences"] == 2
 
 
 def test_record_observer_empty_observer_data(tmp_path):
@@ -356,6 +389,101 @@ def test_record_pruning_records_zero_removed_noop(tmp_path):
     assert p["total_experts_removed"] == 0
     assert p["per_layer"]["0"]["retained_expert_count"] == 4
     assert p["per_layer"]["0"]["removed_expert_count"] == 0
+
+
+def test_record_run_config_records_every_plan_and_validation_flag(tmp_path):
+    from reap.entrypoint import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--model-name",
+            "org/model",
+            "--revision",
+            "v1.0",
+            "--dataset-name",
+            "data",
+            "--output-dir",
+            str(tmp_path),
+            "--skip-layer-indices",
+            "1",
+            "--prune-layer-indices",
+            "0",
+            "1",
+            "--per-layer-ratios",
+            "0:0.5",
+            "--target-experts",
+            "4",
+            "--min-calibration-samples",
+            "2",
+            "--allow-partial-calibration",
+            "--eval-calibration-nll",
+            "--smoke-max-tokens",
+            "7",
+        ]
+    )
+    metrics = RunMetrics(tmp_path)
+
+    metrics.record_run_config(args)
+
+    run_config = metrics.data["run_config"]
+    assert run_config["revision"] == "v1.0"
+    assert run_config["skip_layer_indices"] == [1]
+    assert run_config["prune_layer_indices"] == [0, 1]
+    assert run_config["per_layer_ratios"] == ["0:0.5"]
+    assert run_config["target_experts"] == 4
+    assert run_config["min_calibration_samples"] == 2
+    assert run_config["allow_partial_calibration"] is True
+    assert run_config["eval_calibration_nll"] is True
+    assert run_config["eval_calibration_sequences"] == 8
+    assert run_config["smoke_max_tokens"] == 7
+    assert run_config["strict_resume"] is True
+    assert run_config["resume_from_checkpoint"] is None
+
+
+def test_record_resume_replaces_cli_defaults_with_the_checkpoint_plan(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    metrics.record_run_config(
+        SimpleNamespace(model_name="m", prune_method="reap", compression_ratio=0.25)
+    )
+
+    metrics.record_resume(
+        {
+            "version": 3,
+            "created_at": "2026-10-19T00:00:00+00:00",
+            "model_name": "m",
+            "adapter_name": "qwen3_moe",
+            "prune_method": "frequency",
+            "compression_ratio": 0.5,
+            "target_experts": None,
+            "skip_layer_indices": [1],
+        },
+        tmp_path / "reap-checkpoint.json",
+    )
+
+    run_config = metrics.data["run_config"]
+    assert run_config["prune_method"] == "frequency"
+    assert run_config["resolved_prune_method"] == "expert_frequency"
+    assert run_config["compression_ratio"] == 0.5
+    assert run_config["skip_layer_indices"] == [1]
+    assert run_config["checkpoint"]["version"] == 3
+    assert run_config["checkpoint"]["path"] == str(tmp_path / "reap-checkpoint.json")
+
+
+def test_record_pruning_reads_mixtral_expert_counts(tmp_path):
+    metrics = RunMetrics(tmp_path)
+    metrics.record_pruning(
+        {0: [0, 2]},
+        config_before={"num_local_experts": 4, "num_experts_per_tok": 2},
+        config_after={"num_local_experts": 2, "num_experts_per_tok": 2},
+        observer_data={},
+    )
+
+    p = metrics.data["pruning"]
+    assert p["expert_count_before"] == 4
+    assert p["expert_count_after"] == 2
+    assert p["per_layer"]["0"]["original_expert_count"] == 4
+    assert p["per_layer"]["0"]["removed_expert_count"] == 2
+    assert metrics.data["model"]["expert_count_after"] == 2
 
 
 def test_derive_throughput_returns_none_when_no_phase_data(tmp_path):

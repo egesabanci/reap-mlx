@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import inspect
 import logging
 import math
@@ -13,7 +14,11 @@ from typing import Any
 
 from reap.checkpoint import load_checkpoint, write_checkpoint
 from reap.data import load_calibration_sequences
-from reap.model_adapters import infer_model_adapter
+from reap.model_adapters import (
+    config_num_experts,
+    infer_model_adapter,
+    unsupported_architecture_message,
+)
 from reap.observer import observe_model
 from reap.prune import (
     apply_keep_indices,
@@ -24,8 +29,12 @@ from reap.prune import (
 from reap.save import generation_smoke, save_pruned_model
 from reap.validation_metrics import RunMetrics
 
-
 logger = logging.getLogger(__name__)
+
+# Files a previous reap-mlx run leaves in its output directory.
+_REAP_OUTPUT_MARKERS = ("reap-checkpoint.json", "validation-metrics.json")
+# Files the save step deletes from the output directory before writing.
+_MODEL_ARTIFACT_PATTERNS = ("config.json", "*.safetensors", "*.npz")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the MLX-only REAP expert pruning pipeline.",
     )
     parser.add_argument("--model-name", required=True)
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help=(
+            "Hugging Face branch, tag, or commit to load --model-name at. The "
+            "resolved commit is recorded in the validation metrics."
+        ),
+    )
     parser.add_argument(
         "--dataset-name",
         default=None,
@@ -54,6 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--split", default="train")
     parser.add_argument("--dataset-config-name")
+    parser.add_argument(
+        "--dataset-streaming",
+        action="store_true",
+        help=(
+            "Stream calibration records from the requested split instead of "
+            "downloading and preparing the whole dataset (useful for large "
+            "corpora). Shuffling then uses the datasets streaming buffer."
+        ),
+    )
     parser.add_argument("--prune-method", default="reap")
     parser.add_argument(
         "--compression-ratio",
@@ -135,19 +161,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument(
-        "--strict-resume",
+        "--pack-calibration",
         action="store_true",
-        default=True,
         help=(
-            "On --resume-from-checkpoint, error when checkpoint model_name "
-            "or adapter_name does not match the loaded model (default: on)."
+            "Concatenate calibration samples into sequences of exactly "
+            "--max-seq-length tokens, like the REAP reference implementation. "
+            "--max-samples then counts packed sequences."
         ),
     )
     parser.add_argument(
-        "--no-strict-resume",
-        action="store_false",
-        dest="strict_resume",
-        help="Allow resume when checkpoint model/adapter metadata mismatches.",
+        "--strict-resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "On --resume-from-checkpoint, error (instead of warning) when the "
+            "checkpoint's model name, adapter, or pre-prune config does not "
+            "match the loaded model."
+        ),
     )
     parser.add_argument(
         "--eval-frequency",
@@ -156,6 +186,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Evaluate the MLX graph every N layers during observation. "
             "Higher values reduce GPU syncs but increase peak memory."
+        ),
+    )
+    parser.add_argument(
+        "--skip-replay-check",
+        action="store_true",
+        help=(
+            "Skip the first-sequence check that the observer's layer replay "
+            "matches the model's own MoE forward pass. Only use this if the "
+            "check fails for a reason you have verified is benign."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -245,7 +284,8 @@ def main(
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
 
-    load_model_fn = _default_load_model if load_model_fn is None else load_model_fn
+    if load_model_fn is None:
+        load_model_fn = functools.partial(_default_load_model, revision=args.revision)
     load_calibration_sequences_fn = (
         load_calibration_sequences
         if load_calibration_sequences_fn is None
@@ -295,6 +335,9 @@ def main(
             logger.warning("Could not clear stale metrics %s: %s", stale_metrics, exc)
 
     calibration_sequences: list[Any] = []
+    eval_sequences: list[Any] = []
+    evaluation_set: str | None = None
+    baseline_nll: Mapping[str, Any] | None = None
     try:
         _emit(print_fn, "load: loading MLX-LM model")
         with metrics.phase("model_load"):
@@ -303,18 +346,17 @@ def main(
             raise ValueError("MLX-LM load must return a mapping config.")
         adapter = _infer_adapter_safely(model, config)
         metrics.record_model_metadata(model, config, adapter=adapter)
+        model_revision = _resolve_hub_revision(args.model_name, args.revision)
+        if model_revision is not None:
+            metrics.data["model"]["model_revision"] = model_revision
         if adapter is None:
-            raise ValueError(
-                "Could not determine the MoE architecture adapter for this model. "
-                "REAP pruning currently supports Qwen3-MoE, LFM2-MoE, and "
-                "Mixtral-style block_sparse_moe architectures. "
-                f"Model type: {config.get('model_type', 'unknown')}."
-            )
+            raise ValueError(unsupported_architecture_message(config))
         moe_layer_indices = adapter.identify_moe_layers(model)
         if not moe_layer_indices:
             raise ValueError(
-                f"Model has no MoE layers detected by the {adapter.adapter_name} adapter. "
-                "REAP pruning requires an MoE model with at least one MoE layer."
+                "Model has no MoE layers detected by the "
+                f"{adapter.adapter_name} adapter. REAP pruning requires an MoE "
+                "model with at least one MoE layer."
             )
         metrics.sample_memory("after_model_load")
         per_layer_ratios = _parse_per_layer_ratios(args.per_layer_ratios)
@@ -323,36 +365,43 @@ def main(
             current_phase = "checkpoint_load"
             _emit(print_fn, f"resume: loading checkpoint {args.resume_from_checkpoint}")
             checkpoint = load_checkpoint(args.resume_from_checkpoint)
+            metrics.record_resume(checkpoint, args.resume_from_checkpoint)
+            mismatches = []
             ckpt_model = checkpoint.get("model_name")
-            if ckpt_model and ckpt_model != args.model_name:
-                message = (
-                    f"Checkpoint was created for model {ckpt_model!r} but "
-                    f"--model-name is {args.model_name!r}."
+            if ckpt_model and not _same_model_reference(ckpt_model, args.model_name):
+                mismatches.append(
+                    f"it was created for model {ckpt_model!r} but --model-name "
+                    f"is {args.model_name!r}"
                 )
+            ckpt_adapter = checkpoint.get("adapter_name")
+            if ckpt_adapter and ckpt_adapter != adapter.adapter_name:
+                mismatches.append(
+                    f"its adapter {ckpt_adapter!r} differs from the inferred "
+                    f"adapter {adapter.adapter_name!r}"
+                )
+            mismatches.extend(
+                _config_mismatches(checkpoint.get("config_before_prune"), config)
+            )
+            if mismatches:
+                message = "Checkpoint does not match the loaded model: " + "; ".join(
+                    mismatches
+                ) + "."
                 if args.strict_resume:
                     raise ValueError(message + " Pass --no-strict-resume to override.")
                 logger.warning("%s Keep indices may not apply correctly.", message)
-            ckpt_adapter = checkpoint.get("adapter_name")
-            if ckpt_adapter and ckpt_adapter != adapter.adapter_name:
-                message = (
-                    f"Checkpoint adapter {ckpt_adapter!r} differs from inferred "
-                    f"adapter {adapter.adapter_name!r}."
-                )
-                if args.strict_resume:
-                    raise ValueError(message + " Pass --no-strict-resume to override.")
-                logger.warning("%s", message)
             config_before_prune = copy.deepcopy(config)
             current_phase = "prune"
             _emit(print_fn, "resume: re-applying pruned experts from checkpoint")
             with metrics.phase("prune"):
                 keep_by_layer = apply_keep_indices_fn(
-                    model, config, checkpoint["keep_by_layer"], adapter=adapter,
+                    model,
+                    config,
+                    checkpoint["keep_by_layer"],
+                    adapter=adapter,
+                    skip_layer_indices=checkpoint.get("skip_layer_indices"),
+                    prune_layer_indices=checkpoint.get("prune_layer_indices"),
                 )
-            for layer_idx in sorted(keep_by_layer):
-                _emit(
-                    print_fn,
-                    f"keep: layer {layer_idx} -> {list(map(int, keep_by_layer[layer_idx]))}",
-                )
+            _emit_keep_indices(print_fn, keep_by_layer)
             metrics.record_pruning(
                 keep_by_layer,
                 config_before=config_before_prune,
@@ -376,16 +425,37 @@ def main(
 
             current_phase = "calibration"
             _emit(print_fn, "calibrate: loading calibration sequences")
+            # With NLL evaluation, load extra sequences and hold them out of
+            # observation so the quality signal is not measured on the data
+            # that chose the experts.
+            holdout_count = (
+                args.eval_calibration_sequences if args.eval_calibration_nll else 0
+            )
             with metrics.phase("calibration"):
-                calibration_sequences = load_calibration_sequences_fn(
+                loaded_sequences = load_calibration_sequences_fn(
                     tokenizer,
                     args.dataset_name,
                     split=args.split,
                     dataset_config_name=args.dataset_config_name,
-                    max_samples=args.max_samples,
+                    max_samples=args.max_samples + holdout_count,
                     max_seq_length=args.max_seq_length,
                     seed=args.seed,
+                    pack=args.pack_calibration,
+                    streaming=args.dataset_streaming,
                 )
+            calibration_sequences = list(loaded_sequences[: args.max_samples])
+            if args.eval_calibration_nll:
+                eval_sequences = list(loaded_sequences[args.max_samples :])
+                evaluation_set = "held_out"
+                if not eval_sequences:
+                    logger.warning(
+                        "No calibration records left to hold out for NLL "
+                        "evaluation; measuring NLL on the observed sequences."
+                    )
+                    eval_sequences = calibration_sequences[
+                        : args.eval_calibration_sequences
+                    ]
+                    evaluation_set = "calibration"
             if not calibration_sequences:
                 raise RuntimeError("No non-empty calibration sequences were loaded.")
             min_samples = (
@@ -417,13 +487,38 @@ def main(
                     config,
                     eval_frequency=args.eval_frequency,
                     print_fn=print_fn,
+                    verify_replay=not args.skip_replay_check,
                 )
             metrics.record_observer(observer_data, args.prune_method)
             if not observer_data:
                 raise RuntimeError(
-                    "Observer returned no data. The model may have no observable MoE layers "
-                    "or the adapter could not identify them."
+                    "Observer returned no data. The model may have no observable "
+                    "MoE layers or the adapter could not identify them."
                 )
+            observed_sequences = _observed_sequence_count(observer_data)
+            if (
+                observed_sequences is not None
+                and observed_sequences < len(calibration_sequences)
+            ):
+                _emit(
+                    print_fn,
+                    f"observe: only {observed_sequences}/"
+                    f"{len(calibration_sequences)} calibration sequences were "
+                    "observed before running out of memory",
+                )
+                if (
+                    not args.allow_partial_calibration
+                    and observed_sequences < min_samples
+                ):
+                    raise RuntimeError(
+                        f"Observation stopped after {observed_sequences} of "
+                        f"{len(calibration_sequences)} calibration sequences "
+                        f"(out of memory), but {min_samples} are required "
+                        "(--min-calibration-samples / default --max-samples). "
+                        "Reduce --max-seq-length or --max-samples, free memory, "
+                        "or pass --allow-partial-calibration to prune with "
+                        "fewer sequences."
+                    )
             total_observer_tokens = sum(
                 int(layer.get("total_tokens", 0)) for layer in observer_data.values()
             )
@@ -444,9 +539,45 @@ def main(
                 )
             metrics.sample_memory("after_observe")
 
+            if args.eval_calibration_nll:
+                current_phase = "eval_baseline_nll"
+                _emit(print_fn, "eval: baseline NLL on the unpruned model")
+                from reap.eval_nll import calibration_mean_nll
+
+                with metrics.phase("eval_baseline_nll"):
+                    baseline_nll = calibration_mean_nll(
+                        model,
+                        eval_sequences,
+                        max_sequences=args.eval_calibration_sequences,
+                        max_seq_length=args.max_seq_length,
+                    )
+
             current_phase = "prune"
             _emit(print_fn, "prune: mutating selected experts")
             config_before_prune = copy.deepcopy(config)
+            checkpoint_path = Path(args.output_dir) / "reap-checkpoint.json"
+            checkpoint_written = False
+
+            def persist_prune_plan(planned_keep_by_layer: Mapping[int, Any]) -> None:
+                # Persist the prune decision before any weight is sliced, so a
+                # failed prune or save can be resumed without re-running the
+                # expensive observation. A failed write aborts before mutation.
+                nonlocal checkpoint_written
+                _write_prune_checkpoint(
+                    checkpoint_path,
+                    planned_keep_by_layer,
+                    args=args,
+                    adapter_name=adapter.adapter_name,
+                    config_before_prune=config_before_prune,
+                    per_layer_ratios=per_layer_ratios,
+                    observer_data=observer_data,
+                )
+                checkpoint_written = True
+                _emit(
+                    print_fn,
+                    f"checkpoint: wrote prune decision to {checkpoint_path}",
+                )
+
             with metrics.phase("prune"):
                 keep_by_layer = prune_experts_fn(
                     model,
@@ -458,7 +589,12 @@ def main(
                     prune_layer_indices=args.prune_layer_indices,
                     per_layer_ratios=per_layer_ratios,
                     target_experts=args.target_experts,
+                    on_plan=persist_prune_plan,
                 )
+            if not checkpoint_written:
+                # Injected prune functions may not call on_plan; still leave a
+                # resume checkpoint behind.
+                persist_prune_plan(keep_by_layer)
             metrics.record_pruning(
                 keep_by_layer,
                 config_before=config_before_prune,
@@ -466,43 +602,7 @@ def main(
                 observer_data=observer_data,
             )
             metrics.sample_memory("after_prune")
-
-            # Persist the prune decision so a failed save can be resumed without
-            # re-running the expensive observe + prune phases. Fail closed so
-            # users always have a recovery artifact after a successful prune.
-            checkpoint_path = Path(args.output_dir) / "reap-checkpoint.json"
-            resolved_method = resolve_prune_method(args.prune_method)
-            write_checkpoint(
-                checkpoint_path,
-                keep_by_layer=keep_by_layer,
-                config_before_prune=config_before_prune,
-                model_name=args.model_name,
-                prune_method=args.prune_method,
-                compression_ratio=args.compression_ratio,
-                adapter_name=adapter.adapter_name,
-                dataset_name=args.dataset_name,
-                seed=args.seed,
-                max_samples=args.max_samples,
-                max_seq_length=args.max_seq_length,
-                skip_layer_indices=args.skip_layer_indices,
-                prune_layer_indices=args.prune_layer_indices,
-                per_layer_ratios=per_layer_ratios,
-                saliency_by_layer={
-                    int(idx): layer.get(resolved_method)
-                    for idx, layer in observer_data.items()
-                    if resolved_method in layer
-                },
-                observer_token_totals={
-                    int(idx): int(layer.get("total_tokens", 0))
-                    for idx, layer in observer_data.items()
-                },
-            )
-            _emit(print_fn, f"checkpoint: wrote prune decision to {checkpoint_path}")
-            for layer_idx in sorted(keep_by_layer):
-                _emit(
-                    print_fn,
-                    f"keep: layer {layer_idx} -> {list(map(int, keep_by_layer[layer_idx]))}",
-                )
+            _emit_keep_indices(print_fn, keep_by_layer)
 
         current_phase = "save_reload_smoke"
         _emit(print_fn, "save: saving pruned model and validating reload")
@@ -521,7 +621,7 @@ def main(
         metrics.record_save_reload(result, adapter=adapter)
         metrics.sample_memory("after_save_reload_smoke")
 
-        if args.eval_calibration_nll and calibration_sequences:
+        if args.eval_calibration_nll and eval_sequences:
             current_phase = "eval_calibration_nll"
             _emit(print_fn, "eval: calibration mean NLL on reloaded model")
             from reap.eval_nll import calibration_mean_nll
@@ -529,15 +629,20 @@ def main(
             with metrics.phase("eval_calibration_nll"):
                 nll_payload = calibration_mean_nll(
                     result.reloaded_model,
-                    calibration_sequences,
+                    eval_sequences,
                     max_sequences=args.eval_calibration_sequences,
                     max_seq_length=args.max_seq_length,
                 )
-            metrics.data["quality"] = nll_payload
+            metrics.data["quality"] = _quality_payload(
+                nll_payload,
+                baseline_nll,
+                evaluation_set=evaluation_set,
+            )
             _emit(
                 print_fn,
                 f"eval: nll status={nll_payload.get('status')} "
-                f"mean_nll={nll_payload.get('mean_nll')}",
+                f"mean_nll={nll_payload.get('mean_nll')} "
+                f"baseline={(baseline_nll or {}).get('mean_nll')}",
             )
         elif args.eval_calibration_nll and not calibration_sequences:
             metrics.data["quality"] = {
@@ -589,12 +694,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--resume-from-checkpoint file not found: {args.resume_from_checkpoint}."
         )
+    _validate_output_dir(args)
     _validate_positive_int(args.max_samples, "max_samples")
     _validate_positive_int(args.max_seq_length, "max_seq_length")
     _validate_positive_int(args.eval_frequency, "eval_frequency")
     _validate_positive_int(args.smoke_max_tokens, "smoke_max_tokens")
     if args.min_calibration_samples is not None:
         _validate_positive_int(args.min_calibration_samples, "min_calibration_samples")
+        if int(args.min_calibration_samples) > int(args.max_samples):
+            raise ValueError(
+                f"--min-calibration-samples ({args.min_calibration_samples}) "
+                f"cannot exceed --max-samples ({args.max_samples}); at most "
+                "--max-samples sequences are ever loaded."
+            )
     if args.target_experts is not None:
         _validate_positive_int(args.target_experts, "target_experts")
     if args.eval_calibration_sequences is not None:
@@ -619,10 +731,98 @@ def _validate_args(args: argparse.Namespace) -> None:
     parsed_ratios = _parse_per_layer_ratios(args.per_layer_ratios)
     if parsed_ratios:
         for layer_idx, layer_ratio in parsed_ratios.items():
-            if not math.isfinite(layer_ratio) or layer_ratio < 0.0 or layer_ratio >= 1.0:
+            if not math.isfinite(layer_ratio) or not 0.0 <= layer_ratio < 1.0:
                 raise ValueError(
-                    f"per_layer_ratios[{layer_idx}] must be in [0, 1), got {layer_ratio}."
+                    f"per_layer_ratios[{layer_idx}] must be in [0, 1), "
+                    f"got {layer_ratio}."
                 )
+
+
+def _quality_payload(
+    nll: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None,
+    *,
+    evaluation_set: str | None,
+) -> dict[str, Any]:
+    """Combine pruned and baseline NLL into the telemetry ``quality`` block."""
+    payload = dict(nll)
+    payload["evaluation_set"] = evaluation_set
+    payload["baseline"] = None if baseline is None else dict(baseline)
+    pruned_nll = nll.get("mean_nll")
+    baseline_nll = None if baseline is None else baseline.get("mean_nll")
+    payload["delta_mean_nll"] = (
+        float(pruned_nll) - float(baseline_nll)
+        if pruned_nll is not None and baseline_nll is not None
+        else None
+    )
+    return payload
+
+
+def _write_prune_checkpoint(
+    checkpoint_path: Path,
+    keep_by_layer: Mapping[int, Any],
+    *,
+    args: argparse.Namespace,
+    adapter_name: str,
+    config_before_prune: Mapping[str, Any],
+    per_layer_ratios: dict[int, float] | None,
+    observer_data: Mapping[int, Mapping[str, Any]],
+) -> None:
+    resolved_method = resolve_prune_method(args.prune_method)
+    write_checkpoint(
+        checkpoint_path,
+        keep_by_layer=keep_by_layer,
+        config_before_prune=config_before_prune,
+        model_name=args.model_name,
+        prune_method=args.prune_method,
+        compression_ratio=args.compression_ratio,
+        adapter_name=adapter_name,
+        dataset_name=args.dataset_name,
+        seed=args.seed,
+        max_samples=args.max_samples,
+        max_seq_length=args.max_seq_length,
+        skip_layer_indices=args.skip_layer_indices,
+        prune_layer_indices=args.prune_layer_indices,
+        per_layer_ratios=per_layer_ratios,
+        target_experts=args.target_experts,
+        saliency_by_layer={
+            int(idx): layer.get(resolved_method)
+            for idx, layer in observer_data.items()
+            if resolved_method in layer
+        },
+        observer_token_totals={
+            int(idx): int(layer.get("total_tokens", 0))
+            for idx, layer in observer_data.items()
+        },
+    )
+
+
+def _validate_output_dir(args: argparse.Namespace) -> None:
+    """Refuse output directories whose model files the save step would delete."""
+    output_dir = Path(args.output_dir)
+    model_path = Path(args.model_name)
+    if (
+        model_path.exists()
+        and output_dir.exists()
+        and model_path.resolve() == output_dir.resolve()
+    ):
+        raise ValueError(
+            f"--output-dir {args.output_dir!r} is the source model directory; "
+            "saving there would delete the original weights. Choose a new "
+            "output directory."
+        )
+    if not output_dir.is_dir():
+        return
+    has_model_files = any(
+        any(output_dir.glob(pattern)) for pattern in _MODEL_ARTIFACT_PATTERNS
+    )
+    markers = (*_REAP_OUTPUT_MARKERS, Path(args.metrics_file).name)
+    if has_model_files and not any((output_dir / name).is_file() for name in markers):
+        raise ValueError(
+            f"--output-dir {args.output_dir!r} already contains model files "
+            "that were not written by reap-mlx; refusing to delete them. "
+            "Choose an empty directory or remove those files first."
+        )
 
 
 def _validate_positive_int(value: Any, name: str) -> None:
@@ -630,7 +830,11 @@ def _validate_positive_int(value: Any, name: str) -> None:
         raise ValueError(f"{name} must be a positive integer, got {value}.")
 
 
-def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
+def _default_load_model(
+    model_name: str,
+    *,
+    revision: str | None = None,
+) -> tuple[Any, Any, Mapping[str, Any]]:
     try:
         from mlx_lm import load
     except ModuleNotFoundError as exc:
@@ -638,8 +842,14 @@ def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
             "MLX entrypoint requires the optional 'mlx_lm' package to load models."
         ) from exc
 
+    load_kwargs: dict[str, Any] = {}
+    if revision is not None:
+        if not _supports_keyword(load, "revision"):
+            raise ValueError("The installed mlx-lm does not support --revision.")
+        load_kwargs["revision"] = revision
+
     if _supports_keyword(load, "return_config"):
-        loaded = load(model_name, return_config=True)
+        loaded = load(model_name, return_config=True, **load_kwargs)
         if not isinstance(loaded, tuple) or len(loaded) != 3:
             raise ValueError(
                 "Expected mlx_lm.load(..., return_config=True) to return "
@@ -647,7 +857,7 @@ def _default_load_model(model_name: str) -> tuple[Any, Any, Mapping[str, Any]]:
             )
         return loaded
 
-    loaded = load(model_name)
+    loaded = load(model_name, **load_kwargs)
     if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise ValueError(
             "Expected mlx_lm.load(...) to return (model, tokenizer)."
@@ -671,6 +881,28 @@ def _load_mlx_lm_config(model_name: str) -> Mapping[str, Any]:
     return config
 
 
+def _resolve_hub_revision(model_name: str, revision: str | None) -> str | None:
+    """Return the Hub commit a model was loaded at, else the requested revision.
+
+    Local model paths have no Hub revision. The commit is read from the local
+    Hugging Face cache that mlx-lm populated while loading, so no network
+    request is made.
+    """
+    if Path(model_name).exists():
+        return None
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot = snapshot_download(
+            model_name,
+            revision=revision,
+            local_files_only=True,
+        )
+    except Exception:
+        return revision
+    return Path(snapshot).name
+
+
 def _supports_keyword(fn: Callable[..., Any], keyword: str) -> bool:
     try:
         parameters = inspect.signature(fn).parameters
@@ -689,10 +921,62 @@ def _infer_adapter_safely(model: Any, config: Mapping[str, Any]) -> Any | None:
     except Exception as exc:
         logger.debug("could not infer MLX model adapter", exc_info=True)
         raise ValueError(
-            "Could not determine the MoE architecture adapter for this model. "
-            "REAP pruning currently supports Qwen3-MoE and LFM2-MoE architectures. "
+            f"{unsupported_architecture_message(config)} "
             f"Underlying error: {exc.__class__.__name__}: {exc}"
         ) from exc
+
+
+def _same_model_reference(first: str, second: str) -> bool:
+    """Compare model references, resolving spellings of the same local path."""
+    first_path, second_path = Path(first), Path(second)
+    if first_path.exists() and second_path.exists():
+        return first_path.resolve() == second_path.resolve()
+    return str(first).rstrip("/") == str(second).rstrip("/")
+
+
+# Config facts that must agree between a checkpoint and the model it is
+# re-applied to: keep indices are only meaningful for the same layout.
+_RESUME_CONFIG_KEYS = ("model_type", "num_hidden_layers", "hidden_size")
+
+
+def _config_mismatches(
+    checkpoint_config: Mapping[str, Any] | None,
+    config: Mapping[str, Any],
+) -> list[str]:
+    """Describe structural differences between a checkpoint and the model."""
+    if not checkpoint_config:
+        return []
+    mismatches = []
+    for key in _RESUME_CONFIG_KEYS:
+        expected, actual = checkpoint_config.get(key), config.get(key)
+        if expected is not None and actual is not None and expected != actual:
+            mismatches.append(
+                f"config {key} was {expected!r}, the model has {actual!r}"
+            )
+    expected_experts = config_num_experts(checkpoint_config)
+    actual_experts = config_num_experts(config)
+    if (
+        expected_experts is not None
+        and actual_experts is not None
+        and expected_experts != actual_experts
+    ):
+        mismatches.append(
+            f"the checkpoint was made for {expected_experts} experts per layer, "
+            f"the model has {actual_experts}"
+        )
+    return mismatches
+
+
+def _observed_sequence_count(
+    observer_data: Mapping[int, Mapping[str, Any]],
+) -> int | None:
+    """Return how many calibration sequences every MoE layer fully observed."""
+    counts = [
+        int(layer_data["observed_sequences"])
+        for layer_data in observer_data.values()
+        if "observed_sequences" in layer_data
+    ]
+    return min(counts) if counts else None
 
 
 def _observer_saliency_is_all_zero(
@@ -718,6 +1002,15 @@ def _observer_saliency_is_all_zero(
 
 def _emit(print_fn: Callable[[str], Any], message: str) -> None:
     print_fn(f"[reap-mlx] {message}")
+
+
+def _emit_keep_indices(
+    print_fn: Callable[[str], Any],
+    keep_by_layer: Mapping[int, Any],
+) -> None:
+    for layer_idx in sorted(keep_by_layer):
+        retained = [int(index) for index in keep_by_layer[layer_idx]]
+        _emit(print_fn, f"keep: layer {layer_idx} -> {retained}")
 
 
 if __name__ == "__main__":

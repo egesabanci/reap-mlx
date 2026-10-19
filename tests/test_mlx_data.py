@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import logging
 import os
 import subprocess
@@ -10,6 +12,7 @@ import textwrap
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from reap.data import (
     extract_text,
@@ -106,7 +109,9 @@ class ChatTokenizer(WhitespaceTokenizer):
                 "add_generation_prompt": add_generation_prompt,
             }
         )
-        return " ".join(f"{message['role']}:{message['content']}" for message in messages)
+        return " ".join(
+            f"{message['role']}:{message['content']}" for message in messages
+        )
 
 
 class CallableTokenizer:
@@ -150,6 +155,54 @@ def test_load_calibration_sequences_forwards_dataset_options_and_truncates():
     np.testing.assert_array_equal(sequences[1]["input_ids"], [5, 7])
 
 
+def test_streaming_is_forwarded_to_load_dataset():
+    calls = []
+
+    def fake_load_dataset(dataset_name, **kwargs):
+        calls.append(kwargs)
+        return [{"text": "alpha beta"}]
+
+    load_calibration_sequences(
+        WhitespaceTokenizer(),
+        "example/dataset",
+        max_samples=1,
+        max_seq_length=4,
+        streaming=True,
+        load_dataset_fn=fake_load_dataset,
+    )
+
+    assert calls == [{"split": "train", "streaming": True}]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("datasets") is None,
+    reason="datasets is not installed in this environment.",
+)
+def test_streaming_reads_a_real_dataset_lazily_and_shuffles(tmp_path, monkeypatch):
+    import datasets
+
+    # Keep the datasets lock files out of the user's global cache.
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path / "cache")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    records = [{"text": f"w{i} w{i}"} for i in range(50)]
+    (data_dir / "train.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records),
+        encoding="utf-8",
+    )
+
+    sequences = load_calibration_sequences(
+        WhitespaceTokenizer(),
+        str(data_dir),
+        max_samples=5,
+        max_seq_length=4,
+        seed=3,
+        streaming=True,
+    )
+
+    assert len(sequences) == 5
+
+
 def test_extract_text_supports_instruction_input_output_records():
     text = extract_text(
         {
@@ -160,6 +213,116 @@ def test_extract_text_supports_instruction_input_output_records():
     )
 
     assert text == "Write a function.\n\nUse Python.\n\ndef f(): pass"
+
+
+def test_instruction_records_use_chat_template_when_available():
+    tokenizer = ChatTokenizer()
+
+    text = extract_text(
+        {
+            "instruction": "Write a function.",
+            "input": "Use Python.",
+            "output": "def f(): pass",
+        },
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls == [
+        {
+            "messages": [
+                {"role": "user", "content": "Write a function.\n\nUse Python."},
+                {"role": "assistant", "content": "def f(): pass"},
+            ],
+            "tokenize": False,
+            "add_generation_prompt": False,
+        }
+    ]
+    assert text == "user:Write a function.\n\nUse Python. assistant:def f(): pass"
+
+
+def test_instruction_records_without_a_prompt_stay_plain_text():
+    tokenizer = ChatTokenizer()
+
+    text = extract_text({"output": "def f(): pass"}, tokenizer=tokenizer)
+
+    assert text == "def f(): pass"
+    assert tokenizer.template_calls == []
+
+
+class TemplatelessChatTokenizer(ChatTokenizer):
+    """Has apply_chat_template but no template (Hugging Face base models)."""
+
+    chat_template = None
+
+
+def test_records_skip_apply_chat_template_when_tokenizer_has_no_template():
+    tokenizer = TemplatelessChatTokenizer()
+
+    message_text = extract_text(
+        {"messages": [{"role": "user", "content": "Hello"}]},
+        tokenizer=tokenizer,
+    )
+    instruction_text = extract_text(
+        {"instruction": "Write a function.", "output": "def f(): pass"},
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls == []
+    assert message_text == "user: Hello"
+    assert instruction_text == "Write a function.\n\ndef f(): pass"
+
+
+def test_mlx_lm_has_chat_template_flag_enables_templates():
+    tokenizer = TemplatelessChatTokenizer()
+    tokenizer.has_chat_template = True
+
+    extract_text({"instruction": "Hi", "output": "Hello"}, tokenizer=tokenizer)
+
+    assert len(tokenizer.template_calls) == 1
+
+
+def test_pack_concatenates_samples_into_full_length_sequences():
+    records = [
+        {"text": "a bb ccc"},
+        {"text": "dddd eeeee"},
+        {"text": "f gg hhh iiii"},
+        {"text": "a bb"},
+    ]
+
+    sequences = load_calibration_sequences(
+        WhitespaceTokenizer(),
+        "pack/data",
+        max_samples=3,
+        max_seq_length=4,
+        pack=True,
+        load_dataset_fn=lambda dataset_name, **kwargs: records,
+    )
+
+    # [1, 2, 3] + [4, 5] fills the first sequence (5 is dropped), [1, 2, 3, 4]
+    # fills the second, and [1, 2] is kept as a shorter final sequence.
+    assert [seq["input_ids"].tolist() for seq in sequences] == [
+        [1, 2, 3, 4],
+        [1, 2, 3, 4],
+        [1, 2],
+    ]
+
+
+def test_pack_stops_at_max_samples_packed_sequences():
+    records = [{"text": "a bb ccc dddd"}] * 5
+
+    sequences = load_calibration_sequences(
+        WhitespaceTokenizer(),
+        "pack/data",
+        max_samples=2,
+        max_seq_length=4,
+        pack=True,
+        load_dataset_fn=lambda dataset_name, **kwargs: records,
+    )
+
+    assert [seq["input_ids"].tolist() for seq in sequences] == [
+        [1, 2, 3, 4],
+        [1, 2, 3, 4],
+    ]
 
 
 def test_message_records_use_tokenizer_chat_template_when_available():
@@ -192,6 +355,87 @@ def test_message_records_use_tokenizer_chat_template_when_available():
     ]
     assert tokenizer.texts == ["user:Hello assistant:Hi"]
     np.testing.assert_array_equal(sequences[0]["input_ids"], [10, 12])
+
+
+def test_sharegpt_conversations_are_mapped_to_chat_template_roles():
+    tokenizer = ChatTokenizer()
+
+    text = extract_text(
+        {
+            "conversations": [
+                {"from": "system", "value": "Be brief."},
+                {"from": "human", "value": "Explain REAP."},
+                {"from": "gpt", "value": "REAP prunes experts."},
+            ]
+        },
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls[0]["messages"] == [
+        {
+            "from": "system",
+            "value": "Be brief.",
+            "role": "system",
+            "content": "Be brief.",
+        },
+        {
+            "from": "human",
+            "value": "Explain REAP.",
+            "role": "user",
+            "content": "Explain REAP.",
+        },
+        {
+            "from": "gpt",
+            "value": "REAP prunes experts.",
+            "role": "assistant",
+            "content": "REAP prunes experts.",
+        },
+    ]
+    assert text == "system:Be brief. user:Explain REAP. assistant:REAP prunes experts."
+
+
+def test_chat_template_receives_text_only_content_for_multimodal_messages():
+    tokenizer = ChatTokenizer()
+
+    extract_text(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this."},
+                        {"type": "image_url", "image_url": {"url": "x.png"}},
+                    ],
+                }
+            ]
+        },
+        tokenizer=tokenizer,
+    )
+
+    assert tokenizer.template_calls[0]["messages"] == [
+        {"role": "user", "content": "Describe this."}
+    ]
+
+
+class RejectingChatTokenizer(ChatTokenizer):
+    def apply_chat_template(self, messages, **kwargs):
+        raise ValueError("Conversation roles must alternate user/assistant")
+
+
+def test_chat_template_errors_fall_back_to_role_content_text(caplog):
+    with caplog.at_level(logging.WARNING, logger="reap.data"):
+        text = extract_text(
+            {
+                "messages": [
+                    {"role": "user", "content": "One"},
+                    {"role": "user", "content": "Two"},
+                ]
+            },
+            tokenizer=RejectingChatTokenizer(),
+        )
+
+    assert text == "user: One\nuser: Two"
+    assert any("Chat template failed" in rec.message for rec in caplog.records)
 
 
 def test_conversation_records_fall_back_to_role_content_text():

@@ -45,9 +45,13 @@ Run basic repository checks:
 
 ```bash
 uv lock --check
+uv run ruff check src tests
 git diff --check
 uv run python -m reap.entrypoint --help
 ```
+
+Any change to dependency ranges in `pyproject.toml` needs a matching `uv lock`.
+CI checks the lockfile before installing, so a stale `uv.lock` fails the build.
 
 ## Model And Runtime Notes
 

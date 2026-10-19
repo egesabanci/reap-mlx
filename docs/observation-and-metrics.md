@@ -17,6 +17,8 @@ observe_model(
     eval_frequency=1,
     eval_fn=None,
     mask_fn=None,
+    print_fn=None,
+    verify_replay=True,
 ) -> dict[int, dict[str, Any]]
 ```
 
@@ -31,14 +33,31 @@ layers and sequences.
 layers and also flush the final layer of each sequence when needed. Higher
 values reduce GPU synchronization barriers but increase peak memory.
 
-Only a `MemoryError` from `eval_fn` triggers a temporary fallback to
-`eval_frequency=1` for the rest of the current sequence. Other `RuntimeError`
-failures are re-raised so real graph bugs are not masked as memory pressure.
+Selected-expert statistics do not add synchronization points of their own:
+each MoE layer reduces its routed outputs on device to per-route float32 norms
+and maxes (plus per-token shared-expert norms), and those small arrays are
+evaluated and accumulated at the next eval boundary. The accumulated
+statistics are identical for every `eval_frequency`.
 
-On sequence-level `MemoryError`, observer state is rolled back to the snapshot
-taken before that sequence started (so MoE layers never disagree on how many
-sequences they saw), then observation stops and fully completed sequences are
-retained.
+Out-of-memory errors are recognised in both forms they take: `MemoryError`
+and the `RuntimeError` MLX raises for allocation failures (for example
+`[metal::malloc] Attempting to allocate ... greater than the maximum allowed
+buffer size`). Other `RuntimeError` failures are re-raised so real graph bugs
+are not masked as memory pressure.
+
+An out-of-memory error from `eval_fn` clears the MLX buffer cache and falls back
+to `eval_frequency=1` for the rest of the current sequence.
+
+An out-of-memory error anywhere else in a sequence rolls observer state back to
+the snapshot taken before that sequence started (so MoE layers never disagree
+on how many sequences they saw), clears the buffer cache, stops observation,
+and keeps the fully completed sequences. Every layer report carries
+`observed_sequences`; the CLI fails the run when it is below
+`--min-calibration-samples` unless `--allow-partial-calibration` is passed.
+
+A Metal command-buffer failure ("Insufficient Memory") can abort the process
+inside MLX before Python sees an exception; lower `--max-seq-length` if that
+happens.
 
 ## Qwen3 Replay
 
@@ -111,7 +130,11 @@ Qwen3 routing:
 2. Flattens leading dimensions before gate projection.
 3. Computes gate logits with `moe.gate`.
 4. Applies `mx.softmax(logits, axis=-1, precise=True)`.
-5. Selects top-k experts through `mx.argpartition`.
+5. Selects top-k experts through `mx.argpartition`, using the same form as the
+   mlx-lm architecture: ascending (`argpartition(gates, kth=-k)[..., -k:]`) for
+   `qwen3_moe`, descending (`argpartition(-gates, kth=k-1)[..., :k]`) for
+   `qwen2_moe` and `olmoe`. The two forms keep different experts on exact ties
+   at the top-k boundary, which bfloat16 gates produce regularly.
 6. Gathers selected softmax scores.
 7. Optionally renormalizes selected scores with the shared epsilon denominator
    when `norm_topk_prob` is enabled.
@@ -146,6 +169,15 @@ LFM2 returns two score tensors:
 This keeps REAP ranking aligned with routing probability rather than additive
 expert bias, while the residual path still matches the live model.
 
+Upstream note: the replay deliberately mirrors mlx-lm, which is the runtime
+that executes the pruned model. mlx-lm's LFM2-MoE block (0.31.x) applies a
+softmax, adds `expert_bias` to the probabilities, and weights experts with the
+biased scores. The Hugging Face reference implementation instead uses sigmoid
+scores, applies `expert_bias` only to the top-k selection, and multiplies by
+`routed_scaling_factor` (1.0 for released LFM2-MoE checkpoints). If mlx-lm
+changes its LFM2 routing, the replay parity check fails fast instead of
+silently measuring saliency on the old routes.
+
 ## Selected Expert Outputs
 
 For a routed MoE layer, observation calls:
@@ -168,6 +200,22 @@ The observer computes the MoE output as:
 
 If a shared expert exists, its output is added to the hidden-state flow. Shared
 expert output is not included in selected-expert saliency accumulation.
+
+## Replay Parity Check
+
+The replay only produces correct saliency if the routers reproduce the live
+model's routing exactly. On the first calibration sequence, every MoE layer's
+replayed output is therefore also compared with the live MoE block's own
+forward pass (`moe(moe_input)`). The error is the largest per-token L2
+difference divided by the mean per-token L2 norm of the live output. Supported
+architectures replay bit-exactly (error `0.0`); if the error exceeds
+`REPLAY_PARITY_TOLERANCE` (`1e-2`), observation raises before the remaining
+sequences are processed. That typically means the installed mlx-lm changed how
+the architecture routes.
+
+The measured error is reported per layer as `replay_parity_error`. Pass
+`verify_replay=False` (CLI: `--skip-replay-check`) to disable the check. MoE
+blocks that are not callable (test fixtures) are not compared.
 
 ## PruningState
 

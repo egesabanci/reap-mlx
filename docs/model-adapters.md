@@ -39,7 +39,7 @@ Config conventions supported by adapters:
 
 | Concept | Live attrs | Config keys |
 | --- | --- | --- |
-| Expert count | `num_experts` | `num_experts` |
+| Expert count | `num_experts` | `num_experts` (Qwen/OLMoE/LFM2), `num_local_experts` (Mixtral/PhiMoE) |
 | Top-k | `top_k`, `num_experts_per_tok` | `num_experts_per_tok`, `top_k` |
 | Top-k normalization | `norm_topk_prob` | `norm_topk_prob` |
 | LFM2 expert bias | `use_expert_bias` | `use_expert_bias` |
@@ -97,15 +97,58 @@ LFM2 layers can be attention or conv/SSM operator layers. The observer uses:
 The LFM2 config update currently delegates to the Qwen3 update logic and
 preserves unrelated keys such as `use_expert_bias`.
 
+## Mixtral / PhiMoE Adapter
+
+Adapter name: `mixtral_moe`
+
+Expected layer shape:
+
+```txt
+layer.block_sparse_moe
+  gate
+  switch_mlp
+    gate_proj
+    up_proj
+    down_proj
+```
+
+Routing is top-k on raw gate logits followed by a softmax over the selected
+logits, matching mlx-lm.
+
+mlx-lm builds these architectures from `num_local_experts`, so the adapter
+updates config through `update_mixtral_moe_config`:
+
+- set `config["num_local_experts"]`;
+- set `config["num_experts_per_tok"]`;
+- update `config["num_experts"]` / `config["top_k"]` only when those keys
+  already exist;
+- clamp top-k to at most the retained expert count.
+
+`update_moe_config(config, adapter_name=...)` dispatches to the right updater,
+and `config_num_experts(config)` reads whichever expert-count key a config uses.
+
 ## Adapter Inference
 
-`infer_model_adapter(model, config)` selects LFM2 when:
+`infer_model_adapter(model, config)` only accepts model types whose routing the
+adapters and routers reproduce exactly (`SUPPORTED_MODEL_TYPES`):
 
-- `config["model_type"] == "lfm2_moe"`;
-- any configured architecture starts with `"Lfm2"`;
-- the model layout includes any `layer.feed_forward.switch_mlp`.
+| Adapter | Model types | Layout |
+| --- | --- | --- |
+| `qwen3_moe` | `qwen2_moe`, `qwen3_moe`, `olmoe` | `layer.mlp.switch_mlp` |
+| `mixtral_moe` | `mixtral`, `phimoe` | `layer.block_sparse_moe.switch_mlp` |
+| `lfm2_moe` | `lfm2_moe` | `layer.feed_forward.switch_mlp` |
 
-Otherwise it returns the Qwen3 adapter.
+With a model object, the layout picks the adapter (checked in the order
+`feed_forward`, `block_sparse_moe`, `mlp`), and a config `model_type`, when
+present, must be one of that adapter's model types. Layout alone is not enough:
+other mlx-lm architectures reuse these layouts with different routing, for
+example MiniMax (`block_sparse_moe` with sigmoid scores and a correction bias)
+or DeepSeek/GLM4-MoE (`mlp` with grouped sigmoid gates). Replaying them with a
+supported router would silently compute saliency on the wrong routes, so they
+are rejected with a message that lists the supported model types.
+
+Without a model object, the config `model_type` decides; when it is missing,
+exact architecture class names (for example `Qwen3MoeForCausalLM`) are used.
 
 ## Shared Experts
 
@@ -129,13 +172,16 @@ To add a new MoE family:
    - `get_moe(layer)`
    - `get_dense_mlp(layer)`
    - `get_layer_config(layer, config)`
-2. Add or extend router logic for the architecture's selected-route semantics.
+2. Add or extend router logic for the architecture's selected-route semantics,
+   then add the model type to `SUPPORTED_MODEL_TYPES` (and its architecture
+   class name to the config-only lookup).
 3. Add pruning support if the expert-stacked field layout differs from Qwen3 or
    LFM2.
 4. Update save/reload shape validation if new expert-stacked fields must be
    validated.
 5. Add fixture-style tests for adapter inference, routing, pruning, observer
-   replay, and reload validation.
+   replay, and reload validation, and add the family to
+   `tests/test_mlx_e2e.py` (tiny random model, bf16 and 4-bit).
 
 Keep any new runtime imports lazy and add import-safety coverage.
 

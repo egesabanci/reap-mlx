@@ -21,7 +21,6 @@ from reap.prune import (
     slice_first_dim,
 )
 
-
 MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
 
 requires_mlx = pytest.mark.skipif(
@@ -139,13 +138,19 @@ class TinyGate:
         self.top_k = 3
 
 
-class TinyLfmGate(TinyGate):
+class TinyQuantizedGate(TinyGate):
+    """Gate shaped like mlx.nn.QuantizedLinear: weight plus per-expert scales/biases."""
+
     def __init__(self, num_experts: int):
         super().__init__(num_experts)
         self.scales = np.arange(num_experts, dtype=np.float32).reshape(num_experts, 1)
         self.biases = (
             np.arange(num_experts, dtype=np.float32).reshape(num_experts, 1) + 100
         )
+
+
+class TinyLfmGate(TinyQuantizedGate):
+    pass
 
 
 class TinyMoe:
@@ -300,6 +305,56 @@ def test_prune_experts_slices_qwen_switch_router_metadata_and_config():
     assert config["top_k"] == 2
 
 
+def test_prune_experts_slices_quantized_qwen_gate_scales_and_biases():
+    model = make_model(num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    moe = model.model.layers[0].mlp
+    moe.gate = TinyQuantizedGate(4)
+    keep = np.array([1, 3])
+    gate_scales = moe.gate.scales.copy()
+    gate_biases = moe.gate.biases.copy()
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+        "reap",
+        0.5,
+    )
+
+    np.testing.assert_array_equal(moe.gate.scales, gate_scales[keep])
+    np.testing.assert_array_equal(moe.gate.biases, gate_biases[keep])
+
+
+def make_mixtral_model(num_experts: int = 4, top_k: int = 2):
+    moe = TinyMoe(num_experts=num_experts, top_k=top_k)
+    return SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(block_sparse_moe=moe)]),
+    )
+
+
+def test_prune_experts_updates_mixtral_num_local_experts():
+    model = make_mixtral_model(num_experts=4, top_k=2)
+    config = {
+        "model_type": "mixtral",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+    }
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])}},
+        "reap",
+        0.5,
+    )
+
+    assert config["num_local_experts"] == 2
+    assert config["num_experts_per_tok"] == 2
+    assert "num_experts" not in config
+    assert model.model.layers[0].block_sparse_moe.num_experts == 2
+
+
 def test_prune_experts_accepts_weighted_frequency_alias():
     model = make_model(num_experts=3, top_k=2)
     config = qwen_config(num_experts=3, top_k=2)
@@ -388,7 +443,9 @@ def test_prune_experts_raises_clear_message_when_no_moe_architecture_detected():
     model = SimpleNamespace(
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=object())])
     )
-    with pytest.raises(ValueError, match="Cannot detect a supported MoE architecture") as excinfo:
+    with pytest.raises(
+        ValueError, match="Cannot detect a supported MoE architecture"
+    ) as excinfo:
         prune_experts(model, {"model_type": "bert"}, {}, "reap", 0.5)
     # The message should point to supported architectures, not print 'None'.
     assert "Qwen3-MoE" in str(excinfo.value) and "LFM2-MoE" in str(excinfo.value)
@@ -733,6 +790,124 @@ def test_apply_keep_indices_reproduces_prune_result_on_fresh_model():
     assert fresh_config["num_experts"] == 2
 
 
+def test_prune_experts_reports_the_plan_before_slicing_any_weight():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+    seen = []
+
+    def on_plan(keep_by_layer):
+        seen.append(
+            {
+                "keep": {idx: keep.tolist() for idx, keep in keep_by_layer.items()},
+                "widths": [
+                    layer.mlp.switch_mlp.gate_proj.weight.shape[0]
+                    for layer in model.model.layers
+                ],
+            }
+        )
+
+    keep_by_layer = prune_experts(
+        model,
+        config,
+        {
+            0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+            1: {"reap": np.array([0.3, 0.7, 0.4, 0.6])},
+        },
+        "reap",
+        0.5,
+        on_plan=on_plan,
+    )
+
+    assert seen == [{"keep": {0: [1, 3], 1: [1, 3]}, "widths": [4, 4]}]
+    assert {idx: keep.tolist() for idx, keep in keep_by_layer.items()} == {
+        0: [1, 3],
+        1: [1, 3],
+    }
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 2
+
+
+def test_prune_experts_validates_every_layer_before_mutating():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+
+    with pytest.raises(ValueError, match="expected 4"):
+        prune_experts(
+            model,
+            config,
+            {
+                0: {"reap": np.array([0.1, 0.9, 0.2, 0.8])},
+                1: {"reap": np.array([0.3, 0.7, 0.4])},
+            },
+            "reap",
+            0.5,
+        )
+
+    assert model.model.layers[0].mlp.num_experts == 4
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 4
+    assert config["num_experts"] == 4
+
+
+def test_apply_keep_indices_records_the_same_audit_keys_as_a_fresh_prune():
+    observer_data = {
+        0: {
+            "reap": np.array([0.1, 0.9, 0.2, 0.8]),
+            "expert_frequency": np.array([1, 4, 2, 3]),
+        },
+        1: {
+            "reap": np.array([0.3, 0.7, 0.4, 0.6]),
+            "expert_frequency": np.array([5, 1, 1, 1]),
+        },
+    }
+    fresh_config = qwen_config(num_experts=4, top_k=3)
+    keep_by_layer = prune_experts(
+        make_multi_moe_model(num_layers=2, num_experts=4, top_k=3),
+        fresh_config,
+        observer_data,
+        "reap",
+        0.5,
+        skip_layer_indices=[1],
+    )
+    resumed_config = qwen_config(num_experts=4, top_k=3)
+
+    apply_keep_indices(
+        make_multi_moe_model(num_layers=2, num_experts=4, top_k=3),
+        resumed_config,
+        keep_by_layer,
+        skip_layer_indices=[1],
+    )
+
+    for key in ("reap_retained_experts_by_layer", "reap_primary_prune_layers"):
+        assert resumed_config[key] == fresh_config[key]
+    assert resumed_config["reap_primary_prune_layers"] == [0]
+
+
+def test_apply_keep_indices_rejects_missing_moe_layers_before_mutating():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+
+    with pytest.raises(ValueError, match=r"missing MoE layers \[1\]"):
+        apply_keep_indices(model, config, {0: np.array([1, 3])})
+
+    assert model.model.layers[0].mlp.num_experts == 4
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 4
+    assert config["num_experts"] == 4
+
+
+def test_apply_keep_indices_rejects_non_uniform_counts_before_mutating():
+    model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
+    config = qwen_config(num_experts=4, top_k=3)
+
+    with pytest.raises(ValueError, match="non-uniform retained counts"):
+        apply_keep_indices(
+            model,
+            config,
+            {0: np.array([1, 3]), 1: np.array([0, 1, 2])},
+        )
+
+    assert model.model.layers[0].mlp.switch_mlp.gate_proj.weight.shape[0] == 4
+    assert config["num_experts"] == 4
+
+
 def test_apply_keep_indices_rejects_non_moe_layer_index():
     model = make_multi_moe_model(num_layers=2, num_experts=4, top_k=3)
     config = qwen_config(num_experts=4, top_k=3)
@@ -778,6 +953,7 @@ def test_prune_experts_preserves_switch_glu_parameters_and_forward():
     import mlx.nn as nn
     from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import SwitchGLU
+
     from reap.model_adapters import Lfm2MoeModelAdapter
 
     class Moe(nn.Module):
@@ -797,7 +973,9 @@ def test_prune_experts_preserves_switch_glu_parameters_and_forward():
     before = len(tree_flatten(moe.parameters()))
     assert before >= 5
 
-    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)]))
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)])
+    )
     config = {
         "model_type": "lfm2_moe",
         "num_experts": 4,
@@ -830,7 +1008,6 @@ def test_prune_experts_preserves_switch_glu_parameters_and_forward():
 @requires_mlx
 def test_prune_quantized_switch_linear_preserves_parameters_and_forward():
     import mlx.core as mx
-    import mlx.nn as nn
     from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
@@ -847,6 +1024,98 @@ def test_prune_quantized_switch_linear_preserves_parameters_and_forward():
     y = ql(x[:, None, :], idx)
     mx.eval(y)
     assert y.shape[0] == 2
+
+
+@requires_mlx
+def test_prune_experts_keeps_quantized_qwen3_gate_runnable():
+    """A real mlx-lm Qwen3 MoE block with a quantized router gate stays usable."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models import qwen3_moe
+
+    args = qwen3_moe.ModelArgs(
+        model_type="qwen3_moe",
+        hidden_size=64,
+        num_hidden_layers=1,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        moe_intermediate_size=64,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=2,
+        head_dim=16,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        max_position_embeddings=64,
+        norm_topk_prob=True,
+    )
+    moe = qwen3_moe.Qwen3MoeSparseMoeBlock(args)
+    nn.quantize(moe, group_size=64, bits=4)
+    mx.eval(moe.parameters())
+    assert isinstance(moe.gate, nn.QuantizedLinear)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(mlp=moe)]))
+    config = {
+        "model_type": "qwen3_moe",
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": True,
+    }
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.arange(8, dtype=np.float32)}},
+        "reap",
+        0.25,
+    )
+
+    assert moe.gate.weight.shape[0] == 6
+    assert moe.gate.scales.shape[0] == 6
+    assert moe.gate.biases.shape[0] == 6
+    y = moe(mx.random.normal((1, 5, 64)))
+    mx.eval(y)
+    assert y.shape == (1, 5, 64)
+
+
+@requires_mlx
+def test_pruned_mixtral_checkpoint_reloads_with_mlx_lm(tmp_path):
+    """mlx-lm rebuilds Mixtral from num_local_experts; the saved config must match."""
+    import mlx.core as mx
+    from mlx_lm.models import mixtral
+    from mlx_lm.utils import load_model, save_config, save_model
+
+    config = {
+        "model_type": "mixtral",
+        "vocab_size": 32,
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+    }
+    model = mixtral.Model(mixtral.ModelArgs.from_dict(config))
+    mx.eval(model.parameters())
+
+    prune_experts(
+        model,
+        config,
+        {0: {"reap": np.arange(8, dtype=np.float32)}},
+        "reap",
+        0.25,
+    )
+    save_model(tmp_path, model, donate_model=False)
+    save_config(dict(config), tmp_path / "config.json")
+
+    reloaded, reloaded_config = load_model(tmp_path)
+
+    assert reloaded_config["num_local_experts"] == 6
+    assert reloaded.layers[0].block_sparse_moe.gate.weight.shape[0] == 6
 
 
 def test_apply_keep_indices_rejects_out_of_range_and_duplicates():
@@ -868,6 +1137,7 @@ def test_prune_switch_glu_save_model_writes_nonempty_weights(tmp_path):
     from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import SwitchGLU
     from mlx_lm.utils import save_model
+
     from reap.model_adapters import Lfm2MoeModelAdapter
 
     class Moe(nn.Module):
@@ -884,7 +1154,9 @@ def test_prune_switch_glu_save_model_writes_nonempty_weights(tmp_path):
 
     moe = Moe()
     mx.eval(moe.parameters())
-    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)]))
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(feed_forward=moe)])
+    )
     config = {
         "model_type": "lfm2_moe",
         "num_experts": 4,

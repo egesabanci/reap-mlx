@@ -6,17 +6,17 @@ module import time.
 """
 
 from __future__ import annotations
-import logging
 
-from collections.abc import Mapping, MutableMapping
+import logging
+from collections.abc import Callable, Mapping, MutableMapping
 from typing import Any
 
 import numpy as np
 
 from reap.model_adapters import (
     infer_model_adapter,
-    update_lfm2_moe_config,
-    update_qwen3_moe_config,
+    unsupported_architecture_message,
+    update_moe_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,9 @@ _SUPPORTED_PRUNE_METHODS = {
 }
 
 _SLICE_FIELD_NAMES = ("weight", "scales", "biases", "bias")
+# Router gates may be quantized (QuantizedLinear: weight + scales + biases);
+# every per-expert field must be sliced together or reload sees stale shapes.
+_GATE_FIELD_NAMES = (*_SLICE_FIELD_NAMES, "e_score_correction_bias")
 _SWITCH_PROJECTION_NAMES = ("gate_proj", "up_proj", "down_proj")
 _TOP_K_ATTRS = ("top_k", "num_experts_per_tok", "k")
 
@@ -72,7 +75,8 @@ def _select_moe_layers(
         if invalid_skip:
             raise ValueError(
                 "skip_layer_indices contains non-MoE layer indices: "
-                f"{sorted(invalid_skip)}. Available MoE layers: {sorted(all_moe_indices)}.",
+                f"{sorted(invalid_skip)}. Available MoE layers: "
+                f"{sorted(all_moe_indices)}.",
             )
         selected = [i for i in selected if i not in skip_set]
     if not selected:
@@ -194,7 +198,7 @@ def validate_layer_prune_plan(
     the primary selection (frequency fallback at prune time), not left full-size.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
-    _validate_adapter(adapter)
+    _validate_adapter(adapter, config)
     _validate_compression_ratio(compression_ratio)
     layers = adapter.layers(model)
     all_moe_indices = list(adapter.identify_moe_layers(model))
@@ -226,6 +230,7 @@ def prune_experts(
     prune_layer_indices: list[int] | None = None,
     per_layer_ratios: dict[int, float] | None = None,
     target_experts: int | None = None,
+    on_plan: Callable[[dict[int, np.ndarray]], Any] | None = None,
 ) -> dict[int, np.ndarray]:
     """Prune adapter-discovered MLX MoE experts in place.
 
@@ -236,14 +241,20 @@ def prune_experts(
     are still width-matched to the same retained expert count via
     ``expert_frequency`` so mlx-lm save/reload remains valid.
 
+    Every layer is ranked and validated before any weight is sliced. When
+    ``on_plan`` is given it is called with the keep indices at that point, so
+    callers can persist the decision first (the CLI writes its resume
+    checkpoint there).
+
     Returns a mapping from layer index to ascending retained expert indices.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
-    _validate_adapter(adapter)
+    _validate_adapter(adapter, config)
     _validate_compression_ratio(compression_ratio)
 
     layers = adapter.layers(model)
     keep_by_layer: dict[int, np.ndarray] = {}
+    planned_layers: list[tuple[int, Any, Any]] = []
     config_num_experts: int | None = None
     config_top_k: int | None = None
 
@@ -285,7 +296,8 @@ def prune_experts(
         method_for_layer = prune_method if primary else "expert_frequency"
 
         num_to_prune = int(layer_config.num_experts) - retained_count
-        if primary and layer_ratio > 0.0 and num_to_prune == 0 and target_experts is None:
+        ratio_prunes_nothing = layer_ratio > 0.0 and num_to_prune == 0
+        if primary and ratio_prunes_nothing and target_experts is None:
             logger.warning(
                 "Layer %d: compression_ratio=%.4f prunes 0 of %d experts "
                 "(floor(num_experts * ratio) == 0). Increase the ratio or "
@@ -319,26 +331,8 @@ def prune_experts(
             layer_idx=layer_idx,
         )
         keep_indices = compute_keep_indices(saliency, retained_count)
-
-        if adapter.adapter_name == "lfm2_moe":
-            _prune_lfm2_moe_layer(
-                adapter.get_moe(layer),
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
-        else:
-            # qwen3_moe, mixtral_moe, and other switch_mlp families share
-            # gate/switch projection layouts for dim-0 expert slicing.
-            _prune_qwen3_moe_layer(
-                adapter.get_moe(layer),
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
         keep_by_layer[layer_idx] = keep_indices
+        planned_layers.append((layer_idx, moe, layer_config))
         if retained_count >= layer_config.num_experts:
             if primary:
                 logger.warning(
@@ -356,24 +350,26 @@ def prune_experts(
         else:
             config_top_k = min(config_top_k or new_top_k, new_top_k)
 
-    if config_num_experts is not None:
-        update_config = (
-            update_lfm2_moe_config
-            if adapter.adapter_name == "lfm2_moe"
-            else update_qwen3_moe_config
+    if on_plan is not None:
+        on_plan({idx: keep.copy() for idx, keep in keep_by_layer.items()})
+
+    for layer_idx, moe, layer_config in planned_layers:
+        _prune_switch_moe_layer(
+            moe,
+            keep_by_layer[layer_idx],
+            num_experts=layer_config.num_experts,
+            old_top_k=layer_config.top_k,
+            layer_idx=layer_idx,
         )
-        update_config(
+
+    if config_num_experts is not None:
+        update_moe_config(
             config,
+            adapter_name=adapter.adapter_name,
             num_experts=config_num_experts,
             top_k=config_top_k or config_num_experts,
         )
-        # Audit metadata for heterogeneous native layouts / selective plans.
-        config["reap_retained_experts_by_layer"] = {
-            str(int(k)): int(v) for k, v in sorted(final_counts.items())
-        }
-        config["reap_primary_prune_layers"] = [
-            int(i) for i in sorted(selected_set)
-        ]
+        _record_prune_audit(config, final_counts, selected_set)
 
     if total_pruned_global == 0:
         logger.warning(
@@ -391,26 +387,33 @@ def apply_keep_indices(
     keep_by_layer: Mapping[int, Any],
     *,
     adapter: Any | None = None,
+    skip_layer_indices: list[int] | None = None,
+    prune_layer_indices: list[int] | None = None,
 ) -> dict[int, np.ndarray]:
     """Re-apply a previously computed keep_by_layer to a fresh (unpruned) model.
 
     This is the resume path for pipeline checkpointing: it slices each MoE
     layer's experts to the provided retained indices without re-running
-    observation or saliency. ``keep_by_layer`` must have uniform retained
-    counts because mlx-lm reload rebuilds every MoE layer from a single
-    scalar ``num_experts`` in config.
+    observation or saliency. ``keep_by_layer`` must cover exactly the model's
+    MoE layers with uniform retained counts, because mlx-lm reload rebuilds
+    every MoE layer from a single scalar expert count in config. All checks
+    run before any weight is sliced, so a mismatched checkpoint leaves the
+    model untouched.
+
+    ``skip_layer_indices`` / ``prune_layer_indices`` are the filters the plan
+    was made with; they only feed the ``reap_primary_prune_layers`` audit key,
+    so a resumed artifact records the same metadata as a fresh run.
     """
     adapter = infer_model_adapter(model, config) if adapter is None else adapter
-    _validate_adapter(adapter)
+    _validate_adapter(adapter, config)
     layers = adapter.layers(model)
-    config_num_experts: int | None = None
-    config_top_k: int | None = None
-    result: dict[int, np.ndarray] = {}
 
     if not keep_by_layer:
         raise ValueError("keep_by_layer must contain at least one MoE layer.")
 
-    for layer_idx, keep in keep_by_layer.items():
+    plan: list[tuple[int, Any, Any, np.ndarray]] = []
+    for layer_idx, keep in sorted(keep_by_layer.items()):
+        layer_idx = int(layer_idx)
         if layer_idx < 0 or layer_idx >= len(layers):
             raise ValueError(
                 f"keep_by_layer layer index {layer_idx} is out of range "
@@ -427,52 +430,66 @@ def apply_keep_indices(
         keep_indices = _validate_keep_indices(
             keep,
             num_experts=layer_config.num_experts,
-            layer_idx=int(layer_idx),
+            layer_idx=layer_idx,
         )
-        retained_count = int(len(keep_indices))
-        if adapter.adapter_name == "lfm2_moe":
-            _prune_lfm2_moe_layer(
-                moe,
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
-        else:
-            _prune_qwen3_moe_layer(
-                moe,
-                keep_indices,
-                num_experts=layer_config.num_experts,
-                old_top_k=layer_config.top_k,
-                layer_idx=layer_idx,
-            )
-        new_top_k = min(layer_config.top_k, retained_count)
-        if config_num_experts is None:
-            config_num_experts = retained_count
-            config_top_k = new_top_k
-        elif config_num_experts != retained_count:
-            raise ValueError(
-                "keep_by_layer has non-uniform retained counts; mlx-lm "
-                "reload requires a uniform num_experts. Layer "
-                f"{layer_idx} retains {retained_count}, expected "
-                f"{config_num_experts}."
-            )
-        else:
-            config_top_k = min(config_top_k or new_top_k, new_top_k)
+        plan.append((layer_idx, moe, layer_config, keep_indices))
+
+    moe_layer_indices = sorted(adapter.identify_moe_layers(model))
+    missing = sorted(set(moe_layer_indices) - {layer_idx for layer_idx, *_ in plan})
+    if missing:
+        raise ValueError(
+            f"keep_by_layer is missing MoE layers {missing}. It must cover every "
+            f"MoE layer of the loaded model ({moe_layer_indices}) because "
+            "mlx-lm reloads all of them with the same expert count. Ensure the "
+            "checkpoint matches the loaded model."
+        )
+    retained_counts = {
+        layer_idx: len(keep_indices) for layer_idx, _, _, keep_indices in plan
+    }
+    if len(set(retained_counts.values())) > 1:
+        raise ValueError(
+            "keep_by_layer has non-uniform retained counts "
+            f"{retained_counts}; mlx-lm reload requires a uniform expert count."
+        )
+    retained_count = next(iter(retained_counts.values()))
+
+    result: dict[int, np.ndarray] = {}
+    config_top_k = retained_count
+    for layer_idx, moe, layer_config, keep_indices in plan:
+        _prune_switch_moe_layer(
+            moe,
+            keep_indices,
+            num_experts=layer_config.num_experts,
+            old_top_k=layer_config.top_k,
+            layer_idx=layer_idx,
+        )
+        config_top_k = min(config_top_k, layer_config.top_k)
         result[layer_idx] = keep_indices
 
-    if config_num_experts is not None:
-        update_config = (
-            update_lfm2_moe_config
-            if adapter.adapter_name == "lfm2_moe"
-            else update_qwen3_moe_config
-        )
-        update_config(
-            config,
-            num_experts=config_num_experts,
-            top_k=config_top_k or config_num_experts,
-        )
+    update_moe_config(
+        config,
+        adapter_name=adapter.adapter_name,
+        num_experts=retained_count,
+        top_k=config_top_k,
+    )
+    _record_prune_audit(
+        config,
+        retained_counts,
+        _select_moe_layers(moe_layer_indices, skip_layer_indices, prune_layer_indices),
+    )
     return result
+
+
+def _record_prune_audit(
+    config: MutableMapping[str, Any],
+    retained_by_layer: Mapping[int, int],
+    primary_layers: Any,
+) -> None:
+    """Record per-layer retained counts and primary-method layers in config."""
+    config["reap_retained_experts_by_layer"] = {
+        str(int(k)): int(v) for k, v in sorted(retained_by_layer.items())
+    }
+    config["reap_primary_prune_layers"] = [int(i) for i in sorted(primary_layers)]
 
 
 def _validate_keep_indices(
@@ -490,7 +507,8 @@ def _validate_keep_indices(
         )
     if keep_indices.size != np.unique(keep_indices).size:
         raise ValueError(
-            f"Layer {layer_idx}: keep indices must be unique, got {keep_indices.tolist()}."
+            f"Layer {layer_idx}: keep indices must be unique, "
+            f"got {keep_indices.tolist()}."
         )
     min_index = int(keep_indices.min())
     max_index = int(keep_indices.max())
@@ -583,14 +601,9 @@ def slice_first_dim(
     return sliced_any
 
 
-def _validate_adapter(adapter: Any) -> None:
+def _validate_adapter(adapter: Any, config: Mapping[str, Any] | None = None) -> None:
     if adapter is None:
-        raise ValueError(
-            "Cannot detect a supported MoE architecture. REAP currently "
-            "supports Qwen3-MoE and LFM2-MoE models. Ensure the model config "
-            "exposes a recognized model_type/architectures, or pass an "
-            "explicit adapter.",
-        )
+        raise ValueError(unsupported_architecture_message(config))
     adapter_name = getattr(adapter, "adapter_name", None)
     if adapter_name not in {"qwen3_moe", "lfm2_moe", "mixtral_moe"}:
         raise ValueError(
@@ -647,7 +660,7 @@ def _saliency_scores(
     return scores
 
 
-def _prune_qwen3_moe_layer(
+def _prune_switch_moe_layer(
     moe: Any,
     keep_indices: np.ndarray,
     *,
@@ -655,6 +668,12 @@ def _prune_qwen3_moe_layer(
     old_top_k: int,
     layer_idx: int,
 ) -> None:
+    """Slice one switch_mlp MoE block: projections, router gate, expert bias.
+
+    Every supported adapter (qwen3_moe, lfm2_moe, mixtral_moe) stores experts
+    on dimension 0 of the same fields, so a single slicing path keeps the
+    families from drifting apart.
+    """
     switch_mlp = getattr(moe, "switch_mlp", None)
     if switch_mlp is None:
         raise ValueError(f"MoE layer {layer_idx} does not expose switch_mlp.")
@@ -688,56 +707,7 @@ def _prune_qwen3_moe_layer(
         keep_indices,
         num_experts=num_experts,
         required=True,
-        field_names=("weight", "bias", "e_score_correction_bias"),
-    )
-
-    retained_count = len(keep_indices)
-    new_top_k = min(int(old_top_k), retained_count)
-    _update_runtime_attrs(moe, gate, retained_count=retained_count, top_k=new_top_k)
-
-
-def _prune_lfm2_moe_layer(
-    moe: Any,
-    keep_indices: np.ndarray,
-    *,
-    num_experts: int,
-    old_top_k: int,
-    layer_idx: int,
-) -> None:
-    switch_mlp = getattr(moe, "switch_mlp", None)
-    if switch_mlp is None:
-        raise ValueError(f"MoE layer {layer_idx} does not expose switch_mlp.")
-
-    for projection_name in _SWITCH_PROJECTION_NAMES:
-        projection = getattr(switch_mlp, projection_name, None)
-        if projection is None:
-            raise ValueError(
-                f"MoE layer {layer_idx} switch_mlp is missing "
-                f"{projection_name}."
-            )
-        if _get_module_value(projection, "weight") is None:
-            raise ValueError(
-                f"MoE layer {layer_idx} switch_mlp.{projection_name} is "
-                "missing required weight."
-            )
-        slice_first_dim(
-            projection,
-            keep_indices,
-            num_experts=num_experts,
-            required=True,
-        )
-
-    gate = getattr(moe, "gate", None)
-    if gate is None:
-        raise ValueError(f"MoE layer {layer_idx} does not expose a gate.")
-    if _get_module_value(gate, "weight") is None:
-        raise ValueError(f"MoE layer {layer_idx} gate is missing required weight.")
-    slice_first_dim(
-        gate,
-        keep_indices,
-        num_experts=num_experts,
-        required=True,
-        field_names=("weight", "scales", "biases", "bias"),
+        field_names=_GATE_FIELD_NAMES,
     )
 
     if getattr(moe, "use_expert_bias", False) or hasattr(moe, "expert_bias"):

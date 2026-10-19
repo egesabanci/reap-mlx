@@ -10,11 +10,12 @@ license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "datasets>=3.6.0,<6.0.0",
-    # pyarrow is transitive via datasets; cap below 26 keeps the
-    # 23.x-25.x line Dependabot evaluated (#61: 21 -> 23.0.1; #144: <26).
+    # pyarrow is transitive via datasets; cap below 27 keeps the
+    # 23.x-26.x line Dependabot evaluated (#61: 21 -> 23.0.1; #144: <26;
+    # #154: <27, checked against pyarrow 26.0.0 with datasets 5.1.0).
     # Remove when datasets moves and re-evaluates a newer pyarrow major.
-    "pyarrow<26",
-    "huggingface-hub>=1.0.0,<2.0.0",
+    "pyarrow<27",
+    "huggingface-hub>=1.0.0,<3.0.0",
     "mlx>=0.31.0,<0.33.0",
     "mlx-lm>=0.31.1,<0.33.0",
     "numpy>=1.26",
@@ -32,6 +33,7 @@ packages = ["src/reap"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "ruff>=0.14.2",
 ]
 
 [project.urls]
@@ -42,4 +44,6 @@ reap-mlx = "reap.entrypoint:main"
 
 [tool.ruff]
 line-length = 88
-select = ["SIM"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "SIM"]
