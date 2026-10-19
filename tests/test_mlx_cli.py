@@ -457,6 +457,99 @@ def test_partial_observation_is_allowed_with_allow_partial_calibration(tmp_path)
     assert any("only 1/2 calibration sequences" in line for line in output)
 
 
+def _run_with_eval_nll(tmp_path, monkeypatch, *, available_records):
+    import reap.eval_nll
+
+    model, tokenizer, config = _moe_model_and_config()
+    reloaded_model = object()
+    events = []
+    loader_kwargs = {}
+
+    def fake_loader(tokenizer_arg, dataset_name, **kwargs):
+        loader_kwargs.update(kwargs)
+        count = min(kwargs["max_samples"], available_records)
+        return [{"input_ids": [index, index + 1]} for index in range(count)]
+
+    def fake_observe(model_arg, sequences, config_arg, **kwargs):
+        events.append(("observe", [seq["input_ids"][0] for seq in sequences]))
+        return {0: {"reap": [1.0, 0.5]}}
+
+    def fake_prune(*args, **kwargs):
+        events.append(("prune",))
+        return {}
+
+    def fake_nll(model_arg, sequences, **kwargs):
+        which = "baseline" if model_arg is model else "pruned"
+        events.append((which, [seq["input_ids"][0] for seq in sequences]))
+        return {
+            "status": "ok",
+            "mean_nll": 2.0 if which == "baseline" else 2.5,
+            "token_count": len(sequences),
+            "sequence_count": len(sequences),
+        }
+
+    monkeypatch.setattr(reap.eval_nll, "calibration_mean_nll", fake_nll)
+    code = main(
+        [
+            "--model-name",
+            "model",
+            "--dataset-name",
+            "dataset",
+            "--max-samples",
+            "3",
+            "--eval-calibration-nll",
+            "--eval-calibration-sequences",
+            "2",
+            "--output-dir",
+            str(tmp_path),
+            "--no-smoke",
+        ],
+        load_model_fn=lambda model_name: (model, tokenizer, config),
+        load_calibration_sequences_fn=fake_loader,
+        observe_model_fn=fake_observe,
+        prune_experts_fn=fake_prune,
+        save_pruned_model_fn=lambda *args, **kwargs: SimpleNamespace(
+            output_dir=tmp_path, reloaded_model=reloaded_model
+        ),
+        print_fn=lambda message: None,
+    )
+    payload = json.loads((tmp_path / "validation-metrics.json").read_text())
+    return code, events, loader_kwargs, payload["quality"]
+
+
+def test_eval_nll_holds_out_sequences_and_measures_a_pre_prune_baseline(
+    tmp_path, monkeypatch
+):
+    code, events, loader_kwargs, quality = _run_with_eval_nll(
+        tmp_path, monkeypatch, available_records=10
+    )
+
+    assert code == 0
+    assert loader_kwargs["max_samples"] == 5
+    assert events == [
+        ("observe", [0, 1, 2]),
+        ("baseline", [3, 4]),
+        ("prune",),
+        ("pruned", [3, 4]),
+    ]
+    assert quality["evaluation_set"] == "held_out"
+    assert quality["baseline"]["mean_nll"] == 2.0
+    assert quality["mean_nll"] == 2.5
+    assert quality["delta_mean_nll"] == pytest.approx(0.5)
+
+
+def test_eval_nll_falls_back_to_observed_sequences_when_none_are_left(
+    tmp_path, monkeypatch
+):
+    code, events, _, quality = _run_with_eval_nll(
+        tmp_path, monkeypatch, available_records=3
+    )
+
+    assert code == 0
+    assert ("baseline", [0, 1]) in events
+    assert quality["evaluation_set"] == "calibration"
+
+
 def test_pack_calibration_flag_is_forwarded_to_the_loader(tmp_path):
     loader_kwargs = {}
 

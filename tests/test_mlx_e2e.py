@@ -230,7 +230,15 @@ def test_cli_prunes_saves_and_reloads_tiny_model(tmp_path, family, quantize):
     metrics = json.loads((output / "validation-metrics.json").read_text())
     assert metrics["status"] == "success"
     assert metrics["smoke"]["completed"] is True
-    assert metrics["quality"]["status"] == "ok"
+    quality = metrics["quality"]
+    assert quality["status"] == "ok"
+    assert quality["evaluation_set"] == "held_out"
+    assert quality["baseline"]["status"] == "ok"
+    assert quality["delta_mean_nll"] == pytest.approx(
+        quality["mean_nll"] - quality["baseline"]["mean_nll"]
+    )
+    # Only the observed sequences count as calibration samples.
+    assert metrics["run_config"]["actual_sample_count"] == 4
     saved_config = json.loads((output / "config.json").read_text())
     assert config_num_experts(saved_config) == NUM_EXPERTS - NUM_EXPERTS // 4
     assert metrics["save_reload"]["reloaded_config_expert_count"] == 6

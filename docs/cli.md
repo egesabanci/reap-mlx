@@ -35,7 +35,8 @@ and telemetry writing. Resume mode skips calibration/observe/prune.
 | `--target-experts` | unset | Retain exactly N experts per MoE layer (overrides ratio planning). |
 | `--min-calibration-samples` | `= max-samples` | Hard floor on non-empty sequences (default equals `--max-samples`). |
 | `--allow-partial-calibration` | off | Allow fewer than the min sample floor, both when loading and when out-of-memory stops observation early. |
-| `--eval-calibration-nll` | off | After reload, compute mean next-token NLL on calibration data. |
+| `--eval-calibration-nll` | off | Compare next-token NLL of the unpruned and the reloaded pruned model on held-out calibration sequences. |
+| `--eval-calibration-sequences` | `8` | Number of extra calibration sequences held out of observation for `--eval-calibration-nll`. |
 | `--resume-from-checkpoint` | unset | Re-apply keep indices and retry save only. |
 | `--strict-resume` / `--no-strict-resume` | strict on | Require the checkpoint's model, adapter, and pre-prune config to match (warn instead when off). |
 | `--max-samples` | `128` | Maximum non-empty calibration samples. |

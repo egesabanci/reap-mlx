@@ -327,6 +327,9 @@ def main(
             logger.warning("Could not clear stale metrics %s: %s", stale_metrics, exc)
 
     calibration_sequences: list[Any] = []
+    eval_sequences: list[Any] = []
+    evaluation_set: str | None = None
+    baseline_nll: Mapping[str, Any] | None = None
     try:
         _emit(print_fn, "load: loading MLX-LM model")
         with metrics.phase("model_load"):
@@ -417,17 +420,36 @@ def main(
 
             current_phase = "calibration"
             _emit(print_fn, "calibrate: loading calibration sequences")
+            # With NLL evaluation, load extra sequences and hold them out of
+            # observation so the quality signal is not measured on the data
+            # that chose the experts.
+            holdout_count = (
+                args.eval_calibration_sequences if args.eval_calibration_nll else 0
+            )
             with metrics.phase("calibration"):
-                calibration_sequences = load_calibration_sequences_fn(
+                loaded_sequences = load_calibration_sequences_fn(
                     tokenizer,
                     args.dataset_name,
                     split=args.split,
                     dataset_config_name=args.dataset_config_name,
-                    max_samples=args.max_samples,
+                    max_samples=args.max_samples + holdout_count,
                     max_seq_length=args.max_seq_length,
                     seed=args.seed,
                     pack=args.pack_calibration,
                 )
+            calibration_sequences = list(loaded_sequences[: args.max_samples])
+            if args.eval_calibration_nll:
+                eval_sequences = list(loaded_sequences[args.max_samples :])
+                evaluation_set = "held_out"
+                if not eval_sequences:
+                    logger.warning(
+                        "No calibration records left to hold out for NLL "
+                        "evaluation; measuring NLL on the observed sequences."
+                    )
+                    eval_sequences = calibration_sequences[
+                        : args.eval_calibration_sequences
+                    ]
+                    evaluation_set = "calibration"
             if not calibration_sequences:
                 raise RuntimeError("No non-empty calibration sequences were loaded.")
             min_samples = (
@@ -511,6 +533,19 @@ def main(
                 )
             metrics.sample_memory("after_observe")
 
+            if args.eval_calibration_nll:
+                current_phase = "eval_baseline_nll"
+                _emit(print_fn, "eval: baseline NLL on the unpruned model")
+                from reap.eval_nll import calibration_mean_nll
+
+                with metrics.phase("eval_baseline_nll"):
+                    baseline_nll = calibration_mean_nll(
+                        model,
+                        eval_sequences,
+                        max_sequences=args.eval_calibration_sequences,
+                        max_seq_length=args.max_seq_length,
+                    )
+
             current_phase = "prune"
             _emit(print_fn, "prune: mutating selected experts")
             config_before_prune = copy.deepcopy(config)
@@ -581,7 +616,7 @@ def main(
         metrics.record_save_reload(result, adapter=adapter)
         metrics.sample_memory("after_save_reload_smoke")
 
-        if args.eval_calibration_nll and calibration_sequences:
+        if args.eval_calibration_nll and eval_sequences:
             current_phase = "eval_calibration_nll"
             _emit(print_fn, "eval: calibration mean NLL on reloaded model")
             from reap.eval_nll import calibration_mean_nll
@@ -589,15 +624,20 @@ def main(
             with metrics.phase("eval_calibration_nll"):
                 nll_payload = calibration_mean_nll(
                     result.reloaded_model,
-                    calibration_sequences,
+                    eval_sequences,
                     max_sequences=args.eval_calibration_sequences,
                     max_seq_length=args.max_seq_length,
                 )
-            metrics.data["quality"] = nll_payload
+            metrics.data["quality"] = _quality_payload(
+                nll_payload,
+                baseline_nll,
+                evaluation_set=evaluation_set,
+            )
             _emit(
                 print_fn,
                 f"eval: nll status={nll_payload.get('status')} "
-                f"mean_nll={nll_payload.get('mean_nll')}",
+                f"mean_nll={nll_payload.get('mean_nll')} "
+                f"baseline={(baseline_nll or {}).get('mean_nll')}",
             )
         elif args.eval_calibration_nll and not calibration_sequences:
             metrics.data["quality"] = {
@@ -684,6 +724,26 @@ def _validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(
                     f"per_layer_ratios[{layer_idx}] must be in [0, 1), got {layer_ratio}."
                 )
+
+
+def _quality_payload(
+    nll: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None,
+    *,
+    evaluation_set: str | None,
+) -> dict[str, Any]:
+    """Combine pruned and baseline NLL into the telemetry ``quality`` block."""
+    payload = dict(nll)
+    payload["evaluation_set"] = evaluation_set
+    payload["baseline"] = None if baseline is None else dict(baseline)
+    pruned_nll = nll.get("mean_nll")
+    baseline_nll = None if baseline is None else baseline.get("mean_nll")
+    payload["delta_mean_nll"] = (
+        float(pruned_nll) - float(baseline_nll)
+        if pruned_nll is not None and baseline_nll is not None
+        else None
+    )
+    return payload
 
 
 def _write_prune_checkpoint(

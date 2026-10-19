@@ -234,6 +234,14 @@ Smoke telemetry records:
 
 The result preview is truncated to 500 characters.
 
+## Quality
+
+Present when `--eval-calibration-nll` is set. It holds the reloaded pruned
+model's NLL (`status`, `mean_nll`, `perplexity`, `token_count`,
+`sequence_count`), the unpruned `baseline` with the same fields,
+`delta_mean_nll`, and `evaluation_set` (`held_out` or in-sample
+`calibration`). See [Evaluating pruned models](eval.md).
+
 ## Throughput
 
 Derived throughput fields include:

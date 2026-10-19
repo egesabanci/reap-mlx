@@ -1,7 +1,7 @@
 # Evaluating pruned models
 
 REAP MLX validates structure (reload + optional generation smoke) and can
-optionally report **calibration mean NLL** after reload:
+optionally compare **next-token NLL** before and after pruning:
 
 ```bash
 uv run python -m reap.entrypoint \
@@ -11,6 +11,20 @@ uv run python -m reap.entrypoint \
   --eval-calibration-nll \
   --eval-calibration-sequences 8
 ```
+
+With `--eval-calibration-nll`, the loader fetches `--eval-calibration-sequences`
+extra calibration sequences and holds them out of observation, so the NLL is not
+measured on the data that chose the experts. A baseline NLL is computed on the
+unpruned model right before pruning, and the same sequences are scored again
+on the reloaded pruned model. The `quality` block reports:
+
+- `mean_nll`, `perplexity`, `token_count`, `sequence_count` for the pruned model;
+- `baseline` with the same fields for the unpruned model;
+- `delta_mean_nll` (pruned minus baseline; lower is better);
+- `evaluation_set`: `held_out`, or `calibration` when the dataset had no records
+  left to hold out and the observed sequences were reused (in-sample).
+
+Resumed runs skip calibration, so they report `status: "skipped"`.
 
 The NLL signal is a quick regression check, not a substitute for task benchmarks.
 
